@@ -267,7 +267,7 @@ def render_query_execution_block(
             [
                 "",
                 f"-- Measured repetition {repetition} for {query.name}",
-                "SET VARIABLE benchmark_t0_ms = epoch_ms(current_timestamp);",
+                "SET VARIABLE benchmark_t0_ns = epoch_ns(current_timestamp);",
                 query_sql,
                 ";",
                 "INSERT INTO benchmark_results.timing_runs (",
@@ -282,7 +282,7 @@ def render_query_execution_block(
                 "    join_variant,",
                 "    cluster_count,",
                 "    repetition,",
-                "    elapsed_ms,",
+                "    elapsed_ns,",
                 "    measured_at",
                 ") VALUES (",
                 f"    {sql_literal(run_id)},",
@@ -300,8 +300,8 @@ def render_query_execution_block(
                 f"    {join_variant_sql},",
                 f"    {cluster_count_sql},",
                 f"    {repetition},",
-                "    epoch_ms(current_timestamp) - getvariable('benchmark_t0_ms'),",
-                "    current_timestamp",
+                "    epoch_ns(current_timestamp) - getvariable('benchmark_t0_ns'),",
+                "    CAST(current_timestamp AS TIMESTAMP)",
                 ");",
             ]
         )
@@ -346,7 +346,7 @@ def render_query_execution_block(
             f"    {cluster_count_sql},",
             f"    {sql_literal(str(profile_path))},",
             "    NULL,",
-            "    current_timestamp",
+            "    CAST(current_timestamp AS TIMESTAMP)",
             ");",
         ]
     )
@@ -381,11 +381,10 @@ CREATE TABLE IF NOT EXISTS benchmark_results.timing_runs (
     join_variant VARCHAR,
     cluster_count INTEGER,
     repetition INTEGER,
-    elapsed_ms BIGINT,
-    measured_at TIMESTAMP WITH TIME ZONE
+    elapsed_ns BIGINT,
+    measured_at TIMESTAMP
 );
 """.strip(),
-        "ALTER TABLE benchmark_results.timing_runs ADD COLUMN IF NOT EXISTS benchmark_name VARCHAR;",
         """
 CREATE TABLE IF NOT EXISTS benchmark_results.profile_runs (
     run_id VARCHAR,
@@ -400,10 +399,9 @@ CREATE TABLE IF NOT EXISTS benchmark_results.profile_runs (
     cluster_count INTEGER,
     profile_path VARCHAR,
     cumulative_rows_scanned BIGINT,
-    profiled_at TIMESTAMP WITH TIME ZONE
+    profiled_at TIMESTAMP
 );
 """.strip(),
-        "ALTER TABLE benchmark_results.profile_runs ADD COLUMN IF NOT EXISTS benchmark_name VARCHAR;",
     ]
 
     if threads is not None:
@@ -509,8 +507,8 @@ def summarize_results(
                 engine_version,
                 git_commit,
                 COUNT(*) AS timing_rows,
-                median(elapsed_ms) AS overall_median_ms,
-                avg(elapsed_ms) AS overall_avg_ms
+                median(elapsed_ns) / 1000000.0 AS overall_median_ms,
+                avg(elapsed_ns) / 1000000.0 AS overall_avg_ms
             FROM timing_runs
             WHERE run_id = ?
             GROUP BY 1, 2, 3
@@ -527,8 +525,8 @@ def summarize_results(
                     query_name,
                     join_variant,
                     cluster_count,
-                    median(elapsed_ms) AS median_ms,
-                    avg(elapsed_ms) AS avg_ms
+                    median(elapsed_ns) / 1000000.0 AS median_ms,
+                    avg(elapsed_ns) / 1000000.0 AS avg_ms
                 FROM timing_runs
                 WHERE run_id = ?
                 GROUP BY 1, 2, 3, 4
@@ -575,7 +573,7 @@ def summarize_results(
                     SELECT
                         engine,
                         query_name,
-                        median(elapsed_ms) AS median_ms
+                        median(elapsed_ns) / 1000000.0 AS median_ms
                     FROM timing_runs
                     WHERE run_id = ?
                     GROUP BY 1, 2
@@ -618,7 +616,7 @@ def summarize_results(
                     query_name,
                     join_variant,
                     cluster_count,
-                    median(elapsed_ms) AS median_ms
+                    median(elapsed_ns) / 1000000.0 AS median_ms
                 FROM timing_runs
                 WHERE run_id = ?
                 GROUP BY 1, 2, 3, 4
@@ -647,7 +645,7 @@ def summarize_results(
                     query_name,
                     join_variant,
                     cluster_count,
-                    median(elapsed_ms) AS median_ms
+                    median(elapsed_ns) / 1000000.0 AS median_ms
                 FROM timing_runs
                 WHERE run_id = ?
                 GROUP BY 1, 2, 3, 4
