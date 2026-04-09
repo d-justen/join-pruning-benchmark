@@ -1,0 +1,9 @@
+{
+  "benchmark_name": "join-order-benchmark",
+  "queries_dir": "queries",
+  "metadata_path": null,
+  "init_sql_paths": [
+    "schema.sql",
+    "load.sql"
+  ]
+}
