@@ -47,3 +47,47 @@ For a requested cluster count `C`, the generator creates:
 - range and gap sizes are balanced as evenly as possible
 
 The balanced interval layouts are precomputed into boolean mask columns on `dim`, so the query predicate is just `WHERE d.mask_cXXXXX`.
+
+## Cross-Product Workload Generator
+
+The repository also contains a second generator under [cross_product_benchmark](/Users/d-justen/Development/join-pruning-benchmark/cross_product_benchmark) for a workload that is the cross-product of:
+
+- build size
+- selectivity
+- dimension predicate type
+- probe clustering
+
+It materializes:
+
+- `dim_100k`
+- `dim_100m`
+- `fact(fk_100k_ordered, fk_100k_uniform, fk_100m_ordered, fk_100m_uniform, ...)`
+
+Each dimension table gets one boolean mask per `(selectivity, predicate_type)` combination:
+
+- `range`
+- `shoulder`
+- `seasonal`
+- `scattered`
+
+Current fixed workload:
+
+- build sizes: `100000`, `100000000`
+- selectivities: `0.5%`, `5%`
+- predicate types: `range`, `shoulder`, `seasonal`, `scattered`
+- probe clusterings: `ordered`, `uniform`
+- fact rows: `100000000`
+
+Run it with:
+
+```bash
+python3 -m cross_product_benchmark.cli \
+  --db out/cross-product.duckdb \
+  --queries-dir out/cross-product-queries \
+  --seed 7
+```
+
+This emits 32 query files, for example:
+
+- `b100k_s0005_range_ordered.sql`
+- `b100m_s0050_scattered_uniform.sql`
