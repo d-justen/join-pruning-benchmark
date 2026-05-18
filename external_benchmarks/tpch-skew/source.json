@@ -1,0 +1,7 @@
+{
+  "benchmark_name": "tpch-skew",
+  "queries_dir": "queries",
+  "metadata_path": null,
+  "database_path": "tpch_sf100_z2.duckdb",
+  "database_handling": "reuse"
+}
