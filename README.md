@@ -33,6 +33,7 @@ benchmarking/
   workloads/
 external_benchmarks/
 example_experiment.json
+example_remote_http_experiment.json
 out/
 ```
 
@@ -41,6 +42,7 @@ out/
 - `benchmarking/`: internal implementation modules
 - `external_benchmarks/`: checked-in benchmark definitions and queries
 - `example_experiment.json`: a small end-to-end example config
+- `example_remote_http_experiment.json`: the same suite with remote-HTTP Parquet external workloads
 - `out/`: generated workloads, SQL, system builds, results, and summaries
 
 ## Config Shape
@@ -100,6 +102,7 @@ Supported external preparation modes:
 
 - `init_sql_paths`: initialize a fresh benchmark database by running SQL files with `prepare_duckdb_binary`
 - `database_path`: reuse or copy an already prepared DuckDB database file
+- `remote_http_parquet`: export all base tables to Parquet, serve them over local HTTP, and add a fixed latency to each HTTP request
 
 Example SQL-initialized external benchmark:
 
@@ -128,6 +131,26 @@ Example prebuilt-database external benchmark:
 
 - `reuse`: run queries against the checked-in database in place
 - `copy`: copy the database to `out/.../workloads/<name>/benchmark.duckdb` before benchmarking
+
+Remote-HTTP Parquet mode is enabled in `source.json` and currently only requires one parameter:
+
+```json
+{
+  "benchmark_name": "join-order-benchmark-remote-http",
+  "queries_dir": "../join-order-benchmark/queries",
+  "init_sql_paths": [
+    "../join-order-benchmark/schema.sql",
+    "../join-order-benchmark/load.sql"
+  ],
+  "remote_http_parquet": {
+    "latency_ms": 25
+  }
+}
+```
+
+When this mode is enabled, preparation exports every base table into Parquet files under `out/.../workloads/<name>/remote_parquet/`.
+Benchmark execution then starts a local HTTP server with byte-range support, adds the configured fixed latency to each request,
+and creates temporary views over `read_parquet([...])` so the benchmark queries themselves do not need to change.
 
 ## Systems
 
@@ -258,6 +281,12 @@ That run creates:
 
 - generated benchmark databases and query files
 - generated SQL workloads per system and variant
+
+To run the same suite with the two checked-in external workloads served as remote Parquet over HTTP with fixed per-request latency:
+
+```bash
+python3 run_benchmarks.py --config example_remote_http_experiment.json
+```
 - a results database at `out/experiments/example-local-validation/results.duckdb`
 - a summary file at `out/experiments/example-local-validation/summary.json`
 - profile JSON files under `out/experiments/example-local-validation/profiles/`

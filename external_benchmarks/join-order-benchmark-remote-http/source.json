@@ -1,0 +1,12 @@
+{
+  "benchmark_name": "join-order-benchmark-remote-http",
+  "queries_dir": "../join-order-benchmark/queries",
+  "metadata_path": null,
+  "init_sql_paths": [
+    "../join-order-benchmark/schema.sql",
+    "../join-order-benchmark/load.sql"
+  ],
+  "remote_http_parquet": {
+    "latency_ms": 25
+  }
+}

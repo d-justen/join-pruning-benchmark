@@ -78,6 +78,7 @@ class SingleJoinClustersWorkloadConfig:
     dummy_string_cols: int
     dummy_string_len: int
     seed: int
+    remote_http_parquet_latency_ms: int | None
 
 
 @dataclass(frozen=True)
@@ -92,6 +93,7 @@ class CrossProductWorkloadConfig:
     dummy_string_cols: int
     dummy_string_len: int
     seed: int
+    remote_http_parquet_latency_ms: int | None
 
 
 @dataclass(frozen=True)
@@ -176,6 +178,11 @@ def _parse_single_join_clusters(raw: dict, name: str) -> SingleJoinClustersWorkl
         dummy_string_cols=_require_int(params.get("dummy_string_cols", 2), "dummy_string_cols"),
         dummy_string_len=_require_int(params.get("dummy_string_len", 24), "dummy_string_len"),
         seed=_require_int(params.get("seed", 0), "seed"),
+        remote_http_parquet_latency_ms=(
+            None
+            if params.get("remote_http_parquet_latency_ms") is None
+            else _require_int(params.get("remote_http_parquet_latency_ms"), "remote_http_parquet_latency_ms")
+        ),
     )
 
 
@@ -196,6 +203,11 @@ def _parse_cross_product(raw: dict, name: str) -> CrossProductWorkloadConfig:
         dummy_string_cols=_require_int(params.get("dummy_string_cols", 2), "dummy_string_cols"),
         dummy_string_len=_require_int(params.get("dummy_string_len", 24), "dummy_string_len"),
         seed=_require_int(params.get("seed", 0), "seed"),
+        remote_http_parquet_latency_ms=(
+            None
+            if params.get("remote_http_parquet_latency_ms") is None
+            else _require_int(params.get("remote_http_parquet_latency_ms"), "remote_http_parquet_latency_ms")
+        ),
     )
 
 

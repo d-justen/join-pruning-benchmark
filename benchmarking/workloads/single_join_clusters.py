@@ -8,6 +8,7 @@ import duckdb
 
 from benchmarking.experiment_config import SingleJoinClustersWorkloadConfig
 from benchmarking.manifests import PreparedWorkload, utc_now_iso, write_manifest
+from benchmarking.workloads.external import export_remote_parquet_catalog
 
 
 def mask_column_name(cluster_count: int) -> str:
@@ -269,15 +270,24 @@ def prepare_single_join_clusters_workload(
     metadata = _write_database(spec, db_path, queries_dir)
     _write_queries(spec, queries_dir)
     metadata_path = queries_dir / "metadata.json"
+    runtime_db_path = db_path.resolve()
+    remote_parquet_catalog_path: Path | None = None
+    if spec.remote_http_parquet_latency_ms is not None:
+        remote_parquet_catalog_path = export_remote_parquet_catalog(runtime_db_path, artifact_dir)
+        runtime_db_path = (artifact_dir / "benchmark.duckdb").resolve()
+        if runtime_db_path.exists():
+            runtime_db_path.unlink()
     manifest = PreparedWorkload(
         name=spec.name,
         kind=spec.kind,
         source_root=artifact_dir.resolve(),
         artifact_dir=artifact_dir.resolve(),
-        db_path=db_path.resolve(),
+        db_path=runtime_db_path,
         queries_dir=queries_dir.resolve(),
         metadata_path=metadata_path.resolve(),
         init_sql_paths=(),
+        remote_http_parquet_latency_ms=spec.remote_http_parquet_latency_ms,
+        remote_parquet_catalog_path=remote_parquet_catalog_path,
         prepared_at=utc_now_iso(),
     )
     write_manifest(artifact_dir / "manifest.json", manifest)

@@ -1,0 +1,127 @@
+{
+  "experiment_name": "full-benchmark-suite-remote-http",
+  "output_root": "out/experiments",
+  "overwrite_output": true,
+  "workloads": [
+    {
+      "name": "join-cluster-counts",
+      "kind": "single_join_clusters",
+      "params": {
+        "build_size": 1000000,
+        "domain_multiplier": 16,
+        "fact_rows": 100000000,
+        "cluster_counts": [
+          2,
+          3,
+          7,
+          10,
+          100,
+          1000,
+          10000,
+          100000,
+          200000,
+          500000,
+          1000000
+        ],
+        "dummy_string_cols": 2,
+        "dummy_string_len": 8,
+        "seed": 7,
+        "remote_http_parquet_latency_ms": 25
+      }
+    },
+    {
+      "name": "join-pruning-workload",
+      "kind": "cross_product",
+      "params": {
+        "build_sizes": [
+          100000,
+          10000000
+        ],
+        "selectivities": [
+          0.005,
+          0.05
+        ],
+        "predicate_types": [
+          "range",
+          "shoulder",
+          "seasonal",
+          "scattered"
+        ],
+        "probe_clusterings": [
+          "ordered",
+          "uniform"
+        ],
+        "fact_rows": 100000000,
+        "dummy_string_cols": 2,
+        "dummy_string_len": 8,
+        "seed": 7,
+        "remote_http_parquet_latency_ms": 25
+      }
+    },
+    {
+      "name": "join-order-benchmark-remote-http",
+      "kind": "external",
+      "source_dir": "external_benchmarks/join-order-benchmark-remote-http"
+    },
+    {
+      "name": "tpch-skew-remote-http",
+      "kind": "external",
+      "source_dir": "external_benchmarks/tpch-skew-remote-http"
+    }
+  ],
+  "systems": [
+    {
+      "name": "duckdb",
+      "kind": "git",
+      "repo": "https://github.com/d-justen/duckdb.git",
+      "ref": "prf-sizing",
+      "variants": [
+        {
+          "label": "no_prefilter",
+          "setup_sql": [
+            "SET enable_prefix_range_filter=false;",
+            "SET enable_join_min_max_filter_pushdown=false;",
+            "SET enable_join_bloom_filter_pushdown=false;",
+            "SET enable_perfect_hash_join_filter_pushdown=false;",
+            "SET disabled_optimizers='compressed_materialization';"
+          ]
+        },
+        {
+          "label": "min_max",
+          "setup_sql": [
+            "SET enable_prefix_range_filter=false;",
+            "SET enable_join_min_max_filter_pushdown=true;",
+            "SET enable_join_bloom_filter_pushdown=false;",
+            "SET enable_perfect_hash_join_filter_pushdown=false;",
+            "SET disabled_optimizers='compressed_materialization';"
+          ]
+        },
+        {
+          "label": "sip_min_max",
+          "setup_sql": [
+            "SET enable_prefix_range_filter=false;",
+            "SET enable_join_min_max_filter_pushdown=true;",
+            "SET enable_join_bloom_filter_pushdown=true;",
+            "SET enable_perfect_hash_join_filter_pushdown=false;",
+            "SET disabled_optimizers='compressed_materialization';"
+          ]
+        },
+        {
+          "label": "prf_sip_min_max",
+          "setup_sql": [
+            "SET enable_prefix_range_filter=true;",
+            "SET enable_join_min_max_filter_pushdown=true;",
+            "SET enable_join_bloom_filter_pushdown=true;",
+            "SET enable_perfect_hash_join_filter_pushdown=false;",
+            "SET disabled_optimizers='compressed_materialization';"
+          ]
+        }
+      ]
+    }
+  ],
+  "benchmark": {
+    "repetitions": 5,
+    "threads": 8,
+    "prepare_duckdb_binary": "duckdb"
+  }
+}

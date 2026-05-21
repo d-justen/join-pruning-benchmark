@@ -1,0 +1,10 @@
+{
+  "benchmark_name": "tpch-skew-remote-http",
+  "queries_dir": "../tpch-skew/queries",
+  "metadata_path": null,
+  "database_path": "../tpch-skew/tpch_sf100_z2.duckdb",
+  "database_handling": "reuse",
+  "remote_http_parquet": {
+    "latency_ms": 25
+  }
+}

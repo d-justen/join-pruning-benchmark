@@ -4,7 +4,7 @@ import shutil
 from pathlib import Path
 
 from benchmarking.artifact_layout import ExperimentPaths, prepare_experiment_root
-from benchmarking.duckdb_build import resolve_system
+from benchmarking.duckdb_build import ResolvedSystem, resolve_system
 from benchmarking.duckdb_runner import benchmark_workload, summarize_results, write_summary
 from benchmarking.experiment_config import ExperimentConfig
 from benchmarking.manifests import PreparedWorkload
@@ -15,7 +15,21 @@ from benchmarking.workloads import (
 )
 
 
-def prepare_workloads(config: ExperimentConfig, paths: ExperimentPaths) -> list[PreparedWorkload]:
+def _prepare_duckdb_binary(config: ExperimentConfig, resolved_systems: list[ResolvedSystem]) -> str:
+    configured = config.benchmark.prepare_duckdb_binary
+    if configured != "duckdb":
+        return configured
+    if resolved_systems:
+        return str(resolved_systems[0].binary_path)
+    return configured
+
+
+def prepare_workloads(
+    config: ExperimentConfig,
+    paths: ExperimentPaths,
+    *,
+    prepare_duckdb_binary: str,
+) -> list[PreparedWorkload]:
     prepared: list[PreparedWorkload] = []
     for workload in config.workloads:
         artifact_dir = paths.workload_dir(workload.name)
@@ -28,7 +42,7 @@ def prepare_workloads(config: ExperimentConfig, paths: ExperimentPaths) -> list[
             manifest = prepare_external_workload(
                 workload,
                 artifact_dir,
-                prepare_duckdb_binary=config.benchmark.prepare_duckdb_binary,
+                prepare_duckdb_binary=prepare_duckdb_binary,
             )
         prepared.append(manifest)
     return prepared
@@ -45,9 +59,16 @@ def run_experiment(config: ExperimentConfig) -> ExperimentPaths:
         overwrite=config.overwrite_output,
     )
     copy_config(config.config_path, paths.copied_config_path)
-    workloads = prepare_workloads(config, paths)
-    for system_config in config.systems:
-        resolved_system = resolve_system(system_config, paths.system_dir(system_config.name))
+    resolved_systems = [
+        resolve_system(system_config, paths.system_dir(system_config.name))
+        for system_config in config.systems
+    ]
+    workloads = prepare_workloads(
+        config,
+        paths,
+        prepare_duckdb_binary=_prepare_duckdb_binary(config, resolved_systems),
+    )
+    for system_config, resolved_system in zip(config.systems, resolved_systems):
         for workload in workloads:
             benchmark_workload(
                 config.experiment_name,

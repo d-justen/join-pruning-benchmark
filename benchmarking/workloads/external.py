@@ -6,8 +6,14 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+import duckdb
+
 from benchmarking.experiment_config import ExternalWorkloadConfig
 from benchmarking.manifests import PreparedWorkload, utc_now_iso, write_manifest
+
+
+DEFAULT_REMOTE_PARQUET_FILE_SIZE_MB = 200
+DEFAULT_REMOTE_PARQUET_COMPRESSION = "zstd"
 
 
 def run_command(command: list[str], *, cwd: Path | None = None) -> str:
@@ -49,6 +55,24 @@ class ExternalSourceLayout:
     init_sql_paths: tuple[Path, ...]
     source_db_path: Path | None
     db_handling: str | None
+    remote_http_parquet_latency_ms: int | None
+
+
+def _quote_identifier(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _parse_remote_http_parquet(raw: object, config_path: Path) -> int | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"remote_http_parquet in {config_path} must be an object")
+    latency_ms = raw.get("latency_ms")
+    if not isinstance(latency_ms, int) or isinstance(latency_ms, bool):
+        raise ValueError(f"remote_http_parquet.latency_ms in {config_path} must be an integer")
+    if latency_ms < 0:
+        raise ValueError(f"remote_http_parquet.latency_ms in {config_path} must be non-negative")
+    return latency_ms
 
 
 def _resolve_optional_path(base_dir: Path, raw: str | None) -> Path | None:
@@ -70,6 +94,10 @@ def discover_external_layout(external_dir: Path) -> ExternalSourceLayout:
         )
         source_db_path = _resolve_optional_path(config_path.parent, raw.get("database_path"))
         db_handling = raw.get("database_handling")
+        remote_http_parquet_latency_ms = _parse_remote_http_parquet(
+            raw.get("remote_http_parquet"),
+            config_path,
+        )
         if db_handling not in (None, "reuse", "copy"):
             raise ValueError(
                 f"unsupported database_handling in {config_path}: {db_handling!r}"
@@ -90,6 +118,7 @@ def discover_external_layout(external_dir: Path) -> ExternalSourceLayout:
                 init_sql_paths=(),
                 source_db_path=source_db_path,
                 db_handling=db_handling or "reuse",
+                remote_http_parquet_latency_ms=remote_http_parquet_latency_ms,
             )
         if not init_sql_paths:
             raise FileNotFoundError(
@@ -102,6 +131,7 @@ def discover_external_layout(external_dir: Path) -> ExternalSourceLayout:
             init_sql_paths=init_sql_paths,
             source_db_path=None,
             db_handling=None,
+            remote_http_parquet_latency_ms=remote_http_parquet_latency_ms,
         )
     queries_dir = (external_dir / "queries").resolve()
     if not queries_dir.exists():
@@ -129,6 +159,7 @@ def discover_external_layout(external_dir: Path) -> ExternalSourceLayout:
         init_sql_paths=tuple(init_sql_paths),
         source_db_path=None,
         db_handling=None,
+        remote_http_parquet_latency_ms=None,
     )
 
 
@@ -155,6 +186,52 @@ def materialize_existing_db(source_db_path: Path, artifact_dir: Path, db_handlin
     return db_path.resolve()
 
 
+def export_remote_parquet_catalog(source_db_path: Path, artifact_dir: Path) -> Path:
+    remote_root = artifact_dir / "remote_parquet"
+    if remote_root.exists():
+        shutil.rmtree(remote_root)
+    remote_root.mkdir(parents=True, exist_ok=True)
+
+    con = duckdb.connect(str(source_db_path))
+    try:
+        tables = [
+            row[0]
+            for row in con.execute(
+                """
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'main' AND table_type = 'BASE TABLE'
+                ORDER BY table_name
+                """
+            ).fetchall()
+        ]
+        if not tables:
+            raise ValueError(f"external workload database has no base tables: {source_db_path}")
+        catalog: dict[str, list[str]] = {}
+        for table_name in tables:
+            table_dir = remote_root / table_name
+            con.execute(
+                f"""
+                COPY {_quote_identifier(table_name)}
+                TO ?
+                (FORMAT parquet, COMPRESSION {DEFAULT_REMOTE_PARQUET_COMPRESSION}, FILE_SIZE_BYTES '{
+                    DEFAULT_REMOTE_PARQUET_FILE_SIZE_MB
+                }MB')
+                """,
+                [str(table_dir)],
+            )
+            parquet_files = sorted(path.relative_to(remote_root).as_posix() for path in table_dir.rglob("*.parquet"))
+            if not parquet_files:
+                raise ValueError(f"no Parquet files exported for table {table_name}")
+            catalog[table_name] = parquet_files
+    finally:
+        con.close()
+
+    catalog_path = artifact_dir / "remote_parquet_catalog.json"
+    catalog_path.write_text(json.dumps(catalog, indent=2) + "\n", encoding="utf-8")
+    return catalog_path.resolve()
+
+
 def prepare_external_workload(
     spec: ExternalWorkloadConfig,
     artifact_dir: Path,
@@ -173,17 +250,28 @@ def prepare_external_workload(
         initialize_external_db(duckdb_binary, db_path, list(layout.init_sql_paths))
         db_path = db_path.resolve()
         init_sql_paths = layout.init_sql_paths
+    setup_sql_paths: tuple[Path, ...] = ()
+    remote_parquet_catalog_path: Path | None = None
+    runtime_db_path = db_path
+    if layout.remote_http_parquet_latency_ms is not None:
+        remote_parquet_catalog_path = export_remote_parquet_catalog(db_path, artifact_dir)
+        runtime_db_path = (artifact_dir / "benchmark.duckdb").resolve()
+        if runtime_db_path.exists():
+            runtime_db_path.unlink()
     manifest = PreparedWorkload(
         name=spec.name,
         kind=spec.kind,
         source_root=spec.source_dir.resolve(),
         artifact_dir=artifact_dir.resolve(),
-        db_path=db_path,
+        db_path=runtime_db_path,
         source_db_path=source_db_path.resolve() if source_db_path is not None else None,
         queries_dir=layout.queries_dir.resolve(),
         metadata_path=layout.metadata_path.resolve() if layout.metadata_path is not None else None,
         init_sql_paths=tuple(path.resolve() for path in init_sql_paths),
         db_handling=db_handling,
+        setup_sql_paths=setup_sql_paths,
+        remote_http_parquet_latency_ms=layout.remote_http_parquet_latency_ms,
+        remote_parquet_catalog_path=remote_parquet_catalog_path,
         prepared_at=utc_now_iso(),
     )
     write_manifest(artifact_dir / "manifest.json", manifest)

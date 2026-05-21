@@ -75,7 +75,7 @@
       "ref": "prf-sizing",
       "variants": [
         {
-          "label": "no_prefilter",
+          "label": "no prefilter",
           "setup_sql": [
             "SET enable_prefix_range_filter=false;",
             "SET enable_join_min_max_filter_pushdown=false;",
@@ -85,17 +85,17 @@
           ]
         },
         {
-          "label": "min_max",
+          "label": "sip",
           "setup_sql": [
             "SET enable_prefix_range_filter=false;",
-            "SET enable_join_min_max_filter_pushdown=true;",
-            "SET enable_join_bloom_filter_pushdown=false;",
+            "SET enable_join_min_max_filter_pushdown=false;",
+            "SET enable_join_bloom_filter_pushdown=true;",
             "SET enable_perfect_hash_join_filter_pushdown=false;",
             "SET disabled_optimizers='compressed_materialization';"
           ]
         },
         {
-          "label": "sip_min_max",
+          "label": "sip + min/max",
           "setup_sql": [
             "SET enable_prefix_range_filter=false;",
             "SET enable_join_min_max_filter_pushdown=true;",
@@ -105,7 +105,7 @@
           ]
         },
         {
-          "label": "prf_sip_min_max",
+          "label": "prf with fallback",
           "setup_sql": [
             "SET enable_prefix_range_filter=true;",
             "SET enable_join_min_max_filter_pushdown=true;",

@@ -20,6 +20,63 @@ class ResolvedSystem:
     ref: str | None
 
 
+def apply_compatibility_patches(clone_dir: Path) -> None:
+    enum_path = clone_dir / "src" / "include" / "duckdb" / "execution" / "operator" / "join" / "join_filter_pushdown.hpp"
+    join_path = clone_dir / "src" / "execution" / "operator" / "join" / "physical_hash_join.cpp"
+    if not enum_path.exists() or not join_path.exists():
+        return
+
+    enum_text = enum_path.read_text(encoding="utf-8")
+    join_text = join_path.read_text(encoding="utf-8")
+
+    needs_enum_patch = "MIN_MAX,\n\tBLOOM,\n\tMIN_MAX_AND_BLOOM," not in enum_text
+    buggy_plan_branch = (
+        "result.type = settings.enable_min_max_filter_pushdown ? JoinFilterSummaryPlanType::MIN_MAX_AND_BLOOM\n"
+        "\t\t\t                                                      : JoinFilterSummaryPlanType::MIN_MAX_AND_BLOOM;"
+    )
+    fixed_plan_branch = (
+        "result.type = settings.enable_min_max_filter_pushdown ? JoinFilterSummaryPlanType::MIN_MAX_AND_BLOOM\n"
+        "\t\t\t                                                      : JoinFilterSummaryPlanType::BLOOM;"
+    )
+    needs_join_patch = buggy_plan_branch in join_text and "case JoinFilterSummaryPlanType::BLOOM:" not in join_text
+
+    if not needs_enum_patch and not needs_join_patch:
+        return
+
+    if needs_enum_patch:
+        enum_needle = "enum class JoinFilterSummaryPlanType : uint8_t {\n\tNONE,\n\tSINGLE_VALUE,\n\tMIN_MAX,\n\tMIN_MAX_AND_BLOOM,"
+        enum_replacement = "enum class JoinFilterSummaryPlanType : uint8_t {\n\tNONE,\n\tSINGLE_VALUE,\n\tMIN_MAX,\n\tBLOOM,\n\tMIN_MAX_AND_BLOOM,"
+        if enum_needle not in enum_text:
+            raise RuntimeError(f"failed to apply DuckDB compatibility patch: enum shape not found in {enum_path}")
+        enum_text = enum_text.replace(enum_needle, enum_replacement, 1)
+        enum_path.write_text(enum_text, encoding="utf-8")
+
+    if needs_join_patch:
+        if buggy_plan_branch not in join_text:
+            raise RuntimeError(f"failed to apply DuckDB compatibility patch: buggy branch not found in {join_path}")
+        join_text = join_text.replace(buggy_plan_branch, fixed_plan_branch, 1)
+        switch_needle = (
+            "\t\t\tcase JoinFilterSummaryPlanType::MIN_MAX:\n"
+            "\t\t\t\tCreateDynamicMinMaxFilters(op, info, filter_col_idx, cmp, min_val, max_val);\n"
+            "\t\t\t\tbreak;\n"
+            "\t\t\tcase JoinFilterSummaryPlanType::MIN_MAX_AND_BLOOM:\n"
+        )
+        switch_replacement = (
+            "\t\t\tcase JoinFilterSummaryPlanType::MIN_MAX:\n"
+            "\t\t\t\tCreateDynamicMinMaxFilters(op, info, filter_col_idx, cmp, min_val, max_val);\n"
+            "\t\t\t\tbreak;\n"
+            "\t\t\tcase JoinFilterSummaryPlanType::BLOOM:\n"
+            "\t\t\t\tD_ASSERT(runtime_filter_ht);\n"
+            "\t\t\t\tPushBloomFilter(op, *runtime_filter_ht, info, filter_col_idx);\n"
+            "\t\t\t\tbreak;\n"
+            "\t\t\tcase JoinFilterSummaryPlanType::MIN_MAX_AND_BLOOM:\n"
+        )
+        if switch_needle not in join_text:
+            raise RuntimeError(f"failed to apply DuckDB compatibility patch: switch shape not found in {join_path}")
+        join_text = join_text.replace(switch_needle, switch_replacement, 1)
+        join_path.write_text(join_text, encoding="utf-8")
+
+
 def run_command(
     command: list[str],
     *,
@@ -68,6 +125,10 @@ def ensure_duckdb_checkout(clone_dir: Path, repo: str, ref: str) -> None:
 def build_duckdb(clone_dir: Path) -> None:
     build_env = dict(os.environ)
     build_env["GEN"] = "ninja"
+    extensions = [item for item in build_env.get("BUILD_EXTENSIONS", "").split(";") if item]
+    if "httpfs" not in extensions:
+        extensions.append("httpfs")
+    build_env["BUILD_EXTENSIONS"] = ";".join(extensions)
     run_command(["make"], cwd=clone_dir, env=build_env)
 
 
@@ -114,6 +175,7 @@ def _resolve_binary_system(config: BinarySystemConfig) -> ResolvedSystem:
 def _resolve_git_system(config: GitSystemConfig, system_dir: Path) -> ResolvedSystem:
     checkout_dir = system_dir / "checkout"
     ensure_duckdb_checkout(checkout_dir, config.repo, config.ref)
+    apply_compatibility_patches(checkout_dir)
     build_duckdb(checkout_dir)
     binary_path = resolve_built_duckdb_binary(checkout_dir)
     return ResolvedSystem(

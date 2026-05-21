@@ -1,0 +1,101 @@
+{
+  "experiment_name": "paper-local",
+  "output_root": "../../out/experiments",
+  "overwrite_output": true,
+  "workloads": [
+    {
+      "name": "join-pruning-workload",
+      "kind": "cross_product",
+      "params": {
+        "build_sizes": [
+          100000,
+          10000000
+        ],
+        "selectivities": [
+          0.005,
+          0.05
+        ],
+        "predicate_types": [
+          "range",
+          "shoulder",
+          "seasonal",
+          "scattered"
+        ],
+        "probe_clusterings": [
+          "ordered",
+          "uniform"
+        ],
+        "fact_rows": 100000000,
+        "dummy_string_cols": 2,
+        "dummy_string_len": 8,
+        "seed": 7
+      }
+    },
+    {
+      "name": "join-order-benchmark",
+      "kind": "external",
+      "source_dir": "../../external_benchmarks/join-order-benchmark"
+    },
+    {
+      "name": "tpch-skew",
+      "kind": "external",
+      "source_dir": "../../external_benchmarks/tpch-skew"
+    }
+  ],
+  "systems": [
+    {
+      "name": "duckdb-paper",
+      "kind": "git",
+      "repo": "https://github.com/d-justen/duckdb.git",
+      "ref": "prf-sizing",
+      "variants": [
+        {
+          "label": "no prefilter",
+          "setup_sql": [
+            "SET enable_prefix_range_filter=false;",
+            "SET enable_join_min_max_filter_pushdown=false;",
+            "SET enable_join_bloom_filter_pushdown=false;",
+            "SET enable_perfect_hash_join_filter_pushdown=false;",
+            "SET disabled_optimizers='compressed_materialization';"
+          ]
+        },
+        {
+          "label": "sip",
+          "setup_sql": [
+            "SET enable_prefix_range_filter=false;",
+            "SET enable_join_min_max_filter_pushdown=false;",
+            "SET enable_join_bloom_filter_pushdown=true;",
+            "SET enable_perfect_hash_join_filter_pushdown=false;",
+            "SET disabled_optimizers='compressed_materialization';"
+          ]
+        },
+        {
+          "label": "sip + min/max",
+          "setup_sql": [
+            "SET enable_prefix_range_filter=false;",
+            "SET enable_join_min_max_filter_pushdown=true;",
+            "SET enable_join_bloom_filter_pushdown=true;",
+            "SET enable_perfect_hash_join_filter_pushdown=false;",
+            "SET disabled_optimizers='compressed_materialization';"
+          ]
+        },
+        {
+          "label": "prf with fallback",
+          "setup_sql": [
+            "SET enable_prefix_range_filter=true;",
+            "SET enable_join_min_max_filter_pushdown=true;",
+            "SET enable_join_bloom_filter_pushdown=true;",
+            "SET enable_perfect_hash_join_filter_pushdown=false;",
+            "SET disabled_optimizers='compressed_materialization';"
+          ]
+        }
+      ]
+    }
+  ],
+  "benchmark": {
+    "repetitions": 5,
+    "threads": 8,
+    "prepare_duckdb_binary": "duckdb",
+    "collect_profiles": true
+  }
+}
