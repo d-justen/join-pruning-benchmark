@@ -125,10 +125,6 @@ def ensure_duckdb_checkout(clone_dir: Path, repo: str, ref: str) -> None:
 def build_duckdb(clone_dir: Path) -> None:
     build_env = dict(os.environ)
     build_env["GEN"] = "ninja"
-    extensions = [item for item in build_env.get("BUILD_EXTENSIONS", "").split(";") if item]
-    if "httpfs" not in extensions:
-        extensions.append("httpfs")
-    build_env["BUILD_EXTENSIONS"] = ";".join(extensions)
     run_command(["make"], cwd=clone_dir, env=build_env)
 
 
