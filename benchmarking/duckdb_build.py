@@ -122,9 +122,13 @@ def ensure_duckdb_checkout(clone_dir: Path, repo: str, ref: str) -> None:
     run_command(["git", "switch", "--detach", "FETCH_HEAD"], cwd=clone_dir)
 
 
-def build_duckdb(clone_dir: Path) -> None:
+def build_duckdb(clone_dir: Path, config: GitSystemConfig) -> None:
     build_env = dict(os.environ)
     build_env["GEN"] = "ninja"
+    if config.c_compiler is not None:
+        build_env["CC"] = config.c_compiler
+    if config.cxx_compiler is not None:
+        build_env["CXX"] = config.cxx_compiler
     run_command(["make"], cwd=clone_dir, env=build_env)
 
 
@@ -172,7 +176,7 @@ def _resolve_git_system(config: GitSystemConfig, system_dir: Path) -> ResolvedSy
     checkout_dir = system_dir / "checkout"
     ensure_duckdb_checkout(checkout_dir, config.repo, config.ref)
     apply_compatibility_patches(checkout_dir)
-    build_duckdb(checkout_dir)
+    build_duckdb(checkout_dir, config)
     binary_path = resolve_built_duckdb_binary(checkout_dir)
     return ResolvedSystem(
         kind="git",

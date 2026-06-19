@@ -61,6 +61,8 @@ class GitSystemConfig:
     name: str
     repo: str
     ref: str
+    c_compiler: str | None
+    cxx_compiler: str | None
     variants: tuple[VariantConfig, ...]
 
 
@@ -356,6 +358,16 @@ def _parse_systems(raw: object, base_dir: Path) -> tuple[SystemConfig, ...]:
                     name=name,
                     repo=_require_string(system_obj.get("repo"), "repo"),
                     ref=_require_string(system_obj.get("ref"), "ref"),
+                    c_compiler=(
+                        None
+                        if system_obj.get("c_compiler") is None
+                        else _require_string(system_obj.get("c_compiler"), "c_compiler")
+                    ),
+                    cxx_compiler=(
+                        None
+                        if system_obj.get("cxx_compiler") is None
+                        else _require_string(system_obj.get("cxx_compiler"), "cxx_compiler")
+                    ),
                     variants=variants,
                 )
             )
