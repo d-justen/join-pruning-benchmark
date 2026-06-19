@@ -250,7 +250,26 @@ def prepare_external_workload(
         initialize_external_db(duckdb_binary, db_path, list(layout.init_sql_paths))
         db_path = db_path.resolve()
         init_sql_paths = layout.init_sql_paths
+    queries_dir = layout.queries_dir.resolve()
+    if spec.query_names is not None:
+        query_paths: list[Path] = []
+        for query_name in spec.query_names:
+            query_path = layout.queries_dir / query_name
+            if not query_path.is_file():
+                raise ValueError(
+                    f"query not found for external workload {spec.name}: {query_name}"
+                )
+            query_paths.append(query_path)
+        subset_dir = artifact_dir / "queries"
+        subset_dir.mkdir(parents=True, exist_ok=True)
+        for query_path in query_paths:
+            shutil.copy2(query_path, subset_dir / query_path.name)
+        queries_dir = subset_dir.resolve()
     setup_sql_paths: tuple[Path, ...] = ()
+    if spec.setup_sql:
+        setup_sql_path = (artifact_dir / "setup.sql").resolve()
+        setup_sql_path.write_text("\n".join(spec.setup_sql) + "\n", encoding="utf-8")
+        setup_sql_paths = (setup_sql_path,)
     remote_parquet_catalog_path: Path | None = None
     runtime_db_path = db_path
     if layout.remote_http_parquet_latency_ms is not None:
@@ -265,7 +284,7 @@ def prepare_external_workload(
         artifact_dir=artifact_dir.resolve(),
         db_path=runtime_db_path,
         source_db_path=source_db_path.resolve() if source_db_path is not None else None,
-        queries_dir=layout.queries_dir.resolve(),
+        queries_dir=queries_dir,
         metadata_path=layout.metadata_path.resolve() if layout.metadata_path is not None else None,
         init_sql_paths=tuple(path.resolve() for path in init_sql_paths),
         db_handling=db_handling,

@@ -1,0 +1,7 @@
+{
+  "benchmark_name": "ssb-ordered",
+  "queries_dir": "queries",
+  "metadata_path": null,
+  "database_path": "ssb_sf100.duckdb",
+  "database_handling": "reuse"
+}

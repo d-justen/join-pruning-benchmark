@@ -66,6 +66,7 @@ Supported workload kinds:
 
 - `single_join_clusters`
 - `cross_product`
+- `string_joins`
 - `external`
 
 Example:
@@ -85,6 +86,44 @@ Example:
   }
 }
 ```
+
+Example string-join workload:
+
+```json
+{
+  "name": "string-joins",
+  "kind": "string_joins",
+  "params": {
+    "airport_csv_path": "external_benchmarks/string-joins/airports.csv",
+    "uuid_dim_size": 1000000,
+    "uuid_timestamp_start_ms": 1704067200000,
+    "uuid_timestamp_step_ms": 300000,
+    "uuid_selected_ranges": [
+      [100001, 102500],
+      [350001, 352500],
+      [650001, 652500],
+      [900001, 902500]
+    ],
+    "fact_rows": 100000000,
+    "dummy_string_cols": 2,
+    "dummy_string_len": 8,
+    "seed": 7
+  }
+}
+```
+
+The string-join workload loads the airport CSV into an `airport_dim` table and generates a
+UUID-like dimension plus one fact table. It writes four queries:
+
+- airport `ident` ordered by fact-row ranges with `continent = 'AN'`
+- airport `ident` uniformly distributed with `continent = 'AN'`
+- UUIDv7-like ordered string keys with separated selected dimension-key ranges
+- UUIDv4-like uniformly distributed string keys with the same gapped build-side predicate
+
+The UUIDv7-like key encodes an increasing 48-bit millisecond timestamp in its first 12
+hexadecimal digits. `uuid_timestamp_step_ms` controls the distance between adjacent keys.
+The selected ranges should be separated enough that min/max spans most of the dimension
+while a prefix-range filter can represent and prune the gaps.
 
 For external workloads:
 

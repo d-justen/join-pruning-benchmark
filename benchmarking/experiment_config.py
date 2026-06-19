@@ -97,14 +97,35 @@ class CrossProductWorkloadConfig:
 
 
 @dataclass(frozen=True)
+class StringJoinsWorkloadConfig:
+    kind: str
+    name: str
+    airport_csv_path: Path
+    uuid_dim_size: int
+    uuid_timestamp_start_ms: int
+    uuid_timestamp_step_ms: int
+    uuid_selected_ranges: tuple[tuple[int, int], ...]
+    fact_rows: int
+    dummy_string_cols: int
+    dummy_string_len: int
+    seed: int
+    remote_http_parquet_latency_ms: int | None
+
+
+@dataclass(frozen=True)
 class ExternalWorkloadConfig:
     kind: str
     name: str
     source_dir: Path
+    query_names: tuple[str, ...] | None = None
+    setup_sql: tuple[str, ...] = ()
 
 
 WorkloadConfig = (
-    SingleJoinClustersWorkloadConfig | CrossProductWorkloadConfig | ExternalWorkloadConfig
+    SingleJoinClustersWorkloadConfig
+    | CrossProductWorkloadConfig
+    | StringJoinsWorkloadConfig
+    | ExternalWorkloadConfig
 )
 
 
@@ -211,11 +232,65 @@ def _parse_cross_product(raw: dict, name: str) -> CrossProductWorkloadConfig:
     )
 
 
+def _parse_string_joins(raw: dict, name: str, base_dir: Path) -> StringJoinsWorkloadConfig:
+    params = _require_dict(raw.get("params"), f"workloads[{name}].params")
+    airport_csv_raw = _require_string(params.get("airport_csv_path"), "airport_csv_path")
+    ranges_raw = _require_list(params.get("uuid_selected_ranges"), "uuid_selected_ranges")
+    selected_ranges: list[tuple[int, int]] = []
+    for index, range_raw in enumerate(ranges_raw, start=1):
+        range_values = _require_list(range_raw, f"uuid_selected_ranges[{index}]")
+        if len(range_values) != 2:
+            raise ValueError(f"uuid_selected_ranges[{index}] must contain [start, end]")
+        selected_ranges.append(
+            (
+                _require_int(range_values[0], f"uuid_selected_ranges[{index}][0]"),
+                _require_int(range_values[1], f"uuid_selected_ranges[{index}][1]"),
+            )
+        )
+    return StringJoinsWorkloadConfig(
+        kind="string_joins",
+        name=name,
+        airport_csv_path=(base_dir / airport_csv_raw).resolve(),
+        uuid_dim_size=_require_int(params.get("uuid_dim_size"), "uuid_dim_size"),
+        uuid_timestamp_start_ms=_require_int(
+            params.get("uuid_timestamp_start_ms"), "uuid_timestamp_start_ms"
+        ),
+        uuid_timestamp_step_ms=_require_int(
+            params.get("uuid_timestamp_step_ms"), "uuid_timestamp_step_ms"
+        ),
+        uuid_selected_ranges=tuple(selected_ranges),
+        fact_rows=_require_int(params.get("fact_rows"), "fact_rows"),
+        dummy_string_cols=_require_int(params.get("dummy_string_cols", 2), "dummy_string_cols"),
+        dummy_string_len=_require_int(params.get("dummy_string_len", 24), "dummy_string_len"),
+        seed=_require_int(params.get("seed", 0), "seed"),
+        remote_http_parquet_latency_ms=(
+            None
+            if params.get("remote_http_parquet_latency_ms") is None
+            else _require_int(params.get("remote_http_parquet_latency_ms"), "remote_http_parquet_latency_ms")
+        ),
+    )
+
+
 def _parse_external(raw: dict, name: str, base_dir: Path) -> ExternalWorkloadConfig:
+    query_names_raw = raw.get("query_names")
+    query_names = (
+        None
+        if query_names_raw is None
+        else tuple(
+            _require_string(item, "query_names entry")
+            for item in _require_list(query_names_raw, "query_names")
+        )
+    )
+    setup_sql = tuple(
+        _normalize_sql_statement(_require_string(statement, "setup_sql entry"))
+        for statement in _require_list(raw.get("setup_sql", []), "setup_sql")
+    )
     return ExternalWorkloadConfig(
         kind="external",
         name=name,
         source_dir=(base_dir / _require_string(raw.get("source_dir"), "source_dir")).resolve(),
+        query_names=query_names,
+        setup_sql=setup_sql,
     )
 
 
@@ -236,6 +311,8 @@ def _parse_workloads(raw: object, base_dir: Path) -> tuple[WorkloadConfig, ...]:
             workloads.append(_parse_single_join_clusters(workload_obj, name))
         elif kind == "cross_product":
             workloads.append(_parse_cross_product(workload_obj, name))
+        elif kind == "string_joins":
+            workloads.append(_parse_string_joins(workload_obj, name, base_dir))
         elif kind == "external":
             workloads.append(_parse_external(workload_obj, name, base_dir))
         else:

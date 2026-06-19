@@ -12,6 +12,7 @@ from benchmarking.workloads import (
     prepare_cross_product_workload,
     prepare_external_workload,
     prepare_single_join_clusters_workload,
+    prepare_string_joins_workload,
 )
 
 
@@ -38,6 +39,8 @@ def prepare_workloads(
             manifest = prepare_single_join_clusters_workload(workload, artifact_dir)
         elif workload.kind == "cross_product":
             manifest = prepare_cross_product_workload(workload, artifact_dir)
+        elif workload.kind == "string_joins":
+            manifest = prepare_string_joins_workload(workload, artifact_dir)
         else:
             manifest = prepare_external_workload(
                 workload,

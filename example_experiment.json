@@ -81,6 +81,7 @@
             "SET enable_join_min_max_filter_pushdown=false;",
             "SET enable_join_bloom_filter_pushdown=false;",
             "SET enable_perfect_hash_join_filter_pushdown=false;",
+            "SET dynamic_or_filter_threshold=0;",
             "SET disabled_optimizers='compressed_materialization';"
           ]
         },
@@ -91,6 +92,7 @@
             "SET enable_join_min_max_filter_pushdown=false;",
             "SET enable_join_bloom_filter_pushdown=true;",
             "SET enable_perfect_hash_join_filter_pushdown=false;",
+            "SET dynamic_or_filter_threshold=0;",
             "SET disabled_optimizers='compressed_materialization';"
           ]
         },
@@ -101,6 +103,7 @@
             "SET enable_join_min_max_filter_pushdown=true;",
             "SET enable_join_bloom_filter_pushdown=true;",
             "SET enable_perfect_hash_join_filter_pushdown=false;",
+            "SET dynamic_or_filter_threshold=0;",
             "SET disabled_optimizers='compressed_materialization';"
           ]
         },
@@ -111,6 +114,7 @@
             "SET enable_join_min_max_filter_pushdown=true;",
             "SET enable_join_bloom_filter_pushdown=true;",
             "SET enable_perfect_hash_join_filter_pushdown=false;",
+            "SET dynamic_or_filter_threshold=0;",
             "SET disabled_optimizers='compressed_materialization';"
           ]
         }
