@@ -16,20 +16,9 @@ from benchmarking.workloads import (
 )
 
 
-def _prepare_duckdb_binary(config: ExperimentConfig, resolved_systems: list[ResolvedSystem]) -> str:
-    configured = config.benchmark.prepare_duckdb_binary
-    if configured != "duckdb":
-        return configured
-    if resolved_systems:
-        return str(resolved_systems[0].binary_path)
-    return configured
-
-
 def prepare_workloads(
     config: ExperimentConfig,
     paths: ExperimentPaths,
-    *,
-    prepare_duckdb_binary: str,
 ) -> list[PreparedWorkload]:
     prepared: list[PreparedWorkload] = []
     for workload in config.workloads:
@@ -42,11 +31,7 @@ def prepare_workloads(
         elif workload.kind == "string_joins":
             manifest = prepare_string_joins_workload(workload, artifact_dir)
         else:
-            manifest = prepare_external_workload(
-                workload,
-                artifact_dir,
-                prepare_duckdb_binary=prepare_duckdb_binary,
-            )
+            manifest = prepare_external_workload(workload, artifact_dir)
         prepared.append(manifest)
     return prepared
 
@@ -69,7 +54,6 @@ def run_experiment(config: ExperimentConfig) -> ExperimentPaths:
     workloads = prepare_workloads(
         config,
         paths,
-        prepare_duckdb_binary=_prepare_duckdb_binary(config, resolved_systems),
     )
     for system_config, resolved_system in zip(config.systems, resolved_systems):
         for workload in workloads:

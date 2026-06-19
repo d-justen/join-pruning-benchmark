@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,37 +14,6 @@ from benchmarking.manifests import PreparedWorkload, utc_now_iso, write_manifest
 
 DEFAULT_REMOTE_PARQUET_FILE_SIZE_MB = 200
 DEFAULT_REMOTE_PARQUET_COMPRESSION = "zstd"
-
-
-def run_command(command: list[str], *, cwd: Path | None = None) -> str:
-    result = subprocess.run(
-        command,
-        cwd=cwd,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            "command failed\n"
-            f"cwd: {cwd or Path.cwd()}\n"
-            f"command: {' '.join(command)}\n"
-            f"stdout:\n{result.stdout}\n"
-            f"stderr:\n{result.stderr}"
-        )
-    return result.stdout.strip()
-
-
-def resolve_binary(binary: str) -> Path:
-    if "/" in binary:
-        path = Path(binary).resolve()
-        if not path.exists():
-            raise FileNotFoundError(f"DuckDB binary not found: {binary}")
-        return path
-    candidate = shutil.which(binary)
-    if candidate is None:
-        raise FileNotFoundError(f"cannot find DuckDB binary on PATH: {binary}")
-    return Path(candidate).resolve()
 
 
 @dataclass(frozen=True)
@@ -164,15 +133,31 @@ def discover_external_layout(external_dir: Path) -> ExternalSourceLayout:
 
 
 def initialize_external_db(
-    duckdb_binary: Path,
     db_path: Path,
     init_sql_paths: list[Path],
 ) -> None:
     if db_path.exists():
         db_path.unlink()
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    for sql_path in init_sql_paths:
-        run_command([str(duckdb_binary), str(db_path), "-f", str(sql_path)], cwd=sql_path.parent)
+    con = duckdb.connect(str(db_path))
+    try:
+        for sql_path in init_sql_paths:
+            script = sql_path.read_text(encoding="utf-8")
+            previous_cwd = Path.cwd()
+            try:
+                os.chdir(sql_path.parent)
+                con.execute(script)
+            except Exception as exc:
+                raise RuntimeError(
+                    "command failed\n"
+                    f"cwd: {sql_path.parent}\n"
+                    f"command: python duckdb execute {sql_path}\n"
+                    f"stderr:\n{exc}"
+                ) from exc
+            finally:
+                os.chdir(previous_cwd)
+    finally:
+        con.close()
 
 
 def materialize_existing_db(source_db_path: Path, artifact_dir: Path, db_handling: str) -> Path:
@@ -235,8 +220,6 @@ def export_remote_parquet_catalog(source_db_path: Path, artifact_dir: Path) -> P
 def prepare_external_workload(
     spec: ExternalWorkloadConfig,
     artifact_dir: Path,
-    *,
-    prepare_duckdb_binary: str,
 ) -> PreparedWorkload:
     layout = discover_external_layout(spec.source_dir)
     source_db_path = layout.source_db_path
@@ -246,8 +229,7 @@ def prepare_external_workload(
         init_sql_paths: tuple[Path, ...] = ()
     else:
         db_path = artifact_dir / "benchmark.duckdb"
-        duckdb_binary = resolve_binary(prepare_duckdb_binary)
-        initialize_external_db(duckdb_binary, db_path, list(layout.init_sql_paths))
+        initialize_external_db(db_path, list(layout.init_sql_paths))
         db_path = db_path.resolve()
         init_sql_paths = layout.init_sql_paths
     queries_dir = layout.queries_dir.resolve()
