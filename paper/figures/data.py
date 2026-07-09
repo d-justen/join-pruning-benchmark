@@ -248,23 +248,30 @@ def load_probe_scan_rows(experiment_root: Path, system_name: str) -> list[ProbeS
 
 
 def _extract_join_probe_metrics(profile_data: dict) -> tuple[int, int]:
-    cumulative_join_probe_tuples = 0
+    left_subtree_scan_cardinalities: dict[tuple[int, ...], int] = {}
     join_operator_count = 0
-    stack = [profile_data]
-    while stack:
-        node = stack.pop()
+
+    def collect_scan_cardinalities(node: dict, path: tuple[int, ...]) -> None:
+        if node.get("operator_type") == "TABLE_SCAN":
+            operator_cardinality = node.get("operator_cardinality")
+            if isinstance(operator_cardinality, int):
+                left_subtree_scan_cardinalities[path] = operator_cardinality
+        for index, child in enumerate(node.get("children", [])):
+            collect_scan_cardinalities(child, path + (index,))
+
+    def visit(node: dict, path: tuple[int, ...]) -> None:
+        nonlocal join_operator_count
         children = node.get("children", [])
-        stack.extend(children)
         operator_type = str(node.get("operator_type", ""))
-        if not operator_type.endswith("_JOIN"):
-            continue
-        join_operator_count += 1
-        if not children:
-            continue
-        left_cardinality = children[0].get("operator_cardinality")
-        if isinstance(left_cardinality, int):
-            cumulative_join_probe_tuples += left_cardinality
-    return cumulative_join_probe_tuples, join_operator_count
+        if operator_type.endswith("_JOIN"):
+            join_operator_count += 1
+            if children:
+                collect_scan_cardinalities(children[0], path + (0,))
+        for index, child in enumerate(children):
+            visit(child, path + (index,))
+
+    visit(profile_data, ())
+    return sum(left_subtree_scan_cardinalities.values()), join_operator_count
 
 
 def load_plan_metric_rows(

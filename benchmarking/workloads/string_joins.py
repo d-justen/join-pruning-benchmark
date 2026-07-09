@@ -281,17 +281,27 @@ def _uuid_select_clause(spec: StringJoinsWorkloadConfig) -> str:
     return ",\n".join(payload_exprs) if payload_exprs else "    COUNT(*) AS row_count"
 
 
+def _airport_select_clause() -> str:
+    return ",\n".join(
+        [
+            "    ANY_VALUE(a.ident) AS ident",
+            "    ANY_VALUE(a.name) AS name",
+            "    ANY_VALUE(a.municipality) AS municipality",
+        ]
+    )
+
+
 def _write_queries(spec: StringJoinsWorkloadConfig, queries_dir: Path) -> list[Path]:
     queries = {
-        "airport_ordered_antarctica.sql": """SELECT
-    COUNT(*) AS row_count
+        "airport_ordered_antarctica.sql": f"""SELECT
+{_airport_select_clause()}
 FROM fact AS f
 JOIN airport_dim AS a
   ON f.airport_ident_ordered = a.ident
 WHERE a.continent = 'AN';
 """,
-        "airport_uniform_antarctica.sql": """SELECT
-    COUNT(*) AS row_count
+        "airport_uniform_antarctica.sql": f"""SELECT
+{_airport_select_clause()}
 FROM fact AS f
 JOIN airport_dim AS a
   ON f.airport_ident_uniform = a.ident

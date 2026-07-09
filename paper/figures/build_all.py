@@ -56,6 +56,12 @@ PAGE_SIZES = {
     "two-column": (7.0, 3.15),
 }
 
+TITLE_FONT_SIZE = 8.0
+LABEL_FONT_SIZE = 8.0
+TICK_FONT_SIZE = 7.0
+LEGEND_FONT_SIZE = 7.0
+ANNOTATION_FONT_SIZE = 6.5
+
 COLORS = {
     "no prefilter": "#9ca3af",
     "sip": "#2563eb",
@@ -71,7 +77,7 @@ ROWS_SCANNED_HATCH = "////"
 BENCHMARK_RUNTIME_BOXPLOT_GROUPS = (
     (
         "join-pruning-workload",
-        "Join Pruning",
+        "JPB",
         JPB_ALL_QUERIES,
     ),
     (
@@ -100,6 +106,24 @@ VARIANT_PANEL_LABELS = {
 MULTI_JOIN_QUERY_PANEL_SIZE = 24
 
 
+def _available_workload_names(rows: list) -> set[str]:
+    return {row.workload_name for row in rows}
+
+
+def _figure_is_available(figure, available_workloads: set[str]) -> bool:
+    if len(figure.workloads) > 1:
+        return all(workload_name in available_workloads for workload_name in figure.workloads)
+    return any(workload_name in available_workloads for workload_name in figure.workloads)
+
+
+def _present_benchmark_groups(rows: list) -> tuple[tuple[str, str, tuple[str, ...] | None], ...]:
+    available_workloads = _available_workload_names(rows)
+    return tuple(
+        group for group in BENCHMARK_RUNTIME_BOXPLOT_GROUPS
+        if group[0] in available_workloads
+    )
+
+
 def _variant_display_label(label: str) -> str:
     return VARIANT_DISPLAY_LABELS.get(label, label)
 
@@ -117,24 +141,29 @@ def _format_axis_value(metric: str):
 def _format_large_number(value: float) -> str:
     if value >= 1_000_000_000:
         scaled = value / 1_000_000_000
-        return f"{scaled:.0f}B" if scaled >= 100 else f"{scaled:.1f}B"
+        return f"{scaled:.0f}B" if float(scaled).is_integer() else f"{scaled:.1f}B"
     if value >= 1_000_000:
         scaled = value / 1_000_000
-        return f"{scaled:.0f}M" if scaled >= 100 else f"{scaled:.1f}M"
+        return f"{scaled:.0f}M" if float(scaled).is_integer() else f"{scaled:.1f}M"
     if value >= 1_000:
         scaled = value / 1_000
-        return f"{scaled:.0f}K" if scaled >= 100 else f"{scaled:.1f}K"
+        return f"{scaled:.0f}K" if float(scaled).is_integer() else f"{scaled:.1f}K"
     return f"{value:.0f}"
 
 
-def _log_axis_bounds(values: list[float], *, min_floor: float = 1.0) -> tuple[float, float] | None:
+def _log_axis_bounds(
+    values: list[float],
+    *,
+    min_floor: float = 1.0,
+    upper_padding: float = 1.15,
+) -> tuple[float, float] | None:
     positive_values = [value for value in values if value > 0]
     if not positive_values:
         return None
     lower_power = math.floor(math.log10(min(positive_values)))
-    upper_power = math.ceil(math.log10(max(positive_values)))
+    max_value = max(positive_values)
     lower = max(min_floor, 10 ** lower_power)
-    upper = max(lower * 10, 10 ** upper_power)
+    upper = max(lower * 1.01, max_value * upper_padding)
     return lower, upper
 
 
@@ -161,6 +190,34 @@ def _label_rotation(width_key: str, count: int) -> int:
     if width_key == "one-column":
         return 45
     return 30 if count > 8 else 0
+
+
+def _text_scale(width_key: str, placement_width_key: str) -> float:
+    return PAGE_SIZES[width_key][0] / PAGE_SIZES[placement_width_key][0]
+
+
+def _capped_text_scale(width_key: str, placement_width_key: str, *, maximum: float = 1.45) -> float:
+    return min(_text_scale(width_key, placement_width_key), maximum)
+
+
+def _log_ticks(lower: float, upper: float) -> list[float]:
+    lower_power = int(math.floor(math.log10(lower)))
+    upper_power = int(math.floor(math.log10(upper)))
+    return [10 ** power for power in range(lower_power, upper_power + 1)]
+
+
+def _scaled_font_size(size: float, scale: float) -> float:
+    return round(size * scale, 2)
+
+
+def _wrap_tick_label(label: str, text_scale: float) -> str:
+    if text_scale < 1.5 or " " not in label:
+        return label
+    words = label.split()
+    if len(words) == 2:
+        return "\n".join(words)
+    midpoint = math.ceil(len(words) / 2)
+    return " ".join(words[:midpoint]) + "\n" + " ".join(words[midpoint:])
 
 
 def _verify_layout(fig, ax) -> dict[str, bool]:
@@ -192,11 +249,16 @@ def _draw_vertical_grouped_bars(
     *,
     entries: list[dict[str, object]],
     width_key: str,
+    placement_width_key: str,
     metric: str,
     y_label: str,
     workload_labels: bool,
 ) -> dict[str, bool]:
     width, height = PAGE_SIZES[width_key]
+    text_scale = _text_scale(width_key, placement_width_key)
+    tick_font_size = _scaled_font_size(TICK_FONT_SIZE, text_scale)
+    label_font_size = _scaled_font_size(LABEL_FONT_SIZE, text_scale)
+    legend_font_size = _scaled_font_size(LEGEND_FONT_SIZE, text_scale)
     count = len(entries)
     if count > 8:
         height += 0.35
@@ -241,11 +303,11 @@ def _draw_vertical_grouped_bars(
         xticklabels,
         rotation=_label_rotation(width_key, count),
         ha="right" if _label_rotation(width_key, count) else "center",
-        fontsize=7,
+        fontsize=tick_font_size,
     )
-    ax.set_ylabel(y_label, fontsize=8)
+    ax.set_ylabel(y_label, fontsize=label_font_size)
     ax.yaxis.set_major_formatter(_format_axis_value(metric))
-    ax.tick_params(axis="y", labelsize=7)
+    ax.tick_params(axis="y", labelsize=tick_font_size)
     ax.tick_params(axis="x", pad=2)
     ax.grid(axis="y", color="#e5e7eb", linewidth=0.8, zorder=0)
     ax.spines["top"].set_visible(False)
@@ -259,7 +321,7 @@ def _draw_vertical_grouped_bars(
         bbox_to_anchor=(0.5, 1.20),
         ncol=2,
         frameon=False,
-        fontsize=7,
+        fontsize=legend_font_size,
         handlelength=1.3,
         columnspacing=1.2,
     )
@@ -290,13 +352,25 @@ def _draw_runtime_probe_bars(
     *,
     entries: list[dict[str, object]],
     width_key: str,
+    placement_width_key: str,
     show_query_labels: bool,
+    annotate_runtime_values: bool,
     runtime_log_axis: bool,
     rows_log_axis: bool,
 ) -> dict[str, bool]:
     width, height = PAGE_SIZES[width_key]
-    height += 1.0
+    text_scale = _capped_text_scale(width_key, placement_width_key)
+    compressed_column_layout = placement_width_key == "one-column" and width_key != placement_width_key
+    tick_font_size = _scaled_font_size(TICK_FONT_SIZE, text_scale)
+    label_font_size = _scaled_font_size(LABEL_FONT_SIZE, text_scale)
+    legend_font_size = _scaled_font_size(LEGEND_FONT_SIZE, text_scale)
+    annotation_font_size = _scaled_font_size(ANNOTATION_FONT_SIZE - 0.5, text_scale)
+    has_bar_labels = annotate_runtime_values
+    height += 0.95 if compressed_column_layout else 1.0
+    if has_bar_labels:
+        height += 0.12
     mirrored_log_layout = runtime_log_axis or rows_log_axis
+    panel_hspace = 0.055 if compressed_column_layout else (0.035 if mirrored_log_layout else 0.0)
     fig, (runtime_ax, rows_ax) = plt.subplots(
         2,
         1,
@@ -304,7 +378,7 @@ def _draw_runtime_probe_bars(
         sharex=True,
         gridspec_kw={
             "height_ratios": [1.0, 1.15],
-            "hspace": 0.035 if mirrored_log_layout else 0.0,
+            "hspace": panel_hspace,
         },
         constrained_layout=False,
     )
@@ -380,6 +454,23 @@ def _draw_runtime_probe_bars(
                 linewidth=0.5,
                 zorder=3,
             )
+        if annotate_runtime_values:
+            label_values = rendered_runtime_values if runtime_log_axis else runtime_values
+            for position, value, label_value in zip(positions, runtime_values, label_values):
+                if value <= 0:
+                    continue
+                runtime_ax.annotate(
+                    f"{value:.0f}",
+                    xy=(position, label_value),
+                    xytext=(0, 2),
+                    textcoords="offset points",
+                    ha="center",
+                    va="bottom",
+                    fontsize=annotation_font_size,
+                    color="#111827",
+                    clip_on=False,
+                    zorder=5,
+                )
 
         if rows_log_axis:
             rendered_output_values = [
@@ -435,20 +526,21 @@ def _draw_runtime_probe_bars(
                 zorder=3,
             )
 
-    runtime_ax.set_ylabel("Execution time (ms, log scale)" if runtime_log_axis else "Execution time (ms)", fontsize=8)
+    runtime_ax.set_ylabel(
+        "Time (ms)" if compressed_column_layout else "Execution time (ms)",
+        fontsize=label_font_size,
+        labelpad=10,
+    )
     if runtime_log_axis:
-        runtime_bounds = _log_axis_bounds(positive_runtime_values)
+        runtime_bounds = _log_axis_bounds(
+            positive_runtime_values,
+            upper_padding=1.35 if annotate_runtime_values else 1.15,
+        )
         if runtime_bounds:
             runtime_floor, runtime_upper = runtime_bounds
             runtime_ax.set_yscale("log")
             runtime_ax.set_ylim(runtime_floor, runtime_upper)
-            runtime_ax.set_yticks([
-                10 ** power
-                for power in range(
-                    int(math.floor(math.log10(runtime_floor))),
-                    int(math.ceil(math.log10(runtime_upper))) + 1,
-                )
-            ])
+            runtime_ax.set_yticks(_log_ticks(runtime_floor, runtime_upper))
             runtime_ax.yaxis.set_major_formatter(LogFormatterMathtext(base=10))
             _drop_seam_tick(runtime_ax)
         else:
@@ -456,20 +548,18 @@ def _draw_runtime_probe_bars(
     else:
         runtime_ax.yaxis.set_major_formatter(_format_axis_value("runtime_ms"))
         runtime_ax.set_ylim(0, runtime_max * 1.15 if runtime_max > 0 else 1.0)
-    rows_ax.set_ylabel("Probe rows (log scale)" if rows_log_axis else "Probe rows", fontsize=8)
+    rows_ax.set_ylabel(
+        "Probe rows",
+        fontsize=label_font_size,
+        labelpad=10,
+    )
     if rows_log_axis:
         row_bounds = _log_axis_bounds(positive_row_values)
         if row_bounds:
             row_floor, row_upper = row_bounds
             rows_ax.set_yscale("log")
             rows_ax.set_ylim(row_floor, row_upper)
-            rows_ax.set_yticks([
-                10 ** power
-                for power in range(
-                    int(math.floor(math.log10(row_floor))),
-                    int(math.ceil(math.log10(row_upper))) + 1,
-                )
-            ])
+            rows_ax.set_yticks(_log_ticks(row_floor, row_upper))
             rows_ax.yaxis.set_major_formatter(LogFormatterMathtext(base=10))
             _drop_seam_tick(rows_ax)
         else:
@@ -481,7 +571,7 @@ def _draw_runtime_probe_bars(
     rows_ax.invert_yaxis()
 
     for ax in (runtime_ax, rows_ax):
-        ax.tick_params(axis="y", labelsize=7)
+        ax.tick_params(axis="y", labelsize=tick_font_size)
         ax.grid(axis="y", color="#e5e7eb", linewidth=0.8, zorder=0)
         ax.spines["right"].set_visible(False)
         ax.spines["left"].set_color("#9ca3af")
@@ -492,11 +582,17 @@ def _draw_runtime_probe_bars(
     if mirrored_log_layout:
         _draw_axis_break_marks(runtime_ax, rows_ax)
 
+    has_wrapped_xticklabels = False
     if show_query_labels:
+        xticklabels = [
+            _wrap_tick_label(str(entry["query_label"]), text_scale)
+            for entry in entries
+        ]
+        has_wrapped_xticklabels = any("\n" in label for label in xticklabels)
         rows_ax.set_xticks(x_positions)
         rows_ax.set_xticklabels(
-            [str(entry["query_label"]) for entry in entries],
-            fontsize=7,
+            xticklabels,
+            fontsize=tick_font_size,
         )
     else:
         rows_ax.set_xticks([])
@@ -532,23 +628,37 @@ def _draw_runtime_probe_bars(
             variant_handles[3],
             semantic_handles[1],
         ]
-    runtime_ax.legend(
-        handles=legend_handles,
-        loc="upper center",
-        bbox_to_anchor=(0.5, 1.42 if width_key == "one-column" else 1.31),
-        ncol=2 if width_key == "one-column" else 3,
-        frameon=False,
-        fontsize=7,
-        handlelength=1.5,
-        columnspacing=1.1,
-    )
+    if has_bar_labels:
+        fig.legend(
+            handles=legend_handles,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.89),
+            ncol=3,
+            frameon=False,
+            fontsize=legend_font_size,
+            handlelength=1.5,
+            columnspacing=1.0,
+        )
+    else:
+        runtime_ax.legend(
+            handles=legend_handles,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 1.40 if compressed_column_layout else (1.42 if width_key == "one-column" else 1.31)),
+            ncol=3 if compressed_column_layout else (2 if width_key == "one-column" else 3),
+            frameon=False,
+            fontsize=legend_font_size,
+            handlelength=1.5,
+            columnspacing=1.1,
+        )
 
     fig.subplots_adjust(
-        left=0.26 if width_key == "one-column" else 0.10,
+        left=0.26 if width_key == "one-column" else (0.17 if compressed_column_layout else 0.10),
         right=0.992 if width_key == "one-column" else 0.997,
-        bottom=0.08 if not show_query_labels else 0.11,
-        top=0.75 if width_key == "one-column" else 0.83,
+        bottom=0.08 if not show_query_labels else (0.18 if has_wrapped_xticklabels else (0.12 if compressed_column_layout else 0.11)),
+        top=0.74 if has_bar_labels else (0.72 if compressed_column_layout else (0.75 if width_key == "one-column" else 0.83)),
     )
+    runtime_ax.yaxis.set_label_coords(-0.11, 0.5)
+    rows_ax.yaxis.set_label_coords(-0.11, 0.5)
     runtime_verification = _verify_layout(fig, runtime_ax)
     rows_verification = _verify_layout(fig, rows_ax)
     verification = {
@@ -566,7 +676,7 @@ def _draw_runtime_probe_bars(
         output_path,
         format=output_path.suffix.removeprefix(".") or "pdf",
         bbox_inches="tight",
-        pad_inches=0.01,
+        pad_inches=0.05,
     )
     plt.close(fig)
     return verification
@@ -577,6 +687,7 @@ def _draw_runtime_total_rows_bars(
     *,
     entries: list[dict[str, object]],
     width_key: str,
+    placement_width_key: str,
     show_query_labels: bool,
     show_runtime_labels: bool,
     workload_labels: bool,
@@ -584,7 +695,15 @@ def _draw_runtime_total_rows_bars(
     rows_log_axis: bool,
 ) -> dict[str, bool]:
     width, height = PAGE_SIZES[width_key]
-    height += 0.85
+    text_scale = _capped_text_scale(width_key, placement_width_key)
+    compressed_column_layout = placement_width_key == "one-column" and width_key != placement_width_key
+    tick_font_size = _scaled_font_size(TICK_FONT_SIZE, text_scale)
+    label_font_size = _scaled_font_size(LABEL_FONT_SIZE, text_scale)
+    legend_font_size = _scaled_font_size(LEGEND_FONT_SIZE, text_scale)
+    annotation_font_size = _scaled_font_size(ANNOTATION_FONT_SIZE, text_scale)
+    height += 1.0 if compressed_column_layout else 0.85
+    if show_runtime_labels:
+        height += 0.10
     mirrored_log_layout = runtime_log_axis or rows_log_axis
     fig, (runtime_ax, rows_ax) = plt.subplots(
         2,
@@ -675,7 +794,7 @@ def _draw_runtime_total_rows_bars(
                     textcoords="offset points",
                     ha="center",
                     va="bottom",
-                    fontsize=6.5,
+                    fontsize=annotation_font_size,
                     color="#111827",
                     clip_on=False,
                     zorder=5,
@@ -706,19 +825,17 @@ def _draw_runtime_total_rows_bars(
                 zorder=3,
             )
 
-    runtime_ax.set_ylabel("Time (ms)", fontsize=8)
+    runtime_ax.set_ylabel("Time (ms)", fontsize=label_font_size)
     if runtime_log_axis:
+        runtime_bounds = _log_axis_bounds(
+            positive_runtime_values,
+            upper_padding=1.35 if show_runtime_labels else 1.15,
+        )
         if runtime_bounds:
             runtime_floor, runtime_upper = runtime_bounds
             runtime_ax.set_yscale("log")
             runtime_ax.set_ylim(runtime_floor, runtime_upper)
-            runtime_ax.set_yticks([
-                10 ** power
-                for power in range(
-                    int(math.floor(math.log10(runtime_floor))),
-                    int(math.ceil(math.log10(runtime_upper))) + 1,
-                )
-            ])
+            runtime_ax.set_yticks(_log_ticks(runtime_floor, runtime_upper))
             runtime_ax.yaxis.set_major_formatter(LogFormatterMathtext(base=10))
             _drop_seam_tick(runtime_ax)
         else:
@@ -727,19 +844,13 @@ def _draw_runtime_total_rows_bars(
         runtime_ax.yaxis.set_major_formatter(_format_axis_value("runtime_ms"))
         runtime_ax.set_ylim(0, runtime_max * 1.15 if runtime_max > 0 else 1.0)
 
-    rows_ax.set_ylabel("Rows scanned", fontsize=8)
+    rows_ax.set_ylabel("Rows scanned", fontsize=label_font_size)
     if rows_log_axis:
         if row_bounds:
             row_floor, row_upper = row_bounds
             rows_ax.set_yscale("log")
             rows_ax.set_ylim(row_floor, row_upper)
-            rows_ax.set_yticks([
-                10 ** power
-                for power in range(
-                    int(math.floor(math.log10(row_floor))),
-                    int(math.ceil(math.log10(row_upper))) + 1,
-                )
-            ])
+            rows_ax.set_yticks(_log_ticks(row_floor, row_upper))
             rows_ax.yaxis.set_major_formatter(LogFormatterMathtext(base=10))
             _drop_seam_tick(rows_ax)
         else:
@@ -751,7 +862,7 @@ def _draw_runtime_total_rows_bars(
     rows_ax.invert_yaxis()
 
     for ax in (runtime_ax, rows_ax):
-        ax.tick_params(axis="y", labelsize=7)
+        ax.tick_params(axis="y", labelsize=tick_font_size)
         ax.grid(axis="y", color="#e5e7eb", linewidth=0.8, zorder=0)
         ax.spines["right"].set_visible(False)
         ax.spines["left"].set_color("#9ca3af")
@@ -762,44 +873,63 @@ def _draw_runtime_total_rows_bars(
     if mirrored_log_layout:
         _draw_axis_break_marks(runtime_ax, rows_ax)
 
+    has_wrapped_xticklabels = False
     if show_query_labels:
         xticklabels = []
         for entry in entries:
             label = str(entry["query_label"])
             if workload_labels:
                 label = str(entry["workload_label"])
-            xticklabels.append(label)
+            xticklabels.append(_wrap_tick_label(label, text_scale))
+        has_wrapped_xticklabels = any("\n" in label for label in xticklabels)
         rows_ax.set_xticks(x_positions)
         rows_ax.set_xticklabels(xticklabels, fontsize=7)
+        for tick in rows_ax.get_xticklabels():
+            tick.set_fontsize(tick_font_size)
     else:
         rows_ax.set_xticks([])
     rows_ax.tick_params(axis="x", pad=4, length=0)
     rows_ax.set_xlim(-0.6, count - 0.4)
 
-    runtime_ax.legend(
-        handles=[
-            Patch(
-                facecolor=COLORS[label],
-                edgecolor="none",
-                label=_variant_display_label(label),
-            )
-            for label in VARIANT_ORDER
-        ],
-        loc="upper center",
-        bbox_to_anchor=(0.5, 1.40 if width_key == "one-column" else 1.30),
-        ncol=2 if width_key == "one-column" else 4,
-        frameon=False,
-        fontsize=7,
-        handlelength=1.5,
-        columnspacing=1.1,
-    )
+    total_rows_legend_handles = [
+        Patch(
+            facecolor=COLORS[label],
+            edgecolor="none",
+            label=_variant_display_label(label),
+        )
+        for label in VARIANT_ORDER
+    ]
+    if show_runtime_labels:
+        fig.legend(
+            handles=total_rows_legend_handles,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.89),
+            ncol=2,
+            frameon=False,
+            fontsize=legend_font_size,
+            handlelength=1.5,
+            columnspacing=1.0,
+        )
+    else:
+        runtime_ax.legend(
+            handles=total_rows_legend_handles,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 1.36 if compressed_column_layout else (1.40 if width_key == "one-column" else 1.30)),
+            ncol=2 if width_key == "one-column" else (2 if compressed_column_layout else 4),
+            frameon=False,
+            fontsize=legend_font_size,
+            handlelength=1.5,
+            columnspacing=1.1,
+        )
 
     fig.subplots_adjust(
-        left=0.24 if width_key == "one-column" else 0.10,
+        left=0.24 if width_key == "one-column" else (0.14 if compressed_column_layout else 0.10),
         right=0.992 if width_key == "one-column" else 0.997,
-        bottom=0.08 if not show_query_labels else 0.11,
-        top=0.74 if width_key == "one-column" else 0.83,
+        bottom=0.08 if not show_query_labels else (0.18 if has_wrapped_xticklabels else (0.13 if compressed_column_layout else 0.11)),
+        top=0.74 if show_runtime_labels else (0.70 if compressed_column_layout else (0.74 if width_key == "one-column" else 0.83)),
     )
+    runtime_ax.yaxis.set_label_coords(-0.14 if show_runtime_labels else -0.11, 0.5)
+    rows_ax.yaxis.set_label_coords(-0.14 if show_runtime_labels else -0.11, 0.5)
     runtime_verification = _verify_layout(fig, runtime_ax)
     rows_verification = _verify_layout(fig, rows_ax)
     verification = {
@@ -817,7 +947,7 @@ def _draw_runtime_total_rows_bars(
         output_path,
         format=output_path.suffix.removeprefix(".") or "pdf",
         bbox_inches="tight",
-        pad_inches=0.01,
+        pad_inches=0.05,
     )
     plt.close(fig)
     return verification
@@ -1005,7 +1135,7 @@ def _draw_runtime_plan_work_bars(
         output_path,
         format=output_path.suffix.removeprefix(".") or "pdf",
         bbox_inches="tight",
-        pad_inches=0.01,
+        pad_inches=0.05,
     )
     plt.close(fig)
     return verification
@@ -1077,12 +1207,20 @@ def _draw_benchmark_runtime_boxplot(
     output_path: Path,
     *,
     distributions: list[dict[str, object]],
+    placement_width_key: str,
 ) -> dict[str, bool]:
-    width, height = PAGE_SIZES["two-column"]
+    width_key = "two-column"
+    width, height = PAGE_SIZES[width_key]
+    text_scale = _capped_text_scale(width_key, placement_width_key)
+    compressed_column_layout = placement_width_key == "one-column"
+    tick_font_size = _scaled_font_size(TICK_FONT_SIZE, text_scale)
+    title_font_size = _scaled_font_size(TITLE_FONT_SIZE, text_scale)
+    label_font_size = _scaled_font_size(LABEL_FONT_SIZE, text_scale)
+    legend_font_size = _scaled_font_size(LEGEND_FONT_SIZE, text_scale)
     fig, axes = plt.subplots(
         1,
         len(distributions),
-        figsize=(width, height + 0.35),
+        figsize=(width, height + (0.55 if compressed_column_layout else 0.35)),
         constrained_layout=False,
     )
     fig.patch.set_facecolor("white")
@@ -1127,7 +1265,7 @@ def _draw_benchmark_runtime_boxplot(
         ax.set_ylim(0, ymax)
         ax.yaxis.set_major_formatter(_format_axis_value("runtime_ms"))
         ax.yaxis.set_major_locator(MaxNLocator(nbins=5, prune="upper"))
-        ax.tick_params(axis="y", labelsize=7)
+        ax.tick_params(axis="y", labelsize=tick_font_size)
         ax.set_xticks([])
         ax.tick_params(axis="x", length=0)
         ax.grid(axis="y", which="major", color="#e5e7eb", linewidth=0.8, zorder=0)
@@ -1138,11 +1276,14 @@ def _draw_benchmark_runtime_boxplot(
         ax.set_xlim(0.35, 4.65)
         ax.set_title(
             f"{distribution['benchmark_label']}\n(n={distribution['query_count']})",
-            fontsize=8,
+            fontsize=title_font_size,
             pad=8,
         )
         if index == 0:
-            ax.set_ylabel("Query execution time (ms)", fontsize=8)
+            ax.set_ylabel(
+                "Time (ms)" if compressed_column_layout else "Query execution time (ms)",
+                fontsize=label_font_size,
+            )
         else:
             ax.set_ylabel("")
 
@@ -1156,14 +1297,20 @@ def _draw_benchmark_runtime_boxplot(
             for label in VARIANT_ORDER
         ],
         loc="upper center",
-        bbox_to_anchor=(0.5, 1.10),
+        bbox_to_anchor=(0.5, 1.08),
         ncol=4,
         frameon=False,
-        fontsize=7,
+        fontsize=legend_font_size,
         handlelength=1.4,
         columnspacing=1.2,
     )
-    fig.subplots_adjust(left=0.08, right=0.997, bottom=0.11, top=0.86, wspace=0.18)
+    fig.subplots_adjust(
+        left=0.12 if compressed_column_layout else 0.08,
+        right=0.997,
+        bottom=0.11,
+        top=0.79 if compressed_column_layout else 0.86,
+        wspace=0.22 if compressed_column_layout else 0.18,
+    )
     verifications = [_verify_layout(fig, ax) for ax in axes]
     verification = {
         "tick_label_overlap": any(item["tick_label_overlap"] for item in verifications),
@@ -1174,7 +1321,7 @@ def _draw_benchmark_runtime_boxplot(
         output_path,
         format=output_path.suffix.removeprefix(".") or "pdf",
         bbox_inches="tight",
-        pad_inches=0.01,
+        pad_inches=0.05,
     )
     plt.close(fig)
     return verification
@@ -1224,32 +1371,37 @@ def _benchmark_summaries(rows: list) -> dict[str, object]:
     job_queries = tuple(
         sorted({row.query_name for row in rows if row.workload_name == "join-order-benchmark"})
     )
-    return {
-        "join_pruning_benchmark": summarize_benchmark_runtime(
+    summaries: dict[str, object] = {}
+    available_workloads = _available_workload_names(rows)
+    if "join-pruning-workload" in available_workloads:
+        summaries["join_pruning_benchmark"] = summarize_benchmark_runtime(
             rows,
             workload_name="join-pruning-workload",
             query_names=JPB_ALL_QUERIES,
             benchmark_label=WORKLOAD_LABELS["join-pruning-workload"],
-        ),
-        "tpch_skew_selected": summarize_benchmark_runtime(
+        )
+    if "tpch-skew" in available_workloads:
+        summaries["tpch_skew_selected"] = summarize_benchmark_runtime(
             rows,
             workload_name="tpch-skew",
             query_names=TPCH_SELECTED_QUERIES,
             benchmark_label=WORKLOAD_LABELS["tpch-skew"],
-        ),
-        "string_join_benchmark": summarize_benchmark_runtime(
+        )
+    if "string-joins" in available_workloads:
+        summaries["string_join_benchmark"] = summarize_benchmark_runtime(
             rows,
             workload_name="string-joins",
             query_names=STRING_JOIN_QUERIES,
             benchmark_label=WORKLOAD_LABELS["string-joins"],
-        ),
-        "join_order_benchmark": summarize_benchmark_runtime(
+        )
+    if "join-order-benchmark" in available_workloads:
+        summaries["join_order_benchmark"] = summarize_benchmark_runtime(
             rows,
             workload_name="join-order-benchmark",
             query_names=job_queries,
             benchmark_label=WORKLOAD_LABELS["join-order-benchmark"],
-        ),
-    }
+        )
+    return summaries
 
 
 def _format_duration_ms(value: float) -> str:
@@ -1362,7 +1514,7 @@ def _write_benchmark_summary_markdown(
             "- **Relative time:** geometric mean of each query runtime divided by the best variant runtime for that query.",
             "- **Rows scanned:** sum of profile-level `cumulative_rows_scanned` across all queries.",
             "- **Relative rows:** geometric mean of each query's cumulative rows scanned divided by the best variant for that query.",
-            "- **Join-probe tuples:** sum of the left-child output cardinality for every `*_JOIN` operator in every query plan. Intermediate tuples may be counted at multiple joins.",
+            "- **Join-probe tuples:** sum of the output cardinality of distinct `TABLE_SCAN` operators that appear anywhere in the left subtree of at least one `*_JOIN` operator in a query plan. Each qualifying scan is counted once per query.",
             "- **Relative probes:** geometric mean of each query's join-probe tuples divided by the best variant for that query.",
             "- Lower relative values are better; `1.00x` is best.",
             "",
@@ -1402,14 +1554,19 @@ def build_figures(experiment_root: Path, system_name: str | None) -> Path:
     probe_scan_rows = load_probe_scan_rows(experiment_root, resolved_system_name)
     output_dir = experiment_root / "paper"
     figures_dir = output_dir / "figures"
+    available_workloads = _available_workload_names(rows)
     summary: dict[str, object] = {
         "experiment_root": str(experiment_root),
         "system_name": resolved_system_name,
         "figures": {},
         "sections": {},
         "verification": {},
+        "skipped_figures": [],
     }
     for figure in FIGURES:
+        if not _figure_is_available(figure, available_workloads):
+            summary["skipped_figures"].append(figure.slug)
+            continue
         if figure.metric == "runtime_and_probe_rows":
             workload_name = figure.workloads[0]
             query_names = figure.queries_by_workload[workload_name]
@@ -1515,7 +1672,9 @@ def build_figures(experiment_root: Path, system_name: str | None) -> Path:
                 figure_path,
                 entries=entries,
                 width_key=figure.width,
+                placement_width_key=figure.placement_width,
                 show_query_labels=figure.show_query_labels,
+                annotate_runtime_values=figure.annotate_runtime_values,
                 runtime_log_axis=figure.runtime_log_axis,
                 rows_log_axis=figure.rows_log_axis,
             )
@@ -1524,6 +1683,7 @@ def build_figures(experiment_root: Path, system_name: str | None) -> Path:
                 figure_path,
                 entries=entries,
                 width_key=figure.width,
+                placement_width_key=figure.placement_width,
                 show_query_labels=figure.show_query_labels,
                 show_runtime_labels=figure.show_runtime_labels,
                 workload_labels=figure.query_workload_labels,
@@ -1535,6 +1695,7 @@ def build_figures(experiment_root: Path, system_name: str | None) -> Path:
                 figure_path,
                 entries=entries,
                 width_key=figure.width,
+                placement_width_key=figure.placement_width,
                 metric=figure.metric,
                 y_label=figure.y_label,
                 workload_labels=figure.query_workload_labels,
@@ -1589,122 +1750,124 @@ def build_figures(experiment_root: Path, system_name: str | None) -> Path:
             "join_probe_tuples": join_probe_summary,
         }
 
-    tpch_queries = select_queries(rows, "tpch-skew", ())
-    tpch_entries = build_runtime_plan_work_table(
-        rows,
-        plan_metric_rows,
-        "tpch-skew",
-        tpch_queries,
-    )
-    tpch_path = figures_dir / "tpch_skew_plan_work.pdf"
-    tpch_verification = _draw_runtime_plan_work_bars(
-        tpch_path,
-        entries=tpch_entries,
-        width_key="two-column",
-        show_query_labels=True,
-    )
-    summary["figures"]["tpch_skew_plan_work"] = str(tpch_path)
-    summary["verification"]["tpch_skew_plan_work"] = tpch_verification
-    summary["sections"].setdefault("tpch_skew_plan_work", {}).update(
-        {"tpch_skew_plan_work": summarize_plan_work_entries(tpch_entries)}
-    )
-
-    job_queries = select_queries(rows, "join-order-benchmark", ())
-    job_chunks = _chunk_query_names(job_queries, MULTI_JOIN_QUERY_PANEL_SIZE)
-    job_figures: list[str] = []
-    job_verification: dict[str, dict[str, bool]] = {}
-    job_sections: dict[str, object] = {}
-    for index, chunk in enumerate(job_chunks, start=1):
-        slug = f"job_plan_work_part{index}"
-        chunk_entries = build_runtime_plan_work_table(
+    if "tpch-skew" in available_workloads:
+        tpch_queries = select_queries(rows, "tpch-skew", ())
+        tpch_entries = build_runtime_plan_work_table(
             rows,
             plan_metric_rows,
-            "join-order-benchmark",
-            chunk,
+            "tpch-skew",
+            tpch_queries,
         )
-        chunk_path = figures_dir / f"{slug}.pdf"
-        verification = _draw_runtime_plan_work_bars(
-            chunk_path,
-            entries=chunk_entries,
+        tpch_path = figures_dir / "tpch_skew_plan_work.pdf"
+        tpch_verification = _draw_runtime_plan_work_bars(
+            tpch_path,
+            entries=tpch_entries,
             width_key="two-column",
             show_query_labels=True,
         )
-        summary["figures"][slug] = str(chunk_path)
-        summary["verification"][slug] = verification
-        job_figures.append(str(chunk_path))
-        job_verification[slug] = verification
-        job_sections[slug] = {
-            "query_count": len(chunk),
-            "query_names": list(chunk),
-            **summarize_plan_work_entries(chunk_entries),
+        summary["figures"]["tpch_skew_plan_work"] = str(tpch_path)
+        summary["verification"]["tpch_skew_plan_work"] = tpch_verification
+        summary["sections"].setdefault("tpch_skew_plan_work", {}).update(
+            {"tpch_skew_plan_work": summarize_plan_work_entries(tpch_entries)}
+        )
+
+    if "join-order-benchmark" in available_workloads:
+        job_queries = select_queries(rows, "join-order-benchmark", ())
+        job_chunks = _chunk_query_names(job_queries, MULTI_JOIN_QUERY_PANEL_SIZE)
+        job_sections: dict[str, object] = {}
+        for index, chunk in enumerate(job_chunks, start=1):
+            slug = f"job_plan_work_part{index}"
+            chunk_entries = build_runtime_plan_work_table(
+                rows,
+                plan_metric_rows,
+                "join-order-benchmark",
+                chunk,
+            )
+            chunk_path = figures_dir / f"{slug}.pdf"
+            verification = _draw_runtime_plan_work_bars(
+                chunk_path,
+                entries=chunk_entries,
+                width_key="two-column",
+                show_query_labels=True,
+            )
+            summary["figures"][slug] = str(chunk_path)
+            summary["verification"][slug] = verification
+            job_sections[slug] = {
+                "query_count": len(chunk),
+                "query_names": list(chunk),
+                **summarize_plan_work_entries(chunk_entries),
+            }
+        summary["sections"]["job_plan_work"] = {
+            "panel_count": len(job_chunks),
+            "panels": job_sections,
         }
-    summary["sections"]["job_plan_work"] = {
-        "panel_count": len(job_chunks),
-        "panels": job_sections,
-    }
-    summary["sections"]["end_to_end"] = summarize_end_to_end(
-        [row for row in rows if row.workload_name in FIGURES[-1].workloads]
-    )
+    end_to_end_rows = [row for row in rows if row.workload_name in FIGURES[-1].workloads]
+    if end_to_end_rows:
+        summary["sections"]["end_to_end"] = summarize_end_to_end(end_to_end_rows)
     aggregate_probe_scan_rows = [
         row for row in probe_scan_rows if row.workload_name != "ssb-ordered"
     ]
-    probe_cardinality_values = build_relative_probe_cardinality_values(
-        aggregate_probe_scan_rows
-    )
-    probe_cardinality_outliers = build_relative_probe_cardinality_outliers(
-        aggregate_probe_scan_rows,
-        threshold=PROBE_CARDINALITY_OUTLIER_THRESHOLD,
-    )
-    probe_cardinality_path = figures_dir / "relative_probe_cardinality_boxplot.pdf"
-    probe_cardinality_verification = _draw_relative_probe_cardinality_boxplot(
-        probe_cardinality_path,
-        relative_values=probe_cardinality_values,
-    )
-    outlier_log_path = output_dir / "relative_probe_cardinality_outliers.json"
-    write_summary(outlier_log_path, {"threshold": PROBE_CARDINALITY_OUTLIER_THRESHOLD, "outliers": probe_cardinality_outliers})
-    summary["figures"]["relative_probe_cardinality_boxplot"] = str(probe_cardinality_path)
-    summary["verification"]["relative_probe_cardinality_boxplot"] = probe_cardinality_verification
-    summary["sections"]["relative_probe_cardinality"] = {
-        **summarize_relative_probe_cardinality(aggregate_probe_scan_rows),
-        "outlier_threshold_ratio": PROBE_CARDINALITY_OUTLIER_THRESHOLD,
-        "outlier_count": len(probe_cardinality_outliers),
-        "outlier_log_path": str(outlier_log_path),
-        "largest_outliers": probe_cardinality_outliers[:10],
-    }
-    benchmark_runtime_distributions = build_benchmark_runtime_distributions(
-        rows,
-        BENCHMARK_RUNTIME_BOXPLOT_GROUPS,
-    )
-    benchmark_runtime_boxplot_path = figures_dir / "benchmark_runtime_boxplot.pdf"
-    benchmark_runtime_boxplot_verification = _draw_benchmark_runtime_boxplot(
-        benchmark_runtime_boxplot_path,
-        distributions=benchmark_runtime_distributions,
-    )
-    summary["figures"]["benchmark_runtime_boxplot"] = str(
-        benchmark_runtime_boxplot_path
-    )
-    summary["verification"]["benchmark_runtime_boxplot"] = (
-        benchmark_runtime_boxplot_verification
-    )
-    summary["sections"]["benchmark_runtime_boxplot"] = (
-        summarize_benchmark_runtime_distributions(
-            benchmark_runtime_distributions
+    if aggregate_probe_scan_rows:
+        probe_cardinality_values = build_relative_probe_cardinality_values(
+            aggregate_probe_scan_rows
         )
-    )
-    benchmark_metric_summary = summarize_benchmark_metrics(
-        rows,
-        plan_metric_rows,
-        BENCHMARK_RUNTIME_BOXPLOT_GROUPS,
-    )
-    benchmark_summary_path = output_dir / "benchmark_summary.md"
-    _write_benchmark_summary_markdown(
-        benchmark_summary_path,
-        experiment_root=experiment_root,
-        system_name=resolved_system_name,
-        benchmark_summary=benchmark_metric_summary,
-    )
-    summary["benchmark_summary_path"] = str(benchmark_summary_path)
-    summary["sections"]["benchmark_metrics"] = benchmark_metric_summary
+        probe_cardinality_outliers = build_relative_probe_cardinality_outliers(
+            aggregate_probe_scan_rows,
+            threshold=PROBE_CARDINALITY_OUTLIER_THRESHOLD,
+        )
+        probe_cardinality_path = figures_dir / "relative_probe_cardinality_boxplot.pdf"
+        probe_cardinality_verification = _draw_relative_probe_cardinality_boxplot(
+            probe_cardinality_path,
+            relative_values=probe_cardinality_values,
+        )
+        outlier_log_path = output_dir / "relative_probe_cardinality_outliers.json"
+        write_summary(outlier_log_path, {"threshold": PROBE_CARDINALITY_OUTLIER_THRESHOLD, "outliers": probe_cardinality_outliers})
+        summary["figures"]["relative_probe_cardinality_boxplot"] = str(probe_cardinality_path)
+        summary["verification"]["relative_probe_cardinality_boxplot"] = probe_cardinality_verification
+        summary["sections"]["relative_probe_cardinality"] = {
+            **summarize_relative_probe_cardinality(aggregate_probe_scan_rows),
+            "outlier_threshold_ratio": PROBE_CARDINALITY_OUTLIER_THRESHOLD,
+            "outlier_count": len(probe_cardinality_outliers),
+            "outlier_log_path": str(outlier_log_path),
+            "largest_outliers": probe_cardinality_outliers[:10],
+        }
+    present_benchmark_groups = _present_benchmark_groups(rows)
+    if present_benchmark_groups:
+        benchmark_runtime_distributions = build_benchmark_runtime_distributions(
+            rows,
+            present_benchmark_groups,
+        )
+        benchmark_runtime_boxplot_path = figures_dir / "benchmark_runtime_boxplot.pdf"
+        benchmark_runtime_boxplot_verification = _draw_benchmark_runtime_boxplot(
+            benchmark_runtime_boxplot_path,
+            distributions=benchmark_runtime_distributions,
+            placement_width_key="one-column",
+        )
+        summary["figures"]["benchmark_runtime_boxplot"] = str(
+            benchmark_runtime_boxplot_path
+        )
+        summary["verification"]["benchmark_runtime_boxplot"] = (
+            benchmark_runtime_boxplot_verification
+        )
+        summary["sections"]["benchmark_runtime_boxplot"] = (
+            summarize_benchmark_runtime_distributions(
+                benchmark_runtime_distributions
+            )
+        )
+        benchmark_metric_summary = summarize_benchmark_metrics(
+            rows,
+            plan_metric_rows,
+            present_benchmark_groups,
+        )
+        benchmark_summary_path = output_dir / "benchmark_summary.md"
+        _write_benchmark_summary_markdown(
+            benchmark_summary_path,
+            experiment_root=experiment_root,
+            system_name=resolved_system_name,
+            benchmark_summary=benchmark_metric_summary,
+        )
+        summary["benchmark_summary_path"] = str(benchmark_summary_path)
+        summary["sections"]["benchmark_metrics"] = benchmark_metric_summary
     summary["benchmark_summaries"] = _benchmark_summaries(rows)
     write_summary(output_dir / "summary.json", summary)
     _write_summary_markdown(output_dir / "summary.md", summary)

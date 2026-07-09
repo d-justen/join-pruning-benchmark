@@ -132,12 +132,14 @@ class FigureSpec:
     workloads: tuple[str, ...]
     queries_by_workload: dict[str, tuple[str, ...]]
     width: str
+    placement_width: str
     summary_key: str
     y_label: str
     query_workload_labels: bool = False
     probe_table: str | None = None
     show_query_labels: bool = True
     show_runtime_labels: bool = False
+    annotate_runtime_values: bool = False
     runtime_log_axis: bool = False
     rows_log_axis: bool = False
 
@@ -148,22 +150,24 @@ JOIN_PRUNING_ORDERED = FigureSpec(
     workloads=("join-pruning-workload",),
     queries_by_workload={"join-pruning-workload": JPB_ORDERED_QUERIES},
     width="two-column",
+    placement_width="one-column",
     summary_key="row_group_pruning",
     y_label="",
     probe_table="fact",
     runtime_log_axis=True,
-    rows_log_axis=True,
+    rows_log_axis=False,
 )
 
 INTRO_MOTIVATION = FigureSpec(
     slug="intro_motivation",
     metric="runtime_and_total_rows",
-    workloads=("tpch-skew-intro", "ssb-ordered-intro"),
+    workloads=("ssb-ordered-intro", "tpch-skew-intro"),
     queries_by_workload={
-        "tpch-skew-intro": ("q02.sql",),
         "ssb-ordered-intro": SSB_ORDERED_QUERIES,
+        "tpch-skew-intro": ("q02.sql",),
     },
     width="one-column",
+    placement_width="one-column",
     summary_key="motivation",
     y_label="",
     query_workload_labels=True,
@@ -179,6 +183,7 @@ ROW_GROUP_RUNTIME_EXTERNAL = FigureSpec(
     workloads=("tpch-skew",),
     queries_by_workload={"tpch-skew": TPCH_ROW_GROUP_QUERIES},
     width="two-column",
+    placement_width="two-column",
     summary_key="row_group_pruning",
     y_label="Execution time (ms)",
 )
@@ -189,6 +194,7 @@ ROW_GROUP_ROWS_EXTERNAL = FigureSpec(
     workloads=("tpch-skew",),
     queries_by_workload=ROW_GROUP_RUNTIME_EXTERNAL.queries_by_workload,
     width="two-column",
+    placement_width="two-column",
     summary_key="row_group_pruning",
     y_label="Cumulative rows scanned",
 )
@@ -199,11 +205,12 @@ JOIN_PRUNING_UNIFORM = FigureSpec(
     workloads=("join-pruning-workload",),
     queries_by_workload={"join-pruning-workload": JPB_UNIFORM_QUERIES},
     width="two-column",
+    placement_width="one-column",
     summary_key="row_wise_filtering",
     y_label="",
     probe_table="fact",
     runtime_log_axis=True,
-    rows_log_axis=True,
+    rows_log_axis=False,
 )
 
 ROW_WISE_RUNTIME_EXTERNAL = FigureSpec(
@@ -212,6 +219,7 @@ ROW_WISE_RUNTIME_EXTERNAL = FigureSpec(
     workloads=("tpch-skew",),
     queries_by_workload={"tpch-skew": TPCH_ROW_WISE_QUERIES},
     width="two-column",
+    placement_width="two-column",
     summary_key="row_wise_filtering",
     y_label="Execution time (ms)",
 )
@@ -222,11 +230,13 @@ STRING_JOIN = FigureSpec(
     workloads=("string-joins",),
     queries_by_workload={"string-joins": STRING_JOIN_QUERIES},
     width="two-column",
+    placement_width="one-column",
     summary_key="string_joins",
     y_label="",
     probe_table="fact",
+    annotate_runtime_values=True,
     runtime_log_axis=True,
-    rows_log_axis=True,
+    rows_log_axis=False,
 )
 
 END_TO_END_RUNTIME = FigureSpec(
@@ -235,6 +245,7 @@ END_TO_END_RUNTIME = FigureSpec(
     workloads=("join-pruning-workload", "tpch-skew", "join-order-benchmark"),
     queries_by_workload={},
     width="two-column",
+    placement_width="two-column",
     summary_key="end_to_end",
     y_label="Execution time (ms)",
     query_workload_labels=True,

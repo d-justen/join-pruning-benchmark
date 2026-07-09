@@ -7,7 +7,9 @@ import duckdb
 
 from benchmarking.experiment_config import CrossProductWorkloadConfig
 from benchmarking.manifests import PreparedWorkload, utc_now_iso, write_manifest
-from benchmarking.workloads.external import export_remote_parquet_catalog
+from benchmarking.workloads.external import (
+    export_remote_parquet_catalog,
+)
 
 
 def build_size_label(build_size: int) -> str:
@@ -314,11 +316,14 @@ def prepare_cross_product_workload(
     metadata_path = queries_dir / "metadata.json"
     runtime_db_path = db_path.resolve()
     remote_parquet_catalog_path: Path | None = None
+    setup_sql_paths: tuple[Path, ...] = ()
+    storage_mode = "duckdb"
     if spec.remote_http_parquet_latency_ms is not None:
         remote_parquet_catalog_path = export_remote_parquet_catalog(runtime_db_path, artifact_dir)
         runtime_db_path = (artifact_dir / "benchmark.duckdb").resolve()
         if runtime_db_path.exists():
             runtime_db_path.unlink()
+        storage_mode = "remote_http_parquet"
     manifest = PreparedWorkload(
         name=spec.name,
         kind=spec.kind,
@@ -328,6 +333,8 @@ def prepare_cross_product_workload(
         queries_dir=queries_dir.resolve(),
         metadata_path=metadata_path.resolve(),
         init_sql_paths=(),
+        setup_sql_paths=setup_sql_paths,
+        storage_mode=storage_mode,
         remote_http_parquet_latency_ms=spec.remote_http_parquet_latency_ms,
         remote_parquet_catalog_path=remote_parquet_catalog_path,
         prepared_at=utc_now_iso(),

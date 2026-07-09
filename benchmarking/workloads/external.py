@@ -14,6 +14,7 @@ from benchmarking.manifests import PreparedWorkload, utc_now_iso, write_manifest
 
 DEFAULT_REMOTE_PARQUET_FILE_SIZE_MB = 200
 DEFAULT_REMOTE_PARQUET_COMPRESSION = "zstd"
+DEFAULT_EXTERNAL_DB_FILENAME = "benchmark.duckdb"
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,10 @@ class ExternalSourceLayout:
 
 def _quote_identifier(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
+
+
+def _sql_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
 
 
 def _parse_remote_http_parquet(raw: object, config_path: Path) -> int | None:
@@ -50,6 +55,31 @@ def _resolve_optional_path(base_dir: Path, raw: str | None) -> Path | None:
     return (base_dir / raw).resolve()
 
 
+def _discover_default_source_db_path(external_dir: Path) -> Path | None:
+    candidate = (external_dir / DEFAULT_EXTERNAL_DB_FILENAME).resolve()
+    if candidate.exists():
+        return candidate
+    return None
+
+
+def list_base_tables(source_db_path: Path) -> list[str]:
+    con = duckdb.connect(str(source_db_path))
+    try:
+        return [
+            row[0]
+            for row in con.execute(
+                """
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'main' AND table_type = 'BASE TABLE'
+                ORDER BY table_name
+                """
+            ).fetchall()
+        ]
+    finally:
+        con.close()
+
+
 def discover_external_layout(external_dir: Path) -> ExternalSourceLayout:
     config_path = external_dir / "source.json"
     if config_path.exists():
@@ -67,6 +97,7 @@ def discover_external_layout(external_dir: Path) -> ExternalSourceLayout:
             raw.get("remote_http_parquet"),
             config_path,
         )
+        default_source_db_path = _discover_default_source_db_path(config_path.parent)
         if db_handling not in (None, "reuse", "copy"):
             raise ValueError(
                 f"unsupported database_handling in {config_path}: {db_handling!r}"
@@ -87,6 +118,16 @@ def discover_external_layout(external_dir: Path) -> ExternalSourceLayout:
                 init_sql_paths=(),
                 source_db_path=source_db_path,
                 db_handling=db_handling or "reuse",
+                remote_http_parquet_latency_ms=remote_http_parquet_latency_ms,
+            )
+        if default_source_db_path is not None:
+            return ExternalSourceLayout(
+                benchmark_name=benchmark_name,
+                queries_dir=queries_dir,
+                metadata_path=metadata_path,
+                init_sql_paths=(),
+                source_db_path=default_source_db_path,
+                db_handling="reuse",
                 remote_http_parquet_latency_ms=remote_http_parquet_latency_ms,
             )
         if not init_sql_paths:
@@ -148,11 +189,19 @@ def initialize_external_db(
                 os.chdir(sql_path.parent)
                 con.execute(script)
             except Exception as exc:
+                message = str(exc)
+                if "http" in message.lower():
+                    message = (
+                        f"{message}\n"
+                        f"hint: place a prebuilt DuckDB snapshot at "
+                        f"{sql_path.parent / DEFAULT_EXTERNAL_DB_FILENAME} "
+                        "to reuse the workload offline"
+                    )
                 raise RuntimeError(
                     "command failed\n"
                     f"cwd: {sql_path.parent}\n"
                     f"command: python duckdb execute {sql_path}\n"
-                    f"stderr:\n{exc}"
+                    f"stderr:\n{message}"
                 ) from exc
             finally:
                 os.chdir(previous_cwd)
@@ -254,11 +303,13 @@ def prepare_external_workload(
         setup_sql_paths = (setup_sql_path,)
     remote_parquet_catalog_path: Path | None = None
     runtime_db_path = db_path
+    storage_mode = "duckdb"
     if layout.remote_http_parquet_latency_ms is not None:
         remote_parquet_catalog_path = export_remote_parquet_catalog(db_path, artifact_dir)
         runtime_db_path = (artifact_dir / "benchmark.duckdb").resolve()
         if runtime_db_path.exists():
             runtime_db_path.unlink()
+        storage_mode = "remote_http_parquet"
     manifest = PreparedWorkload(
         name=spec.name,
         kind=spec.kind,
@@ -271,6 +322,7 @@ def prepare_external_workload(
         init_sql_paths=tuple(path.resolve() for path in init_sql_paths),
         db_handling=db_handling,
         setup_sql_paths=setup_sql_paths,
+        storage_mode=storage_mode,
         remote_http_parquet_latency_ms=layout.remote_http_parquet_latency_ms,
         remote_parquet_catalog_path=remote_parquet_catalog_path,
         prepared_at=utc_now_iso(),

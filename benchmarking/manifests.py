@@ -24,6 +24,7 @@ class PreparedWorkload:
     source_db_path: Path | None = None
     db_handling: str | None = None
     setup_sql_paths: tuple[Path, ...] = ()
+    storage_mode: str = "duckdb"
     remote_http_parquet_latency_ms: int | None = None
     remote_parquet_catalog_path: Path | None = None
 
@@ -43,6 +44,7 @@ def manifest_to_dict(manifest: PreparedWorkload) -> dict:
     data["init_sql_paths"] = [str(path) for path in manifest.init_sql_paths]
     data["db_handling"] = manifest.db_handling
     data["setup_sql_paths"] = [str(path) for path in manifest.setup_sql_paths]
+    data["storage_mode"] = manifest.storage_mode
     data["remote_http_parquet_latency_ms"] = manifest.remote_http_parquet_latency_ms
     data["remote_parquet_catalog_path"] = (
         str(manifest.remote_parquet_catalog_path)
@@ -81,6 +83,7 @@ def load_manifest(path: Path) -> PreparedWorkload:
         init_sql_paths=tuple(Path(item).resolve() for item in raw.get("init_sql_paths", [])),
         db_handling=raw.get("db_handling"),
         setup_sql_paths=tuple(Path(item).resolve() for item in raw.get("setup_sql_paths", [])),
+        storage_mode=raw.get("storage_mode", "duckdb"),
         remote_http_parquet_latency_ms=raw.get("remote_http_parquet_latency_ms"),
         remote_parquet_catalog_path=_resolve_optional_path(raw.get("remote_parquet_catalog_path")),
         prepared_at=raw["prepared_at"],

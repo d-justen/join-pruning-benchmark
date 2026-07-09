@@ -74,6 +74,9 @@ def _ensure_profile_runs_table(results_db: Path) -> None:
         con.execute("ALTER TABLE profile_runs ADD COLUMN IF NOT EXISTS total_rows_scanned BIGINT;")
         con.execute("ALTER TABLE profile_runs ADD COLUMN IF NOT EXISTS probe_rows_scanned BIGINT;")
         con.execute("ALTER TABLE profile_runs ADD COLUMN IF NOT EXISTS build_rows_scanned BIGINT;")
+        con.execute("ALTER TABLE profile_runs ADD COLUMN IF NOT EXISTS total_bytes_read BIGINT;")
+        con.execute("ALTER TABLE profile_runs ADD COLUMN IF NOT EXISTS total_bytes_written BIGINT;")
+        con.execute("ALTER TABLE profile_runs ADD COLUMN IF NOT EXISTS table_scan_file_count BIGINT;")
     finally:
         con.close()
 
@@ -94,10 +97,17 @@ def _variant_map(config: ExperimentConfig) -> dict[tuple[str, str], VariantConfi
     return mapping
 
 
-def _profile_sql(query_text: str, profile_path: Path, variant: VariantConfig, threads: int | None) -> str:
+def _profile_sql(
+    query_text: str,
+    profile_path: Path,
+    variant: VariantConfig,
+    threads: int | None,
+    workload_setup_sql: tuple[str, ...],
+) -> str:
     statements = ["SET enable_progress_bar=false;"]
     if threads is not None:
         statements.append(f"SET threads = {threads};")
+    statements.extend(workload_setup_sql)
     statements.extend(variant.setup_sql)
     statements.append("SET enable_profiling='json';")
     escaped_profile_path = str(profile_path).replace("'", "''")
@@ -177,8 +187,17 @@ def backfill_profiles(experiment_root: Path, config: ExperimentConfig, *, result
             profile_path = (profile_dir / query_name).with_suffix(".json")
             temp_sql_path = profile_dir / (Path(query_name).stem + ".sql")
             query_text = Path(query_path).read_text(encoding="utf-8")
+            workload_setup_sql = tuple(
+                path.read_text(encoding="utf-8").strip() for path in workload.setup_sql_paths
+            )
             temp_sql_path.write_text(
-                _profile_sql(query_text, profile_path, variant, config.benchmark.threads),
+                _profile_sql(
+                    query_text,
+                    profile_path,
+                    variant,
+                    config.benchmark.threads,
+                    workload_setup_sql,
+                ),
                 encoding="utf-8",
             )
             _run_command([str(resolved_system.binary_path), str(workload.db_path), "-f", str(temp_sql_path)])
@@ -190,8 +209,9 @@ def backfill_profiles(experiment_root: Path, config: ExperimentConfig, *, result
                     run_id, experiment_name, workload_name, workload_kind,
                     system_name, system_kind, system_version, system_git_commit, system_repo, system_ref,
                     variant_label, variant_setup_sql, query_name, query_path, join_variant, cluster_count,
-                    profile_path, cumulative_rows_scanned, total_rows_scanned, probe_rows_scanned, build_rows_scanned, profiled_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
+                    profile_path, cumulative_rows_scanned, total_rows_scanned, probe_rows_scanned, build_rows_scanned,
+                    total_bytes_read, total_bytes_written, table_scan_file_count, profiled_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
                 """,
                 [
                     run_id,
@@ -215,6 +235,9 @@ def backfill_profiles(experiment_root: Path, config: ExperimentConfig, *, result
                     metrics.total_rows_scanned,
                     metrics.probe_rows_scanned,
                     metrics.build_rows_scanned,
+                    metrics.total_bytes_read,
+                    metrics.total_bytes_written,
+                    metrics.table_scan_file_count,
                 ],
             )
             inserted += 1
@@ -291,7 +314,8 @@ def _comparison_rows(
                     join_variant,
                     cluster_count,
                     max(total_rows_scanned) AS total_rows_scanned,
-                    max(probe_rows_scanned) AS probe_rows_scanned
+                    max(probe_rows_scanned) AS probe_rows_scanned,
+                    max(total_bytes_read) AS total_bytes_read
                 FROM profile_runs
                 WHERE experiment_name = ?
                   AND workload_name = ?
@@ -308,7 +332,9 @@ def _comparison_rows(
                 baseline.avg_ms,
                 candidate.avg_ms,
                 coalesce(baseline_profile.probe_rows_scanned, baseline_profile.total_rows_scanned),
-                coalesce(candidate_profile.probe_rows_scanned, candidate_profile.total_rows_scanned)
+                coalesce(candidate_profile.probe_rows_scanned, candidate_profile.total_rows_scanned),
+                baseline_profile.total_bytes_read,
+                candidate_profile.total_bytes_read
             FROM timing AS candidate
             JOIN timing AS baseline
               ON baseline.query_name = candidate.query_name
@@ -352,8 +378,11 @@ def _comparison_rows(
                 "variant_avg_ms": row[7],
                 "baseline_probe_or_total_rows_scanned": row[8],
                 "variant_probe_or_total_rows_scanned": row[9],
+                "baseline_total_bytes_read": row[10],
+                "variant_total_bytes_read": row[11],
                 "speedup_vs_variant": None if row[5] in (None, 0) else row[4] / row[5],
                 "rows_scanned_ratio": None if row[9] in (None, 0) else row[8] / row[9] if row[8] is not None else None,
+                "bytes_read_ratio": None if row[11] in (None, 0) else row[10] / row[11] if row[10] is not None else None,
             }
             for row in rows
         ]
@@ -395,7 +424,10 @@ def _absolute_metric_rows(
                     join_variant,
                     cluster_count,
                     max(total_rows_scanned) AS total_rows_scanned,
-                    max(probe_rows_scanned) AS probe_rows_scanned
+                    max(probe_rows_scanned) AS probe_rows_scanned,
+                    max(total_bytes_read) AS total_bytes_read,
+                    max(total_bytes_written) AS total_bytes_written,
+                    max(table_scan_file_count) AS table_scan_file_count
                 FROM profile_runs
                 WHERE experiment_name = ?
                   AND workload_name = ?
@@ -409,7 +441,10 @@ def _absolute_metric_rows(
                 timing.cluster_count,
                 timing.median_ms,
                 profiles.total_rows_scanned,
-                profiles.probe_rows_scanned
+                profiles.probe_rows_scanned,
+                profiles.total_bytes_read,
+                profiles.total_bytes_written,
+                profiles.table_scan_file_count
             FROM timing
             LEFT JOIN profiles
               ON profiles.variant_label = timing.variant_label
@@ -436,6 +471,9 @@ def _absolute_metric_rows(
                 "median_ms": row[4],
                 "total_rows_scanned": row[5],
                 "probe_rows_scanned": row[6],
+                "total_bytes_read": row[7],
+                "total_bytes_written": row[8],
+                "table_scan_file_count": row[9],
                 "display_rows_scanned": row[6] if row[6] is not None else row[5],
             }
             for row in rows
@@ -639,6 +677,8 @@ def analyze_experiment(experiment_root: Path, baseline_variant: str | None) -> A
                     "slower_queries": sum(1 for row in comparison_rows if (row["speedup_vs_variant"] or 0) < 1),
                     "fewer_rows_scanned": sum(1 for row in comparison_rows if (row["rows_scanned_ratio"] or 0) > 1),
                     "more_rows_scanned": sum(1 for row in comparison_rows if (row["rows_scanned_ratio"] or 0) < 1),
+                    "fewer_bytes_read": sum(1 for row in comparison_rows if (row["bytes_read_ratio"] or 0) > 1),
+                    "more_bytes_read": sum(1 for row in comparison_rows if (row["bytes_read_ratio"] or 0) < 1),
                 }
             )
         chart_path = analysis_paths.charts_dir / f"{workload_name}.svg"

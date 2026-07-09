@@ -143,6 +143,16 @@ Supported external preparation modes:
 - `database_path`: reuse or copy an already prepared DuckDB database file
 - `remote_http_parquet`: export all base tables to Parquet, serve them over local HTTP, and add a fixed latency to each HTTP request
 
+For SQL-backed external workloads, placing a checked-in `benchmark.duckdb` next to `source.json`
+or `schema.sql`/`load.sql` automatically switches the workload to local database reuse. This is
+useful for offline runs or environments where remote initialization is blocked.
+
+The join-order benchmark includes a helper to build that snapshot in place:
+
+```bash
+python external_benchmarks/join-order-benchmark/materialize_local_db.py
+```
+
 Example SQL-initialized external benchmark:
 
 ```json
@@ -187,8 +197,8 @@ Remote-HTTP Parquet mode is enabled in `source.json` and currently only requires
 }
 ```
 
-When this mode is enabled, preparation exports every base table into Parquet files under `out/.../workloads/<name>/remote_parquet/`.
-Benchmark execution then starts a local HTTP server with byte-range support, adds the configured fixed latency to each request,
+When this mode is enabled, preparation exports the source tables into local Parquet files under `out/.../workloads/<name>/remote_parquet/`,
+benchmark execution then starts a local HTTP server with byte-range support, adds the configured fixed latency to each request,
 and creates temporary views over `read_parquet([...])` so the benchmark queries themselves do not need to change.
 
 ## Systems
@@ -228,6 +238,8 @@ Example git-built system:
   "kind": "git",
   "repo": "https://github.com/duckdb/duckdb.git",
   "ref": "main",
+  "c_compiler": "clang",
+  "cxx_compiler": "clang++",
   "variants": [
     {
       "label": "default",
@@ -236,6 +248,9 @@ Example git-built system:
   ]
 }
 ```
+
+For `git` systems, `c_compiler` and `cxx_compiler` are optional. When set, the build step
+exports them as `CC` and `CXX` while running `make`.
 
 ## Benchmark Settings
 
@@ -255,7 +270,7 @@ Example:
 - `repetitions`: measured executions per query and variant
 - `threads`: optional `SET threads = ...`
 - `prepare_duckdb_binary`: DuckDB CLI used to initialize SQL-backed external workloads
-- `collect_profiles`: collect one profiled run per query and variant for `cumulative_rows_scanned`
+- `collect_profiles`: collect one profiled run per query and variant for `cumulative_rows_scanned`, `total_bytes_read`, `total_bytes_written`, and file-count metadata when available
 
 ## Artifact Layout
 
@@ -308,6 +323,8 @@ Visualization behavior by workload kind:
 - `cross_product`: bar-chart panels for runtime and cumulative rows scanned
 - `external`: bar-chart panels for runtime and cumulative rows scanned
 
+Comparison JSON files also include byte-oriented profile metrics when available.
+
 ## Running The Example
 
 The checked-in example uses small generated workloads and a local DuckDB binary:
@@ -345,5 +362,6 @@ That creates:
 ## Notes
 
 - The join-order benchmark under `external_benchmarks/join-order-benchmark` loads data from remote parquet files during initialization.
+- If a SQL-backed external workload also contains `benchmark.duckdb`, the runner reuses that local snapshot instead of rerunning `init_sql_paths`.
 - The TPC-H skew benchmark under `external_benchmarks/tpch-skew` is wired as a prebuilt DuckDB database and uses `database_handling: "reuse"` to avoid copying the 35 GB file into `out/`.
 - For offline validation, use generated workloads such as the example config.

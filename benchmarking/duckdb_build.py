@@ -106,7 +106,7 @@ def get_binary_version(binary: Path) -> str:
     return run_command([str(binary), "--version"])
 
 
-def ensure_duckdb_checkout(clone_dir: Path, repo: str, ref: str) -> None:
+def ensure_git_checkout(clone_dir: Path, repo: str, ref: str) -> None:
     if not clone_dir.exists():
         clone_dir.parent.mkdir(parents=True, exist_ok=True)
         run_command(["git", "clone", "--no-checkout", repo, str(clone_dir)])
@@ -120,6 +120,20 @@ def ensure_duckdb_checkout(clone_dir: Path, repo: str, ref: str) -> None:
         )
     run_command(["git", "fetch", "origin", ref, "--depth", "1"], cwd=clone_dir)
     run_command(["git", "switch", "--detach", "FETCH_HEAD"], cwd=clone_dir)
+
+
+def ensure_duckdb_checkout(clone_dir: Path, repo: str, ref: str) -> None:
+    ensure_git_checkout(clone_dir, repo, ref)
+
+
+def ensure_duckdb_vcpkg_toolchain(clone_dir: Path, env: dict[str, str]) -> Path:
+    toolchain_path = clone_dir / "vcpkg" / "scripts" / "buildsystems" / "vcpkg.cmake"
+    if toolchain_path.exists():
+        return toolchain_path.resolve()
+    run_command(["make", "setup-vcpkg"], cwd=clone_dir, env=env)
+    if not toolchain_path.exists():
+        raise FileNotFoundError(f"DuckDB vcpkg toolchain not found after setup: {toolchain_path}")
+    return toolchain_path.resolve()
 
 
 def build_duckdb(clone_dir: Path, config: GitSystemConfig) -> None:

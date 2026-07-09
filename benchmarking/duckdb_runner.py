@@ -17,8 +17,6 @@ from benchmarking.duckdb_build import ResolvedSystem
 from benchmarking.experiment_config import BenchmarkOptions, VariantConfig
 from benchmarking.manifests import PreparedWorkload
 from benchmarking.query_inventory import QuerySpec, load_queries
-
-
 LABEL_COMPONENT_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -112,6 +110,9 @@ def ensure_results_schema(results_db: Path) -> None:
         con.execute("ALTER TABLE profile_runs ADD COLUMN IF NOT EXISTS total_rows_scanned BIGINT;")
         con.execute("ALTER TABLE profile_runs ADD COLUMN IF NOT EXISTS probe_rows_scanned BIGINT;")
         con.execute("ALTER TABLE profile_runs ADD COLUMN IF NOT EXISTS build_rows_scanned BIGINT;")
+        con.execute("ALTER TABLE profile_runs ADD COLUMN IF NOT EXISTS total_bytes_read BIGINT;")
+        con.execute("ALTER TABLE profile_runs ADD COLUMN IF NOT EXISTS total_bytes_written BIGINT;")
+        con.execute("ALTER TABLE profile_runs ADD COLUMN IF NOT EXISTS table_scan_file_count BIGINT;")
     finally:
         con.close()
 
@@ -121,12 +122,18 @@ class ProfileMetrics:
     total_rows_scanned: int | None
     probe_rows_scanned: int | None
     build_rows_scanned: int | None
+    total_bytes_read: int | None
+    total_bytes_written: int | None
+    table_scan_file_count: int | None
 
 
 def _extract_profile_metrics(profile_data: dict) -> ProfileMetrics:
     total_rows_scanned = profile_data.get("cumulative_rows_scanned")
     probe_rows_scanned: int | None = None
     build_rows_scanned = 0
+    total_bytes_read = profile_data.get("total_bytes_read")
+    total_bytes_written = profile_data.get("total_bytes_written")
+    table_scan_file_count = 0
 
     stack = list(profile_data.get("children", []))
     while stack:
@@ -139,6 +146,11 @@ def _extract_profile_metrics(profile_data: dict) -> ProfileMetrics:
         rows_scanned = node.get("operator_rows_scanned")
         if not isinstance(rows_scanned, int):
             continue
+        files_read = extra_info.get("Total Files Read")
+        if isinstance(files_read, str) and files_read.isdigit():
+            table_scan_file_count += int(files_read)
+        elif isinstance(files_read, int):
+            table_scan_file_count += files_read
         if table_name.endswith(".fact"):
             probe_rows_scanned = rows_scanned
         else:
@@ -146,10 +158,15 @@ def _extract_profile_metrics(profile_data: dict) -> ProfileMetrics:
 
     if build_rows_scanned == 0:
         build_rows_scanned = None
+    if table_scan_file_count == 0:
+        table_scan_file_count = None
     return ProfileMetrics(
         total_rows_scanned=total_rows_scanned,
         probe_rows_scanned=probe_rows_scanned,
         build_rows_scanned=build_rows_scanned,
+        total_bytes_read=total_bytes_read if isinstance(total_bytes_read, int) else None,
+        total_bytes_written=total_bytes_written if isinstance(total_bytes_written, int) else None,
+        table_scan_file_count=table_scan_file_count,
     )
 
 
@@ -222,7 +239,8 @@ def render_profile_execution_block(
         "    run_id, experiment_name, workload_name, workload_kind,",
         "    system_name, system_kind, system_version, system_git_commit, system_repo, system_ref,",
         "    variant_label, variant_setup_sql, query_name, query_path, join_variant, cluster_count,",
-        "    profile_path, cumulative_rows_scanned, total_rows_scanned, probe_rows_scanned, build_rows_scanned, profiled_at",
+        "    profile_path, cumulative_rows_scanned, total_rows_scanned, probe_rows_scanned, build_rows_scanned,",
+        "    total_bytes_read, total_bytes_written, table_scan_file_count, profiled_at",
         ") VALUES (",
         f"    {sql_literal(run_id)},",
         f"    {sql_literal(experiment_name)},",
@@ -241,6 +259,9 @@ def render_profile_execution_block(
         f"    {join_variant_sql},",
         f"    {cluster_count_sql},",
         f"    {sql_literal(str(profile_path))},",
+        "    NULL,",
+        "    NULL,",
+        "    NULL,",
         "    NULL,",
         "    NULL,",
         "    NULL,",
@@ -450,7 +471,10 @@ def populate_profile_metrics(results_db: Path, run_id: str) -> None:
                 SET cumulative_rows_scanned = ?,
                     total_rows_scanned = ?,
                     probe_rows_scanned = ?,
-                    build_rows_scanned = ?
+                    build_rows_scanned = ?,
+                    total_bytes_read = ?,
+                    total_bytes_written = ?,
+                    table_scan_file_count = ?
                 WHERE run_id = ? AND variant_label = ? AND query_name = ? AND profile_path = ?
                 """,
                 [
@@ -458,6 +482,9 @@ def populate_profile_metrics(results_db: Path, run_id: str) -> None:
                     metrics.total_rows_scanned,
                     metrics.probe_rows_scanned,
                     metrics.build_rows_scanned,
+                    metrics.total_bytes_read,
+                    metrics.total_bytes_written,
+                    metrics.table_scan_file_count,
                     run_id,
                     variant_label,
                     query_name,

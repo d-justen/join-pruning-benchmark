@@ -24,7 +24,12 @@ class StringJoinsWorkloadTest(unittest.TestCase):
         self.root = Path(self.temp_dir.name)
         self.airports_path = self.root / "airports.csv"
         self.airports_path.write_text(
-            "ident,continent\nAAA,AN\nBBB,EU\nCCC,NA\n",
+            (
+                "ident,continent,name,municipality\n"
+                "AAA,AN,Alpha Airfield,McMurdo\n"
+                "BBB,EU,Bravo Field,Berlin\n"
+                "CCC,NA,Charlie Port,Denver\n"
+            ),
             encoding="utf-8",
         )
 
@@ -143,6 +148,12 @@ class StringJoinsWorkloadTest(unittest.TestCase):
                 encoding="utf-8"
             ),
         )
+        airport_query = (artifact_dir / "queries" / "airport_ordered_antarctica.sql").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("ANY_VALUE(a.ident) AS ident", airport_query)
+        self.assertIn("ANY_VALUE(a.name) AS name", airport_query)
+        self.assertIn("ANY_VALUE(a.municipality) AS municipality", airport_query)
 
     def test_validation_rejects_small_or_overlapping_build_ranges(self) -> None:
         with self.assertRaisesRegex(ValueError, "more than 50 rows"):
