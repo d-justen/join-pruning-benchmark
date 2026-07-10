@@ -1,3 +1,6 @@
 out/
 __pycache__/
 venv/
+tmp/
+*.pyc
+.DS_Store
