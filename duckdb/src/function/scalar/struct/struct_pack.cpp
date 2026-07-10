@@ -1,0 +1,102 @@
+#include "duckdb/common/vector/map_vector.hpp"
+#include "duckdb/common/vector/struct_vector.hpp"
+#include "duckdb/function/scalar/nested_functions.hpp"
+#include "duckdb/function/scalar/struct_functions.hpp"
+#include "duckdb/common/case_insensitive_map.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/parser/expression/bound_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression_binder.hpp"
+#include "duckdb/storage/statistics/struct_stats.hpp"
+
+namespace duckdb {
+
+static void StructPackFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+#ifdef DEBUG
+	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
+	auto &info = func_expr.bind_info->Cast<VariableReturnBindData>();
+	// this should never happen if the binder below is sane
+	D_ASSERT(args.ColumnCount() == StructType::GetChildTypes(info.stype).size());
+#endif
+	bool all_const = true;
+	auto &child_entries = StructVector::GetEntries(result);
+	idx_t children_size = 0;
+	for (idx_t i = 0; i < args.ColumnCount(); i++) {
+		if (args.data[i].GetVectorType() != VectorType::CONSTANT_VECTOR) {
+			all_const = false;
+		}
+		// same holds for this
+		child_entries[i].Reference(args.data[i]);
+		children_size = MaxValue<idx_t>(children_size, child_entries[i].size());
+	}
+	// set only the struct buffer's type/size - do not propagate to children
+	// since children reference external vectors (args) that may have incompatible buffer types.
+	// match the parent size to the (already-set) child vector size, not to the chunk cardinality - those can
+	// differ when the caller is collapsing all-constant inputs to a single argument row.
+	result.BufferMutable().SetVectorTypeOnly(all_const ? VectorType::CONSTANT_VECTOR : VectorType::FLAT_VECTOR);
+	result.BufferMutable().SetVectorSizeOnly(children_size);
+	result.Verify();
+}
+
+template <bool IS_STRUCT_PACK>
+static unique_ptr<FunctionData> StructPackBind(BindScalarFunctionInput &input) {
+	auto &bound_function = input.GetBoundFunction();
+	auto &arguments = input.GetArguments();
+	case_insensitive_set_t name_collision_set;
+
+	// collect names and deconflict, construct return type
+	if (arguments.empty()) {
+		throw InvalidInputException("Can't pack nothing into a struct");
+	}
+	child_list_t<LogicalType> struct_children;
+	for (idx_t i = 0; i < arguments.size(); i++) {
+		auto &child = arguments[i];
+		string alias;
+		if (IS_STRUCT_PACK) {
+			if (child->GetAlias().empty()) {
+				throw BinderException("Need named argument for struct pack, e.g. STRUCT_PACK(a := b)");
+			}
+			alias = child->GetAlias();
+			if (name_collision_set.find(alias) != name_collision_set.end()) {
+				throw BinderException("Duplicate struct entry name \"%s\"", alias);
+			}
+			name_collision_set.insert(alias);
+		}
+		struct_children.push_back(make_pair(alias, arguments[i]->GetReturnType()));
+	}
+
+	// this is more for completeness reasons
+	bound_function.SetReturnType(LogicalType::STRUCT(struct_children));
+	return make_uniq<VariableReturnBindData>(bound_function.GetReturnType());
+}
+
+static unique_ptr<BaseStatistics> StructPackStats(ClientContext &context, FunctionStatisticsInput &input) {
+	auto &child_stats = input.child_stats;
+	auto &expr = input.expr;
+	auto struct_stats = StructStats::CreateUnknown(expr.GetReturnType());
+	for (idx_t i = 0; i < child_stats.size(); i++) {
+		StructStats::SetChildStats(struct_stats, i, child_stats[i]);
+	}
+	return struct_stats.ToUnique();
+}
+
+template <bool IS_STRUCT_PACK>
+static ScalarFunction GetStructPackFunction() {
+	ScalarFunction fun(IS_STRUCT_PACK ? "struct_pack" : "row", {}, LogicalTypeId::STRUCT, StructPackFunction,
+	                   StructPackBind<IS_STRUCT_PACK>, StructPackStats);
+	fun.SetVarArgs(LogicalType::ANY);
+	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	fun.SetSerializeCallback(VariableReturnBindData::Serialize);
+	fun.SetDeserializeCallback(VariableReturnBindData::Deserialize);
+	return fun;
+}
+
+ScalarFunction StructPackFun::GetFunction() {
+	return GetStructPackFunction<true>();
+}
+
+ScalarFunction RowFun::GetFunction() {
+	return GetStructPackFunction<false>();
+}
+
+} // namespace duckdb

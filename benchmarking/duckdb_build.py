@@ -8,6 +8,8 @@ from pathlib import Path
 
 from benchmarking.experiment_config import BinarySystemConfig, GitSystemConfig, SystemConfig
 
+DEFAULT_SHARED_DUCKDB_CHECKOUT_DIR = (Path(__file__).resolve().parent.parent / "duckdb").resolve()
+
 
 @dataclass(frozen=True)
 class ResolvedSystem:
@@ -18,6 +20,13 @@ class ResolvedSystem:
     git_commit: str | None
     repo: str | None
     ref: str | None
+
+
+@dataclass(frozen=True)
+class DuckDBCheckoutOptions:
+    checkout_dir: Path = DEFAULT_SHARED_DUCKDB_CHECKOUT_DIR
+    github_branch: str | None = None
+    github_repo: str | None = None
 
 
 def apply_compatibility_patches(clone_dir: Path) -> None:
@@ -106,24 +115,79 @@ def get_binary_version(binary: Path) -> str:
     return run_command([str(binary), "--version"])
 
 
-def ensure_git_checkout(clone_dir: Path, repo: str, ref: str) -> None:
-    if not clone_dir.exists():
-        clone_dir.parent.mkdir(parents=True, exist_ok=True)
-        run_command(["git", "clone", "--no-checkout", repo, str(clone_dir)])
-    git_dir = clone_dir / ".git"
-    if not git_dir.exists():
-        raise RuntimeError(f"existing clone path is not a git checkout: {clone_dir}")
-    current_origin = run_command(["git", "remote", "get-url", "origin"], cwd=clone_dir)
-    if current_origin != repo:
-        raise RuntimeError(
-            f"existing clone at {clone_dir} points to {current_origin}, expected {repo}"
+def _directory_is_non_empty(path: Path) -> bool:
+    return path.exists() and any(path.iterdir())
+
+
+def _looks_like_duckdb_source_tree(path: Path) -> bool:
+    return (path / "Makefile").exists() and (path / "src" / "include" / "duckdb").is_dir()
+
+
+def _normalize_github_repo(repo: str) -> str:
+    normalized = repo.strip()
+    if normalized.startswith("https://") or normalized.startswith("git@"):
+        return normalized
+    normalized = normalized.removesuffix(".git")
+    return f"https://github.com/{normalized}.git"
+
+
+def _redacted_git_version(binary: Path) -> str:
+    version = get_binary_version(binary)
+    parts = version.split()
+    if not parts:
+        return "duckdb-local-build"
+    return parts[0]
+
+
+def ensure_duckdb_checkout(options: DuckDBCheckoutOptions) -> Path:
+    checkout_dir = options.checkout_dir.resolve()
+    if _directory_is_non_empty(checkout_dir):
+        if options.github_branch is None:
+            if not _looks_like_duckdb_source_tree(checkout_dir):
+                raise RuntimeError(
+                    f"DuckDB checkout directory exists but does not look like a DuckDB source tree: {checkout_dir}"
+                )
+            return checkout_dir
+        git_dir = checkout_dir / ".git"
+        if not git_dir.exists():
+            raise RuntimeError(
+                f"DuckDB checkout directory at {checkout_dir} has no .git metadata; cannot update "
+                "from --duckdb-github-branch after anonymization"
+            )
+    else:
+        if options.github_branch is None:
+            raise RuntimeError(
+                f"DuckDB checkout directory not found or empty: {checkout_dir}. "
+                "Populate it manually or pass --duckdb-github-branch."
+            )
+        if options.github_repo is None:
+            raise RuntimeError(
+                "--duckdb-github-repo is required when --duckdb-github-branch is used to create a missing checkout"
+            )
+        checkout_dir.parent.mkdir(parents=True, exist_ok=True)
+        run_command(
+            [
+                "git",
+                "clone",
+                "--no-checkout",
+                _normalize_github_repo(options.github_repo),
+                str(checkout_dir),
+            ]
         )
-    run_command(["git", "fetch", "origin", ref, "--depth", "1"], cwd=clone_dir)
-    run_command(["git", "switch", "--detach", "FETCH_HEAD"], cwd=clone_dir)
 
-
-def ensure_duckdb_checkout(clone_dir: Path, repo: str, ref: str) -> None:
-    ensure_git_checkout(clone_dir, repo, ref)
+    remote_name = "origin"
+    if options.github_repo is not None:
+        expected_origin = _normalize_github_repo(options.github_repo)
+        current_origin = run_command(["git", "remote", "get-url", remote_name], cwd=checkout_dir)
+        if current_origin != expected_origin:
+            raise RuntimeError(
+                f"existing checkout at {checkout_dir} points to {current_origin}, expected {expected_origin}"
+            )
+    run_command(["git", "fetch", remote_name, options.github_branch, "--depth", "1"], cwd=checkout_dir)
+    run_command(["git", "switch", "--detach", "FETCH_HEAD"], cwd=checkout_dir)
+    if not _looks_like_duckdb_source_tree(checkout_dir):
+        raise RuntimeError(f"DuckDB checkout directory is incomplete after update: {checkout_dir}")
+    return checkout_dir
 
 
 def ensure_duckdb_vcpkg_toolchain(clone_dir: Path, env: dict[str, str]) -> Path:
@@ -139,6 +203,7 @@ def ensure_duckdb_vcpkg_toolchain(clone_dir: Path, env: dict[str, str]) -> Path:
 def build_duckdb(clone_dir: Path, config: GitSystemConfig) -> None:
     build_env = dict(os.environ)
     build_env["GEN"] = "ninja"
+    build_env["CCACHE_DISABLE"] = "1"
     if config.c_compiler is not None:
         build_env["CC"] = config.c_compiler
     if config.cxx_compiler is not None:
@@ -186,9 +251,8 @@ def _resolve_binary_system(config: BinarySystemConfig) -> ResolvedSystem:
     )
 
 
-def _resolve_git_system(config: GitSystemConfig, system_dir: Path) -> ResolvedSystem:
-    checkout_dir = system_dir / "checkout"
-    ensure_duckdb_checkout(checkout_dir, config.repo, config.ref)
+def _resolve_git_system(config: GitSystemConfig, checkout_options: DuckDBCheckoutOptions) -> ResolvedSystem:
+    checkout_dir = ensure_duckdb_checkout(checkout_options)
     apply_compatibility_patches(checkout_dir)
     build_duckdb(checkout_dir, config)
     binary_path = resolve_built_duckdb_binary(checkout_dir)
@@ -196,30 +260,40 @@ def _resolve_git_system(config: GitSystemConfig, system_dir: Path) -> ResolvedSy
         kind="git",
         name=config.name,
         binary_path=binary_path,
-        version=get_binary_version(binary_path),
-        git_commit=get_git_commit(checkout_dir),
-        repo=config.repo,
-        ref=config.ref,
+        version=_redacted_git_version(binary_path),
+        git_commit=None,
+        repo=None,
+        ref=None,
     )
 
 
-def resolve_system(config: SystemConfig, system_dir: Path) -> ResolvedSystem:
+def resolve_system(
+    config: SystemConfig,
+    system_dir: Path,
+    checkout_options: DuckDBCheckoutOptions | None = None,
+) -> ResolvedSystem:
     if config.kind == "binary":
         return _resolve_binary_system(config)
-    return _resolve_git_system(config, system_dir)
+    return _resolve_git_system(config, checkout_options or DuckDBCheckoutOptions())
 
 
-def resolve_existing_system(config: SystemConfig, system_dir: Path) -> ResolvedSystem:
+def resolve_existing_system(
+    config: SystemConfig,
+    system_dir: Path,
+    checkout_options: DuckDBCheckoutOptions | None = None,
+) -> ResolvedSystem:
     if config.kind == "binary":
         return _resolve_binary_system(config)
-    checkout_dir = system_dir / "checkout"
+    checkout_dir = (checkout_options or DuckDBCheckoutOptions()).checkout_dir.resolve()
+    if not _looks_like_duckdb_source_tree(checkout_dir):
+        raise RuntimeError(f"DuckDB checkout directory does not look usable: {checkout_dir}")
     binary_path = resolve_built_duckdb_binary(checkout_dir)
     return ResolvedSystem(
         kind="git",
         name=config.name,
         binary_path=binary_path,
-        version=get_binary_version(binary_path),
-        git_commit=get_git_commit(checkout_dir),
-        repo=config.repo,
-        ref=config.ref,
+        version=_redacted_git_version(binary_path),
+        git_commit=None,
+        repo=None,
+        ref=None,
     )

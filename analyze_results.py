@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from benchmarking.duckdb_build import DEFAULT_SHARED_DUCKDB_CHECKOUT_DIR, DuckDBCheckoutOptions
 from benchmarking.results_analysis import analyze_experiment
 
 
@@ -20,12 +21,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--baseline-variant",
         help="override the baseline variant label used for comparisons",
     )
+    parser.add_argument(
+        "--duckdb-checkout-dir",
+        type=Path,
+        default=DEFAULT_SHARED_DUCKDB_CHECKOUT_DIR,
+        help=f"path to the shared local DuckDB source tree (default: {DEFAULT_SHARED_DUCKDB_CHECKOUT_DIR})",
+    )
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    paths = analyze_experiment(args.experiment_root, args.baseline_variant)
+    paths = analyze_experiment(
+        args.experiment_root,
+        args.baseline_variant,
+        DuckDBCheckoutOptions(checkout_dir=args.duckdb_checkout_dir.resolve()),
+    )
     print(paths.root)
 
 

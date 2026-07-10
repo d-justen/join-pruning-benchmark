@@ -1,0 +1,162 @@
+//===----------------------------------------------------------------------===//
+//                         DuckDB
+//
+// duckdb/execution/operator/join/join_filter_pushdown.hpp
+//
+//
+//===----------------------------------------------------------------------===//
+
+#pragma once
+
+#include "duckdb/common/enums/join_type.hpp"
+#include "duckdb/common/projection_index.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/planner/column_binding.hpp"
+#include "duckdb/planner/expression.hpp"
+#include "duckdb/planner/filter/table_filter_functions.hpp"
+#include "duckdb/planner/table_filter.hpp"
+
+namespace duckdb {
+class DataChunk;
+class DynamicTableFilterSet;
+class LogicalGet;
+class JoinHashTable;
+class PhysicalComparisonJoin;
+class PerfectHashJoinExecutor;
+struct GlobalUngroupedAggregateState;
+struct LocalUngroupedAggregateState;
+
+struct JoinFilterPushdownColumn {
+	//! The probe column index to which this filter should be applied
+	ColumnBinding probe_column_index;
+	//! The type of the value in storage (LogicalGet)
+	LogicalType storage_type;
+};
+
+struct JoinFilterGlobalState {
+	~JoinFilterGlobalState();
+
+	//! Global Min/Max aggregates for filter pushdown
+	unique_ptr<GlobalUngroupedAggregateState> global_aggregate_state;
+};
+
+struct JoinFilterLocalState {
+	~JoinFilterLocalState();
+
+	//! Local Min/Max aggregates for filter pushdown
+	unique_ptr<LocalUngroupedAggregateState> local_aggregate_state;
+};
+
+struct JoinFilterPushdownFilter {
+	//! The dynamic table filter set where to push filters into
+	shared_ptr<DynamicTableFilterSet> dynamic_filters;
+	//! The columns for which we should generate filters
+	vector<JoinFilterPushdownColumn> columns;
+};
+
+struct PushdownFilterTarget {
+	PushdownFilterTarget(LogicalGet &get, vector<JoinFilterPushdownColumn> columns_p)
+	    : get(get), columns(std::move(columns_p)) {
+	}
+
+	LogicalGet &get;
+	vector<JoinFilterPushdownColumn> columns;
+};
+
+enum class PrefixRangeFilterPlanType : uint8_t { NONE, EXACT, FIXED_SIZE_APPROXIMATE };
+
+struct PrefixRangeFilterPlan {
+	PrefixRangeFilterPlanType type = PrefixRangeFilterPlanType::NONE;
+	PrefixRangeFilter::Sizing sizing;
+
+	bool HasFilter() const {
+		return type != PrefixRangeFilterPlanType::NONE;
+	}
+
+	bool NeedsPostBuildAnalysis() const {
+		return type == PrefixRangeFilterPlanType::FIXED_SIZE_APPROXIMATE;
+	}
+};
+
+struct JoinFilterPushdownUtil {
+	static bool PushdownJoinFilterExpression(const Expression &expr, JoinFilterPushdownColumn &filter);
+	static bool JoinTypeIsSupported(JoinType join_type);
+};
+
+struct JoinFilterPushdownSettings {
+	bool enable_min_max_filter_pushdown = true;
+	bool enable_bloom_filter_pushdown = true;
+	bool enable_bloom_filter_row_group_pruning = true;
+	bool enable_prefix_range_filter_pushdown = true;
+	bool enable_perfect_hash_join_filter_pushdown = true;
+};
+
+enum class JoinFilterSummaryPlanType : uint8_t {
+	NONE,
+	SINGLE_VALUE,
+	MIN_MAX,
+	BLOOM,
+	MIN_MAX_AND_BLOOM,
+	IN_FILTER,
+	PERFECT_HASH_JOIN,
+	PREFIX_RANGE,
+	PREFIX_RANGE_WITH_FALLBACKS
+};
+
+struct JoinFilterSummaryPlan {
+	JoinFilterSummaryPlanType type = JoinFilterSummaryPlanType::NONE;
+	PrefixRangeFilterPlan prefix_range_plan;
+};
+
+struct JoinFilterPushdownInfo {
+	//! The join condition indexes for which we compute the min/max aggregates
+	vector<idx_t> join_condition;
+	//! The probes to push the filter into
+	vector<JoinFilterPushdownFilter> probe_info;
+	//! Min/Max aggregates
+	vector<unique_ptr<Expression>> min_max_aggregates;
+	//! Whether the build side has a filter -> we might be able to push down a bloom filter into the probe side
+	bool build_side_has_filter;
+
+public:
+	unique_ptr<JoinFilterGlobalState> GetGlobalState(ClientContext &context, const PhysicalOperator &op) const;
+	unique_ptr<JoinFilterLocalState> GetLocalState(JoinFilterGlobalState &gstate) const;
+
+	void Sink(DataChunk &chunk, JoinFilterLocalState &lstate) const;
+	void Combine(JoinFilterGlobalState &gstate, JoinFilterLocalState &lstate) const;
+	unique_ptr<DataChunk> Finalize(ClientContext &context, JoinFilterGlobalState &gstate,
+	                               const PhysicalComparisonJoin &op, optional_ptr<JoinHashTable> ht = nullptr,
+	                               optional_ptr<PerfectHashJoinExecutor> perfect_hash_join_executor = nullptr) const;
+
+	unique_ptr<DataChunk> FinalizeMinMax(JoinFilterGlobalState &gstate) const;
+	unique_ptr<DataChunk> FinalizeFilters(ClientContext &context, const PhysicalComparisonJoin &op,
+	                                      unique_ptr<DataChunk> final_min_max, optional_ptr<JoinHashTable> ht = nullptr,
+	                                      optional_ptr<PerfectHashJoinExecutor> perfect_join_executor = nullptr) const;
+
+private:
+	JoinFilterPushdownSettings GetSettings(const ClientContext &context) const;
+	void PushInFilter(const JoinFilterPushdownFilter &info, JoinHashTable &ht, const PhysicalOperator &op,
+	                  idx_t filter_idx, ProjectionIndex filter_col_idx) const;
+
+	void PushBloomFilter(const PhysicalOperator &op, JoinHashTable &ht, const JoinFilterPushdownFilter &info,
+	                     ProjectionIndex filter_col_idx, bool allow_row_group_pruning,
+	                     bool build_immediately = true) const;
+	void PushPerfectHashJoinFilter(const PhysicalOperator &op, PerfectHashJoinExecutor &perfect_join_executor,
+	                               const JoinFilterPushdownFilter &info, ProjectionIndex filter_col_idx) const;
+	void RegisterPrefixRangeFilter(const JoinFilterPushdownFilter &info, ClientContext &context, JoinHashTable &ht,
+	                               const PhysicalOperator &op, ProjectionIndex filter_col_idx, const Value &min_val,
+	                               const Value &max_val, const PrefixRangeFilterPlan &plan) const;
+
+	bool CanUseInFilter(const ClientContext &context, optional_ptr<JoinHashTable> ht, const ExpressionType &cmp) const;
+	bool CanUseBloomFilter(const ClientContext &context, const PhysicalComparisonJoin &op, const ExpressionType &cmp,
+	                       optional_ptr<JoinHashTable> ht = nullptr) const;
+	PrefixRangeFilterPlan PlanPrefixRangeFilter(ClientContext &context, optional_ptr<JoinHashTable> ht,
+	                                            const PhysicalComparisonJoin &op, const ExpressionType &cmp,
+	                                            const Value &min, const Value &max) const;
+	JoinFilterSummaryPlan PlanSummaryFilters(const JoinFilterPushdownSettings &settings, ClientContext &context,
+	                                         const PhysicalComparisonJoin &op, const ExpressionType &cmp,
+	                                         const Value &min, const Value &max, optional_ptr<JoinHashTable> ht,
+	                                         optional_ptr<PerfectHashJoinExecutor> perfect_join_executor) const;
+};
+
+} // namespace duckdb

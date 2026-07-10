@@ -71,8 +71,6 @@
     {
       "name": "duckdb",
       "kind": "git",
-      "repo": "https://github.com/d-justen/duckdb.git",
-      "ref": "prf-sizing",
       "variants": [
         {
           "label": "no prefilter",

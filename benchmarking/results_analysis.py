@@ -7,7 +7,7 @@ from pathlib import Path
 
 import duckdb
 
-from benchmarking.duckdb_build import resolve_existing_system
+from benchmarking.duckdb_build import DuckDBCheckoutOptions, resolve_existing_system
 from benchmarking.duckdb_runner import _extract_profile_metrics
 from benchmarking.experiment_config import ExperimentConfig, VariantConfig, load_experiment_config
 from benchmarking.manifests import PreparedWorkload, load_manifest
@@ -117,7 +117,13 @@ def _profile_sql(
     return "\n".join(statements) + "\n"
 
 
-def backfill_profiles(experiment_root: Path, config: ExperimentConfig, *, results_db: Path) -> int:
+def backfill_profiles(
+    experiment_root: Path,
+    config: ExperimentConfig,
+    *,
+    results_db: Path,
+    checkout_options: DuckDBCheckoutOptions,
+) -> int:
     _ensure_profile_runs_table(results_db)
     con = duckdb.connect(str(results_db))
     try:
@@ -180,7 +186,11 @@ def backfill_profiles(experiment_root: Path, config: ExperimentConfig, *, result
             ) = row
             workload = workloads[workload_name]
             system_config = systems_by_name[system_name]
-            resolved_system = resolve_existing_system(system_config, experiment_root / "systems" / system_name)
+            resolved_system = resolve_existing_system(
+                system_config,
+                experiment_root / "systems" / system_name,
+                checkout_options,
+            )
             variant = variant_by_key[(system_name, variant_label)]
             profile_dir = experiment_root / "analysis" / "profiles" / workload_name / system_name / variant_label
             profile_dir.mkdir(parents=True, exist_ok=True)
@@ -627,15 +637,25 @@ def write_workload_chart(
     output_path.write_text(svg, encoding="utf-8")
 
 
-def analyze_experiment(experiment_root: Path, baseline_variant: str | None) -> AnalysisPaths:
+def analyze_experiment(
+    experiment_root: Path,
+    baseline_variant: str | None,
+    checkout_options: DuckDBCheckoutOptions | None = None,
+) -> AnalysisPaths:
     experiment_root = experiment_root.resolve()
     config = load_experiment_config(experiment_root / "config.json")
     results_db = experiment_root / "results.duckdb"
+    resolved_checkout_options = checkout_options or DuckDBCheckoutOptions()
     analysis_paths = AnalysisPaths(root=experiment_root / "analysis")
     analysis_paths.root.mkdir(parents=True, exist_ok=True)
     analysis_paths.comparisons_dir.mkdir(parents=True, exist_ok=True)
     analysis_paths.charts_dir.mkdir(parents=True, exist_ok=True)
-    backfill_count = backfill_profiles(experiment_root, config, results_db=results_db)
+    backfill_count = backfill_profiles(
+        experiment_root,
+        config,
+        results_db=results_db,
+        checkout_options=resolved_checkout_options,
+    )
     workloads = _load_workloads(experiment_root)
     baselines = _default_baselines(config)
     if baseline_variant is not None:

@@ -59,8 +59,6 @@ class BinarySystemConfig:
 class GitSystemConfig:
     kind: str
     name: str
-    repo: str
-    ref: str
     c_compiler: str | None
     cxx_compiler: str | None
     variants: tuple[VariantConfig, ...]
@@ -352,12 +350,15 @@ def _parse_systems(raw: object, base_dir: Path) -> tuple[SystemConfig, ...]:
                 )
             )
         elif kind == "git":
+            if "repo" in system_obj or "ref" in system_obj:
+                raise ValueError(
+                    "git systems no longer accept repo/ref in config; use the local duckdb checkout "
+                    "and the runtime-only --duckdb-github-branch flag instead"
+                )
             systems.append(
                 GitSystemConfig(
                     kind="git",
                     name=name,
-                    repo=_require_string(system_obj.get("repo"), "repo"),
-                    ref=_require_string(system_obj.get("ref"), "ref"),
                     c_compiler=(
                         None
                         if system_obj.get("c_compiler") is None

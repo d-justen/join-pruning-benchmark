@@ -4,7 +4,7 @@ import shutil
 from pathlib import Path
 
 from benchmarking.artifact_layout import ExperimentPaths, prepare_experiment_root
-from benchmarking.duckdb_build import ResolvedSystem, resolve_system
+from benchmarking.duckdb_build import DuckDBCheckoutOptions, ResolvedSystem, resolve_system
 from benchmarking.duckdb_runner import benchmark_workload, summarize_results, write_summary
 from benchmarking.experiment_config import ExperimentConfig
 from benchmarking.manifests import PreparedWorkload
@@ -42,13 +42,20 @@ def copy_config(config_path: Path, destination: Path) -> None:
 
 
 def run_experiment(config: ExperimentConfig) -> ExperimentPaths:
+    return run_experiment_with_options(config, DuckDBCheckoutOptions())
+
+
+def run_experiment_with_options(
+    config: ExperimentConfig,
+    checkout_options: DuckDBCheckoutOptions,
+) -> ExperimentPaths:
     paths = prepare_experiment_root(
         config.experiment_root,
         overwrite=config.overwrite_output,
     )
     copy_config(config.config_path, paths.copied_config_path)
     resolved_systems = [
-        resolve_system(system_config, paths.system_dir(system_config.name))
+        resolve_system(system_config, paths.system_dir(system_config.name), checkout_options)
         for system_config in config.systems
     ]
     workloads = prepare_workloads(

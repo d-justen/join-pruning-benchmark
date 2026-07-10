@@ -104,8 +104,6 @@
     {
       "name": "duckdb-paper",
       "kind": "git",
-      "repo": "https://github.com/d-justen/duckdb.git",
-      "ref": "prf-sizing",
       "c_compiler": "clang",
       "cxx_compiler": "clang++",
       "variants": [
