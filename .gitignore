@@ -4,3 +4,4 @@ venv/
 tmp/
 *.pyc
 .DS_Store
+tests/
