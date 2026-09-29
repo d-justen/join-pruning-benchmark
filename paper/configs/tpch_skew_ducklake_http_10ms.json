@@ -1,0 +1,98 @@
+{
+  "experiment_name": "paper-tpch-skew-ducklake-http-10ms",
+  "output_root": "../../out/experiments",
+  "overwrite_output": true,
+  "workloads": [
+    {
+      "name": "tpch-skew-ducklake-http-10ms",
+      "kind": "external",
+      "source_dir": "../../external_benchmarks/tpch-skew",
+      "storage": {
+        "kind": "ducklake",
+        "parquet_file_size_mb": 64,
+        "http_latency_ms": 10
+      }
+    }
+  ],
+  "systems": [
+    {
+      "name": "duckdb-paper-ducklake-http",
+      "kind": "binary",
+      "binary_path": "duckdb/build/release/duckdb",
+      "variants": [
+        {
+          "label": "no prefilter",
+          "setup_sql": [
+            "SET enable_prefix_range_filter=false;",
+            "SET enable_join_min_max_filter_pushdown=false;",
+            "SET enable_join_bloom_filter_pushdown=false;",
+            "SET enable_perfect_hash_join_filter_pushdown=false;",
+            "SET dynamic_or_filter_threshold=0;",
+            "SET disable_parquet_prefetching=true;",
+            "SET disabled_optimizers='compressed_materialization';"
+          ]
+        },
+        {
+          "label": "sip",
+          "setup_sql": [
+            "SET enable_prefix_range_filter=false;",
+            "SET enable_join_min_max_filter_pushdown=false;",
+            "SET enable_join_bloom_filter_pushdown=true;",
+            "SET enable_join_bloom_filter_row_group_pruning=true;",
+            "SET enable_perfect_hash_join_filter_pushdown=false;",
+            "SET dynamic_or_filter_threshold=0;",
+            "SET disable_parquet_prefetching=true;",
+            "SET disabled_optimizers='compressed_materialization';"
+          ]
+        },
+        {
+          "label": "sip + min/max",
+          "setup_sql": [
+            "SET enable_prefix_range_filter=false;",
+            "SET enable_join_min_max_filter_pushdown=true;",
+            "SET enable_join_bloom_filter_pushdown=true;",
+            "SET enable_join_bloom_filter_row_group_pruning=true;",
+            "SET enable_perfect_hash_join_filter_pushdown=false;",
+            "SET dynamic_or_filter_threshold=0;",
+            "SET disable_parquet_prefetching=true;",
+            "SET disabled_optimizers='compressed_materialization';"
+          ]
+        },
+        {
+          "label": "prf uncompressed",
+          "setup_sql": [
+            "SET enable_prefix_range_filter=true;",
+            "SET enable_prefix_range_filter_compression=false;",
+            "SET enable_join_min_max_filter_pushdown=true;",
+            "SET enable_join_bloom_filter_pushdown=true;",
+            "SET enable_join_bloom_filter_row_group_pruning=true;",
+            "SET enable_perfect_hash_join_filter_pushdown=false;",
+            "SET dynamic_or_filter_threshold=0;",
+            "SET disable_parquet_prefetching=true;",
+            "SET disabled_optimizers='compressed_materialization';"
+          ]
+        },
+        {
+          "label": "prf with fallback",
+          "setup_sql": [
+            "SET enable_prefix_range_filter=true;",
+            "SET enable_prefix_range_filter_compression=true;",
+            "SET enable_join_min_max_filter_pushdown=true;",
+            "SET enable_join_bloom_filter_pushdown=true;",
+            "SET enable_join_bloom_filter_row_group_pruning=true;",
+            "SET enable_perfect_hash_join_filter_pushdown=false;",
+            "SET dynamic_or_filter_threshold=0;",
+            "SET disable_parquet_prefetching=true;",
+            "SET disabled_optimizers='compressed_materialization';"
+          ]
+        }
+      ]
+    }
+  ],
+  "benchmark": {
+    "repetitions": 3,
+    "threads": 8,
+    "prepare_duckdb_binary": "duckdb",
+    "collect_profiles": true
+  }
+}

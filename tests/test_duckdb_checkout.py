@@ -9,6 +9,7 @@ from pathlib import Path
 from benchmarking.duckdb_build import (
     DuckDBCheckoutOptions,
     ensure_duckdb_checkout,
+    resolve_built_duckdb_binary,
     resolve_existing_system,
 )
 from benchmarking.experiment_config import GitSystemConfig, load_experiment_config
@@ -26,6 +27,104 @@ def _make_fake_duckdb_tree(root: Path) -> Path:
 
 
 class DuckDBCheckoutTest(unittest.TestCase):
+    def test_preferred_build_directory_wins_over_release_build(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            checkout_dir = _make_fake_duckdb_tree(Path(temporary_dir) / "duckdb")
+            native_build_dir = checkout_dir / "build" / "paper-native-release"
+            native_build_dir.mkdir(parents=True)
+            native_binary = native_build_dir / "duckdb"
+            native_binary.write_text("native", encoding="utf-8")
+
+            resolved = resolve_built_duckdb_binary(
+                checkout_dir, native_build_dir
+            )
+
+            self.assertEqual(resolved, native_binary.resolve())
+
+    def test_git_system_accepts_local_checkout_and_workload_subset(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            checkout_dir = _make_fake_duckdb_tree(root / "rpt")
+            external_dir = root / "external"
+            (external_dir / "queries").mkdir(parents=True)
+            (external_dir / "source.json").write_text(
+                json.dumps({"benchmark_name": "external", "queries_dir": "queries"}),
+                encoding="utf-8",
+            )
+            config_path = root / "experiment.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "experiment_name": "test",
+                        "output_root": "out",
+                        "overwrite_output": True,
+                        "workloads": [
+                            {
+                                "name": "external",
+                                "kind": "external",
+                                "source_dir": "external",
+                            }
+                        ],
+                        "systems": [
+                            {
+                                "name": "rpt",
+                                "kind": "git",
+                                "checkout_dir": "rpt",
+                                "workload_names": ["external"],
+                                "variants": [{"label": "rpt prf", "setup_sql": []}],
+                            }
+                        ],
+                        "benchmark": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            system = load_experiment_config(config_path).systems[0]
+
+            self.assertEqual(system.checkout_dir, checkout_dir.resolve())
+            self.assertEqual(system.workload_names, ("external",))
+
+    def test_system_rejects_unknown_workload_subset_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            external_dir = root / "external"
+            (external_dir / "queries").mkdir(parents=True)
+            (external_dir / "source.json").write_text(
+                json.dumps({"benchmark_name": "external", "queries_dir": "queries"}),
+                encoding="utf-8",
+            )
+            config_path = root / "experiment.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "experiment_name": "test",
+                        "output_root": "out",
+                        "overwrite_output": True,
+                        "workloads": [
+                            {
+                                "name": "external",
+                                "kind": "external",
+                                "source_dir": "external",
+                            }
+                        ],
+                        "systems": [
+                            {
+                                "name": "rpt",
+                                "kind": "git",
+                                "workload_names": ["missing"],
+                                "variants": [{"label": "rpt prf", "setup_sql": []}],
+                            }
+                        ],
+                        "benchmark": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "unknown workloads: missing"):
+                load_experiment_config(config_path)
+
     def test_config_parser_rejects_repo_and_ref_for_git_systems(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)

@@ -30,7 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--system-name",
-        help="system name to visualize when the config contains multiple systems",
+        help="visualize one system instead of combining all configured systems",
     )
     return parser
 

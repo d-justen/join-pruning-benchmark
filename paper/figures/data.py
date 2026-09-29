@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import duckdb
 
 from benchmarking import load_experiment_config
+from benchmarking.manifests import load_manifest
 from paper.figure_specs import FIGURES, QUERY_LABELS, VARIANT_ORDER, WORKLOAD_LABELS
 
 
@@ -19,6 +20,7 @@ class MetricRow:
     median_ms: float
     probe_rows_scanned: int | None
     total_rows_scanned: int | None
+    query_parameters: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -31,6 +33,10 @@ class ProbeScanRow:
     operator_rows_scanned: int
     operator_cardinality: int
     dynamic_filters: str
+    join_probe_cardinality: int | None = None
+    total_files_read: int | None = None
+    total_files_skipped: int | None = None
+    table_file_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -58,33 +64,91 @@ def display_label(query_name: str) -> str:
     return QUERY_LABELS.get(query_name, query_name.removesuffix(".sql"))
 
 
-def load_system_name(experiment_root: Path, requested: str | None) -> str:
+def load_system_names(experiment_root: Path, requested: str | None) -> tuple[str, ...]:
     config = load_experiment_config(experiment_root / "config.json")
     system_names = [system.name for system in config.systems]
     if requested is not None:
         if requested not in system_names:
             raise ValueError(f"unknown system {requested!r}; available: {', '.join(system_names)}")
-        return requested
-    if len(system_names) != 1:
+        selected = (requested,)
+    else:
+        selected = tuple(system_names)
+    selected_labels = [
+        variant.label
+        for system in config.systems
+        if system.name in selected
+        for variant in system.variants
+    ]
+    duplicates = sorted(
+        label for label in set(selected_labels) if selected_labels.count(label) > 1
+    )
+    if duplicates:
+        raise ValueError(
+            "paper figures require unique variant labels across selected systems: "
+            + ", ".join(duplicates)
+        )
+    return selected
+
+
+def load_system_name(experiment_root: Path, requested: str | None) -> str:
+    """Compatibility wrapper for callers that require exactly one system."""
+    selected = load_system_names(experiment_root, requested)
+    if len(selected) != 1:
         raise ValueError("multiple systems configured; pass --system-name explicitly")
-    return system_names[0]
+    return selected[0]
 
 
-def load_metric_rows(experiment_root: Path, system_name: str) -> list[MetricRow]:
+def _system_predicate(system_names: tuple[str, ...]) -> tuple[str, list[str]]:
+    if not system_names:
+        raise ValueError("at least one system must be selected")
+    return ", ".join("?" for _ in system_names), list(system_names)
+
+
+def _runtime_ms_with_profile_fallback(
+    median_ms: float,
+    profile_path: str | None,
+) -> float:
+    if median_ms > 0:
+        return median_ms
+    if profile_path:
+        profile_data = json.loads(Path(profile_path).read_text(encoding="utf-8"))
+        latency_seconds = profile_data.get("latency")
+        if (
+            isinstance(latency_seconds, (int, float))
+            and not isinstance(latency_seconds, bool)
+            and latency_seconds > 0
+        ):
+            return float(latency_seconds) * 1000.0
+    # A zero from a millisecond-granularity clock means the query completed
+    # within one tick. Keep it positive for logarithmic and ratio plots.
+    return 0.5
+
+
+def load_metric_rows(experiment_root: Path, system_names: tuple[str, ...]) -> list[MetricRow]:
     config = load_experiment_config(experiment_root / "config.json")
+    placeholders, system_parameters = _system_predicate(system_names)
     con = duckdb.connect(str(experiment_root / "results.duckdb"), read_only=True)
     try:
+        timing_columns = {
+            row[1] for row in con.execute("PRAGMA table_info('timing_runs')").fetchall()
+        }
+        query_parameters_projection = (
+            "any_value(query_parameters) AS query_parameters"
+            if "query_parameters" in timing_columns
+            else "NULL::VARCHAR AS query_parameters"
+        )
         rows = con.execute(
-            """
+            f"""
             WITH timing AS (
                 SELECT
                     workload_name,
                     query_name,
                     variant_label,
-                    median(elapsed_ns) / 1000000.0 AS median_ms
+                    median(elapsed_ns) / 1000000.0 AS median_ms,
+                    {query_parameters_projection}
                 FROM timing_runs
                 WHERE experiment_name = ?
-                  AND system_name = ?
+                  AND system_name IN ({placeholders})
                 GROUP BY 1, 2, 3
             ),
             profiles AS (
@@ -93,10 +157,11 @@ def load_metric_rows(experiment_root: Path, system_name: str) -> list[MetricRow]
                     query_name,
                     variant_label,
                     max(probe_rows_scanned) AS probe_rows_scanned,
-                    max(total_rows_scanned) AS total_rows_scanned
+                    max(total_rows_scanned) AS total_rows_scanned,
+                    max(profile_path) AS profile_path
                 FROM profile_runs
                 WHERE experiment_name = ?
-                  AND system_name = ?
+                  AND system_name IN ({placeholders})
                 GROUP BY 1, 2, 3
             )
             SELECT
@@ -104,8 +169,10 @@ def load_metric_rows(experiment_root: Path, system_name: str) -> list[MetricRow]
                 timing.query_name,
                 timing.variant_label,
                 timing.median_ms,
+                timing.query_parameters,
                 profiles.probe_rows_scanned,
-                profiles.total_rows_scanned
+                profiles.total_rows_scanned,
+                profiles.profile_path
             FROM timing
             LEFT JOIN profiles
               ON profiles.workload_name = timing.workload_name
@@ -113,7 +180,12 @@ def load_metric_rows(experiment_root: Path, system_name: str) -> list[MetricRow]
              AND profiles.variant_label = timing.variant_label
             ORDER BY timing.workload_name, timing.query_name, timing.variant_label
             """,
-            [config.experiment_name, system_name, config.experiment_name, system_name],
+            [
+                config.experiment_name,
+                *system_parameters,
+                config.experiment_name,
+                *system_parameters,
+            ],
         ).fetchall()
     finally:
         con.close()
@@ -122,9 +194,15 @@ def load_metric_rows(experiment_root: Path, system_name: str) -> list[MetricRow]
             workload_name=row[0],
             query_name=row[1],
             variant_label=row[2],
-            median_ms=row[3],
-            probe_rows_scanned=row[4],
-            total_rows_scanned=row[5],
+            # Older DuckDB builds expose CURRENT_TIMESTAMP at millisecond
+            # precision. Use the high-resolution profile latency when their
+            # repetition median is zero.
+            median_ms=_runtime_ms_with_profile_fallback(float(row[3]), row[7]),
+            probe_rows_scanned=row[5],
+            total_rows_scanned=row[6],
+            query_parameters=(
+                None if row[4] is None else json.loads(row[4])
+            ),
         )
         for row in rows
     ]
@@ -148,6 +226,14 @@ def _table_basename(table_name: str) -> str:
     return table_name.rsplit(".", 1)[-1].strip('"')
 
 
+def _optional_int(raw: object) -> int | None:
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str) and raw.isdigit():
+        return int(raw)
+    return None
+
+
 def _configured_probe_tables() -> dict[str, set[str]]:
     result: dict[str, set[str]] = {}
     for figure in FIGURES:
@@ -158,6 +244,45 @@ def _configured_probe_tables() -> dict[str, set[str]]:
     return result
 
 
+_PROBE_PATH_OPERATORS = {
+    "FILTER",
+    "PROJECTION",
+    "TABLE_SCAN",
+    "USE_BF",
+}
+
+
+def _join_probe_cardinalities_by_scan_path(
+    profile_data: dict,
+) -> dict[tuple[int, ...], int]:
+    """Map direct scan-fed join probes to the rows entering their join."""
+    result: dict[tuple[int, ...], int] = {}
+
+    def find_scan_path(node: dict, path: tuple[int, ...]) -> tuple[int, ...] | None:
+        operator_type = str(node.get("operator_type", ""))
+        if operator_type == "TABLE_SCAN":
+            return path
+        children = node.get("children", [])
+        if operator_type not in _PROBE_PATH_OPERATORS or len(children) != 1:
+            return None
+        return find_scan_path(children[0], path + (0,))
+
+    def visit(node: dict, path: tuple[int, ...]) -> None:
+        children = node.get("children", [])
+        operator_type = str(node.get("operator_type", ""))
+        if operator_type.endswith("_JOIN") and children:
+            probe_root = children[0]
+            scan_path = find_scan_path(probe_root, path + (0,))
+            probe_cardinality = probe_root.get("operator_cardinality")
+            if scan_path is not None and isinstance(probe_cardinality, int):
+                result[scan_path] = probe_cardinality
+        for index, child in enumerate(children):
+            visit(child, path + (index,))
+
+    visit(profile_data, ())
+    return result
+
+
 def _extract_probe_scan_rows(
     profile_data: dict,
     *,
@@ -165,13 +290,39 @@ def _extract_probe_scan_rows(
     query_name: str,
     variant_label: str,
     probe_tables: set[str],
+    table_file_counts: dict[str, int],
 ) -> list[ProbeScanRow]:
     extracted: list[ProbeScanRow] = []
+    join_probe_cardinalities = _join_probe_cardinalities_by_scan_path(profile_data)
 
-    def visit(node: dict, path: tuple[int, ...]) -> None:
+    def visit(
+        node: dict,
+        path: tuple[int, ...],
+        inherited_runtime_filters: tuple[str, ...] = (),
+    ) -> None:
         extra_info = node.get("extra_info", {})
-        if node.get("operator_type") == "TABLE_SCAN" and isinstance(extra_info, dict):
-            dynamic_filters = _normalize_dynamic_filters(extra_info.get("Dynamic Filters"))
+        operator_type = str(node.get("operator_type", ""))
+        runtime_filters = inherited_runtime_filters
+        if operator_type == "USE_BF" and isinstance(extra_info, dict):
+            filter_name = str(extra_info.get("Filter", "runtime filter"))
+            placement = str(extra_info.get("Tuple Placement", "operator"))
+            runtime_filters = runtime_filters + (
+                f"RPT {filter_name} ({placement})",
+            )
+        elif operator_type not in _PROBE_PATH_OPERATORS:
+            runtime_filters = ()
+        if operator_type == "TABLE_SCAN" and isinstance(extra_info, dict):
+            scan_dynamic_filters = _normalize_dynamic_filters(
+                extra_info.get("Dynamic Filters")
+            )
+            dynamic_filters = " ".join(
+                value
+                for value in (
+                    scan_dynamic_filters,
+                    " ".join(runtime_filters),
+                )
+                if value
+            )
             operator_rows_scanned = node.get("operator_rows_scanned")
             operator_cardinality = node.get("operator_cardinality")
             table_name = str(extra_info.get("Table", ""))
@@ -183,6 +334,7 @@ def _extract_probe_scan_rows(
                 and (
                     is_probe_table
                     or _has_optional_join_filter(dynamic_filters)
+                    or runtime_filters
                 )
             ):
                 if (
@@ -205,31 +357,54 @@ def _extract_probe_scan_rows(
                         operator_rows_scanned=operator_rows_scanned,
                         operator_cardinality=operator_cardinality,
                         dynamic_filters=dynamic_filters,
+                        join_probe_cardinality=join_probe_cardinalities.get(path),
+                        total_files_read=_optional_int(extra_info.get("Total Files Read")),
+                        total_files_skipped=_optional_int(
+                            extra_info.get("Total Files Skipped")
+                        ),
+                        table_file_count=table_file_counts.get(
+                            _table_basename(table_name)
+                        ),
                     )
                 )
         for index, child in enumerate(node.get("children", [])):
-            visit(child, path + (index,))
+            visit(child, path + (index,), runtime_filters)
 
     visit(profile_data, ())
     return extracted
 
 
-def load_probe_scan_rows(experiment_root: Path, system_name: str) -> list[ProbeScanRow]:
+def load_probe_scan_rows(experiment_root: Path, system_names: tuple[str, ...]) -> list[ProbeScanRow]:
     config = load_experiment_config(experiment_root / "config.json")
+    placeholders, system_parameters = _system_predicate(system_names)
     con = duckdb.connect(str(experiment_root / "results.duckdb"), read_only=True)
     try:
         rows = con.execute(
-            """
+            f"""
             SELECT workload_name, query_name, variant_label, profile_path
             FROM profile_runs
             WHERE experiment_name = ?
-              AND system_name = ?
+              AND system_name IN ({placeholders})
             ORDER BY workload_name, query_name, variant_label
             """,
-            [config.experiment_name, system_name],
+            [config.experiment_name, *system_parameters],
         ).fetchall()
     finally:
         con.close()
+
+    table_file_counts_by_workload: dict[str, dict[str, int]] = {}
+    for manifest_path in sorted((experiment_root / "workloads").glob("*/manifest.json")):
+        manifest = load_manifest(manifest_path)
+        catalog_path = manifest.parquet_catalog_path
+        if catalog_path is None and manifest.storage_mode == "ducklake":
+            catalog_path = manifest.remote_parquet_catalog_path
+        if catalog_path is None:
+            continue
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        table_file_counts_by_workload[manifest.name] = {
+            table_name: len(file_paths)
+            for table_name, file_paths in catalog.items()
+        }
 
     extracted: list[ProbeScanRow] = []
     probe_tables_by_workload = _configured_probe_tables()
@@ -242,47 +417,66 @@ def load_probe_scan_rows(experiment_root: Path, system_name: str) -> list[ProbeS
                 query_name=query_name,
                 variant_label=variant_label,
                 probe_tables=probe_tables_by_workload.get(workload_name, set()),
+                table_file_counts=table_file_counts_by_workload.get(workload_name, {}),
             )
         )
-    return extracted
+
+    # COPY can leave a trailing, zero-row Parquet file on a size boundary.
+    # DuckLake ignores that file when adding data, so prefer the number of
+    # registered files observed by the scan operator over the export-path count.
+    observed_file_counts: dict[tuple[str, str], int] = {}
+    for row in extracted:
+        if row.total_files_read is None:
+            continue
+        observed_count = row.total_files_read + (row.total_files_skipped or 0)
+        key = (row.workload_name, _table_basename(row.table_name))
+        observed_file_counts[key] = max(
+            observed_count,
+            observed_file_counts.get(key, 0),
+        )
+    return [
+        replace(
+            row,
+            table_file_count=observed_file_counts.get(
+                (row.workload_name, _table_basename(row.table_name)),
+                row.table_file_count,
+            ),
+        )
+        for row in extracted
+    ]
 
 
 def _extract_join_probe_metrics(profile_data: dict) -> tuple[int, int]:
-    left_subtree_scan_cardinalities: dict[tuple[int, ...], int] = {}
+    join_probe_tuples = 0
     join_operator_count = 0
 
-    def collect_scan_cardinalities(node: dict, path: tuple[int, ...]) -> None:
-        if node.get("operator_type") == "TABLE_SCAN":
-            operator_cardinality = node.get("operator_cardinality")
-            if isinstance(operator_cardinality, int):
-                left_subtree_scan_cardinalities[path] = operator_cardinality
-        for index, child in enumerate(node.get("children", [])):
-            collect_scan_cardinalities(child, path + (index,))
-
     def visit(node: dict, path: tuple[int, ...]) -> None:
-        nonlocal join_operator_count
+        nonlocal join_operator_count, join_probe_tuples
         children = node.get("children", [])
         operator_type = str(node.get("operator_type", ""))
         if operator_type.endswith("_JOIN"):
             join_operator_count += 1
             if children:
-                collect_scan_cardinalities(children[0], path + (0,))
+                probe_cardinality = children[0].get("operator_cardinality")
+                if isinstance(probe_cardinality, int):
+                    join_probe_tuples += probe_cardinality
         for index, child in enumerate(children):
             visit(child, path + (index,))
 
     visit(profile_data, ())
-    return sum(left_subtree_scan_cardinalities.values()), join_operator_count
+    return join_probe_tuples, join_operator_count
 
 
 def load_plan_metric_rows(
     experiment_root: Path,
-    system_name: str,
+    system_names: tuple[str, ...],
 ) -> list[PlanMetricRow]:
     config = load_experiment_config(experiment_root / "config.json")
+    placeholders, system_parameters = _system_predicate(system_names)
     con = duckdb.connect(str(experiment_root / "results.duckdb"), read_only=True)
     try:
         rows = con.execute(
-            """
+            f"""
             SELECT
                 workload_name,
                 query_name,
@@ -291,10 +485,10 @@ def load_plan_metric_rows(
                 total_rows_scanned
             FROM profile_runs
             WHERE experiment_name = ?
-              AND system_name = ?
+              AND system_name IN ({placeholders})
             ORDER BY workload_name, query_name, variant_label
             """,
-            [config.experiment_name, system_name],
+            [config.experiment_name, *system_parameters],
         ).fetchall()
     finally:
         con.close()
@@ -335,13 +529,14 @@ def build_runtime_probe_table(
     workload_name: str,
     query_names: tuple[str, ...],
     probe_table: str,
+    logical_probe_rows: int | None = None,
 ) -> list[dict[str, object]]:
     metric_rows = {
         (row.query_name, row.variant_label): row
         for row in rows
         if row.workload_name == workload_name
     }
-    probe_scans: dict[tuple[str, str], ProbeScanRow] = {}
+    probe_scans: dict[tuple[str, str], list[ProbeScanRow]] = {}
     for scan_row in scan_rows:
         if (
             scan_row.workload_name != workload_name
@@ -349,36 +544,74 @@ def build_runtime_probe_table(
         ):
             continue
         key = (scan_row.query_name, scan_row.variant_label)
-        if key in probe_scans:
-            raise ValueError(
-                f"multiple {probe_table} scans found for {workload_name}/{scan_row.query_name}/"
-                f"{scan_row.variant_label}"
-            )
-        probe_scans[key] = scan_row
+        probe_scans.setdefault(key, []).append(scan_row)
 
     entries: list[dict[str, object]] = []
     for query_name in query_names:
         series: list[dict[str, object]] = []
         for variant_label in VARIANT_ORDER:
             metric_row = metric_rows.get((query_name, variant_label))
-            scan_row = probe_scans.get((query_name, variant_label))
+            matching_scans = probe_scans.get((query_name, variant_label))
             if metric_row is None:
-                raise ValueError(
-                    f"missing timing row for {workload_name}/{query_name}/{variant_label}"
-                )
-            if scan_row is None:
+                continue
+            if not matching_scans:
                 raise ValueError(
                     f"missing {probe_table} scan profile for "
                     f"{workload_name}/{query_name}/{variant_label}"
                 )
+            probe_rows_scanned = sum(row.operator_rows_scanned for row in matching_scans)
+            join_probe_rows = sum(
+                row.join_probe_cardinality
+                if row.join_probe_cardinality is not None
+                else row.operator_cardinality
+                for row in matching_scans
+            )
+            base_probe_rows = (
+                logical_probe_rows
+                if logical_probe_rows is not None
+                else probe_rows_scanned
+            )
+            if not 0 <= join_probe_rows <= probe_rows_scanned <= base_probe_rows:
+                raise ValueError(
+                    f"invalid probe accounting for {workload_name}/{query_name}/"
+                    f"{variant_label}/{probe_table}: join probe={join_probe_rows}, "
+                    f"physical scan={probe_rows_scanned}, logical input={base_probe_rows}"
+                )
+            files_read = (
+                None
+                if any(row.total_files_read is None for row in matching_scans)
+                else sum(int(row.total_files_read) for row in matching_scans)
+            )
+            table_file_count = (
+                None
+                if any(row.table_file_count is None for row in matching_scans)
+                else sum(int(row.table_file_count) for row in matching_scans)
+            )
             series.append(
                 {
                     "variant_label": variant_label,
                     "median_ms": metric_row.median_ms,
-                    "probe_rows_scanned": scan_row.operator_rows_scanned,
-                    "probe_output_cardinality": scan_row.operator_cardinality,
+                    "logical_probe_rows": base_probe_rows,
+                    "physical_rows_scanned": probe_rows_scanned,
+                    "join_probe_rows": join_probe_rows,
+                    "probe_rows_skipped_at_scan": (
+                        base_probe_rows - probe_rows_scanned
+                    ),
+                    "probe_rows_filtered_after_scan": (
+                        probe_rows_scanned - join_probe_rows
+                    ),
+                    # Compatibility aliases for consumers outside the JPB figures.
+                    "probe_rows_scanned": probe_rows_scanned,
+                    "probe_output_cardinality": join_probe_rows,
                     "probe_rows_filtered_out": (
-                        scan_row.operator_rows_scanned - scan_row.operator_cardinality
+                        probe_rows_scanned - join_probe_rows
+                    ),
+                    "files_read": files_read,
+                    "table_file_count": table_file_count,
+                    "files_read_fraction": (
+                        None
+                        if files_read is None or table_file_count in (None, 0)
+                        else files_read / table_file_count
                     ),
                 }
             )
@@ -417,9 +650,7 @@ def build_runtime_plan_work_table(
             metric_row = metric_rows.get((query_name, variant_label))
             plan_row = plan_by_key.get((query_name, variant_label))
             if metric_row is None:
-                raise ValueError(
-                    f"missing timing row for {workload_name}/{query_name}/{variant_label}"
-                )
+                continue
             if plan_row is None:
                 raise ValueError(
                     f"missing plan metrics for {workload_name}/{query_name}/{variant_label}"
@@ -466,11 +697,16 @@ def build_benchmark_runtime_distributions(
             for row in rows
             if row.workload_name == workload_name
         }
+        active_variants = tuple(
+            label
+            for label in VARIANT_ORDER
+            if any((query_name, label) in by_key for query_name in query_names)
+        )
         values_by_variant = {label: [] for label in VARIANT_ORDER}
         for query_name in query_names:
             missing_variants = [
                 variant_label
-                for variant_label in VARIANT_ORDER
+                for variant_label in active_variants
                 if (query_name, variant_label) not in by_key
             ]
             if missing_variants:
@@ -478,7 +714,7 @@ def build_benchmark_runtime_distributions(
                     f"incomplete runtime data for {workload_name}/{query_name}: "
                     f"missing {', '.join(missing_variants)}"
                 )
-            for variant_label in VARIANT_ORDER:
+            for variant_label in active_variants:
                 runtime_ms = by_key[(query_name, variant_label)]
                 if runtime_ms <= 0:
                     raise ValueError(
@@ -561,6 +797,14 @@ def summarize_benchmark_metrics(
             if requested_queries is None
             else requested_queries
         )
+        active_variants = tuple(
+            label
+            for label in VARIANT_ORDER
+            if any(
+                (workload_name, query_name, label) in timing_by_key
+                for query_name in query_names
+            )
+        )
         metric_values = {
             "runtime_ms": {label: [] for label in VARIANT_ORDER},
             "rows_scanned": {label: [] for label in VARIANT_ORDER},
@@ -580,7 +824,7 @@ def summarize_benchmark_metrics(
                 "join_probe_tuples": {},
             }
             query_has_join = False
-            for variant_label in VARIANT_ORDER:
+            for variant_label in active_variants:
                 key = (workload_name, query_name, variant_label)
                 runtime_ms = timing_by_key.get(key)
                 plan_row = plan_by_key.get(key)
@@ -612,7 +856,7 @@ def summarize_benchmark_metrics(
                     relative_values[metric][variant_label].append(value / best)
 
         variants: dict[str, object] = {}
-        for variant_label in VARIANT_ORDER:
+        for variant_label in active_variants:
             variants[variant_label] = {
                 "total_runtime_ms": sum(
                     metric_values["runtime_ms"][variant_label]
@@ -702,8 +946,17 @@ def build_absolute_table(
 
 
 def summarize_section(entries: list[dict[str, object]], metric: str) -> dict[str, object]:
-    relative_values = {label: [] for label in VARIANT_ORDER}
-    absolute_totals = {label: 0.0 for label in VARIANT_ORDER}
+    active_variants = tuple(
+        label
+        for label in VARIANT_ORDER
+        if any(
+            item["variant_label"] == label
+            for entry in entries
+            for item in entry["series"]
+        )
+    )
+    relative_values = {label: [] for label in active_variants}
+    absolute_totals = {label: 0.0 for label in active_variants}
     for entry in entries:
         metric_values = [
             item["value"]
@@ -719,7 +972,10 @@ def summarize_section(entries: list[dict[str, object]], metric: str) -> dict[str
                 continue
             relative_values[item["variant_label"]].append(value / fastest_value)
             absolute_totals[item["variant_label"]] += float(value)
-    summary_key = "absolute_runtime_totals_ms" if metric == "runtime_ms" else "absolute_cumulative_rows_totals"
+    summary_key = {
+        "runtime_ms": "absolute_runtime_totals_ms",
+        "files_read_fraction": "sum_of_opened_file_fractions",
+    }.get(metric, "absolute_cumulative_rows_totals")
     return {
         "geometric_means_fastest_equals_one": {
             label: geometric_mean(values)
@@ -782,16 +1038,21 @@ def summarize_benchmark_runtime(
             continue
         grouped.setdefault(row.query_name, {})[row.variant_label] = row
 
-    absolute_totals = {label: 0.0 for label in VARIANT_ORDER}
-    relative_values = {label: [] for label in VARIANT_ORDER}
+    active_variants = tuple(
+        label
+        for label in VARIANT_ORDER
+        if any(label in variant_rows for variant_rows in grouped.values())
+    )
+    absolute_totals = {label: 0.0 for label in active_variants}
+    relative_values = {label: [] for label in active_variants}
     max_speedup = {
         label: {"query": None, "factor": None}
-        for label in VARIANT_ORDER
+        for label in active_variants
         if label != "no prefilter"
     }
     max_slowdown = {
         label: {"query": None, "factor": None}
-        for label in VARIANT_ORDER
+        for label in active_variants
         if label != "no prefilter"
     }
 
@@ -812,7 +1073,7 @@ def summarize_benchmark_runtime(
         baseline = variant_rows.get("no prefilter")
         if baseline is None or baseline.median_ms <= 0:
             continue
-        for variant_label in VARIANT_ORDER:
+        for variant_label in active_variants:
             if variant_label == "no prefilter":
                 continue
             row = variant_rows.get(variant_label)
@@ -849,7 +1110,7 @@ def summarize_benchmark_runtime(
 
 
 def summarize_relative_probe_cardinality(scan_rows: list[ProbeScanRow]) -> dict[str, object]:
-    variants = tuple(label for label in VARIANT_ORDER if label != "no prefilter")
+    variants = _relative_probe_variants(scan_rows)
     grouped = _group_relative_probe_scans(scan_rows, variants)
 
     relative_values = {label: [] for label in variants}
@@ -859,13 +1120,19 @@ def summarize_relative_probe_cardinality(scan_rows: list[ProbeScanRow]) -> dict[
         if any(label not in variant_rows for label in variants):
             excluded_missing_variants += 1
             continue
-        cardinalities = [variant_rows[label].operator_cardinality for label in variants if variant_rows[label].operator_cardinality > 0]
+        cardinalities = [
+            _effective_probe_cardinality(variant_rows[label])
+            for label in variants
+            if _effective_probe_cardinality(variant_rows[label]) > 0
+        ]
         if len(cardinalities) != len(variants):
             continue
         best = min(cardinalities)
         included_count += 1
         for label in variants:
-            relative_values[label].append(variant_rows[label].operator_cardinality / best)
+            relative_values[label].append(
+                _effective_probe_cardinality(variant_rows[label]) / best
+            )
 
     return {
         "included_probe_scans": included_count,
@@ -879,19 +1146,25 @@ def summarize_relative_probe_cardinality(scan_rows: list[ProbeScanRow]) -> dict[
 
 
 def build_relative_probe_cardinality_values(scan_rows: list[ProbeScanRow]) -> dict[str, list[float]]:
-    variants = tuple(label for label in VARIANT_ORDER if label != "no prefilter")
+    variants = _relative_probe_variants(scan_rows)
     grouped = _group_relative_probe_scans(scan_rows, variants)
 
     relative_values = {label: [] for label in variants}
     for variant_rows in grouped.values():
         if any(label not in variant_rows for label in variants):
             continue
-        cardinalities = [variant_rows[label].operator_cardinality for label in variants if variant_rows[label].operator_cardinality > 0]
+        cardinalities = [
+            _effective_probe_cardinality(variant_rows[label])
+            for label in variants
+            if _effective_probe_cardinality(variant_rows[label]) > 0
+        ]
         if len(cardinalities) != len(variants):
             continue
         best = min(cardinalities)
         for label in variants:
-            relative_values[label].append(variant_rows[label].operator_cardinality / best)
+            relative_values[label].append(
+                _effective_probe_cardinality(variant_rows[label]) / best
+            )
     return relative_values
 
 
@@ -903,8 +1176,58 @@ def _group_relative_probe_scans(
     for row in scan_rows:
         if row.variant_label not in variants:
             continue
-        grouped.setdefault((row.workload_name, row.query_name, row.scan_key), {})[row.variant_label] = row
+        logical_scan_key = (
+            row.workload_name,
+            row.query_name,
+            _table_basename(row.table_name),
+        )
+        variant_rows = grouped.setdefault(logical_scan_key, {})
+        existing = variant_rows.get(row.variant_label)
+        if existing is None:
+            variant_rows[row.variant_label] = replace(
+                row,
+                scan_key=f"{logical_scan_key[2]}::aggregate",
+                table_name=logical_scan_key[2],
+            )
+            continue
+        variant_rows[row.variant_label] = replace(
+            existing,
+            operator_rows_scanned=(
+                existing.operator_rows_scanned + row.operator_rows_scanned
+            ),
+            operator_cardinality=(
+                existing.operator_cardinality + row.operator_cardinality
+            ),
+            join_probe_cardinality=(
+                None
+                if existing.join_probe_cardinality is None
+                or row.join_probe_cardinality is None
+                else existing.join_probe_cardinality + row.join_probe_cardinality
+            ),
+            dynamic_filters=" | ".join(
+                value
+                for value in (existing.dynamic_filters, row.dynamic_filters)
+                if value
+            ),
+        )
     return grouped
+
+
+def _effective_probe_cardinality(row: ProbeScanRow) -> int:
+    return (
+        row.join_probe_cardinality
+        if row.join_probe_cardinality is not None
+        else row.operator_cardinality
+    )
+
+
+def _relative_probe_variants(scan_rows: list[ProbeScanRow]) -> tuple[str, ...]:
+    present = {row.variant_label for row in scan_rows}
+    return tuple(
+        label
+        for label in VARIANT_ORDER
+        if label in present and label not in {"no prefilter", "rpt none"}
+    )
 
 
 def build_relative_probe_cardinality_outliers(
@@ -912,16 +1235,16 @@ def build_relative_probe_cardinality_outliers(
     *,
     threshold: float = 10.0,
 ) -> list[dict[str, object]]:
-    variants = tuple(label for label in VARIANT_ORDER if label != "no prefilter")
+    variants = _relative_probe_variants(scan_rows)
     grouped = _group_relative_probe_scans(scan_rows, variants)
     outliers: list[dict[str, object]] = []
     for (workload_name, query_name, scan_key), variant_rows in grouped.items():
         if any(label not in variant_rows for label in variants):
             continue
         cardinalities = {
-            label: variant_rows[label].operator_cardinality
+            label: _effective_probe_cardinality(variant_rows[label])
             for label in variants
-            if variant_rows[label].operator_cardinality > 0
+            if _effective_probe_cardinality(variant_rows[label]) > 0
         }
         if len(cardinalities) != len(variants):
             continue

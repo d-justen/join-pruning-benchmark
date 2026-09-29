@@ -5,3 +5,8 @@ tmp/
 *.pyc
 .DS_Store
 tests/
+!tests/
+tests/*
+!tests/test_cross_product_sweeps.py
+/external_benchmarks/**/*.duckdb
+/dynamic-predicate-transfer/job-*.csv

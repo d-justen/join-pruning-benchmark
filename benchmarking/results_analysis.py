@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,9 @@ from benchmarking.experiment_config import ExperimentConfig, VariantConfig, load
 from benchmarking.manifests import PreparedWorkload, load_manifest
 from benchmarking.query_inventory import load_queries
 from benchmarking.svg_charts import PALETTE, grouped_bar_chart, line_chart, svg_document, text
+
+
+DYNAMIC_FILTER_OCCURRENCE_RE = re.compile(r"\bIN\s+(PRF|BF)\(")
 
 
 @dataclass(frozen=True)
@@ -77,6 +81,8 @@ def _ensure_profile_runs_table(results_db: Path) -> None:
         con.execute("ALTER TABLE profile_runs ADD COLUMN IF NOT EXISTS total_bytes_read BIGINT;")
         con.execute("ALTER TABLE profile_runs ADD COLUMN IF NOT EXISTS total_bytes_written BIGINT;")
         con.execute("ALTER TABLE profile_runs ADD COLUMN IF NOT EXISTS table_scan_file_count BIGINT;")
+        con.execute("ALTER TABLE profile_runs ADD COLUMN IF NOT EXISTS query_parameters VARCHAR;")
+        con.execute("ALTER TABLE timing_runs ADD COLUMN IF NOT EXISTS query_parameters VARCHAR;")
     finally:
         con.close()
 
@@ -103,12 +109,14 @@ def _profile_sql(
     variant: VariantConfig,
     threads: int | None,
     workload_setup_sql: tuple[str, ...],
+    post_variant_setup_sql: tuple[str, ...],
 ) -> str:
     statements = ["SET enable_progress_bar=false;"]
     if threads is not None:
         statements.append(f"SET threads = {threads};")
     statements.extend(workload_setup_sql)
     statements.extend(variant.setup_sql)
+    statements.extend(post_variant_setup_sql)
     statements.append("SET enable_profiling='json';")
     escaped_profile_path = str(profile_path).replace("'", "''")
     statements.append(f"SET profiling_output='{escaped_profile_path}';")
@@ -145,7 +153,8 @@ def backfill_profiles(
                 t.query_name,
                 t.query_path,
                 t.join_variant,
-                t.cluster_count
+                t.cluster_count,
+                t.query_parameters
             FROM timing_runs AS t
             LEFT JOIN profile_runs AS p
               ON p.run_id = t.run_id
@@ -183,6 +192,7 @@ def backfill_profiles(
                 query_path,
                 join_variant,
                 cluster_count,
+                query_parameters,
             ) = row
             workload = workloads[workload_name]
             system_config = systems_by_name[system_name]
@@ -207,6 +217,7 @@ def backfill_profiles(
                     variant,
                     config.benchmark.threads,
                     workload_setup_sql,
+                    workload.post_variant_setup_sql,
                 ),
                 encoding="utf-8",
             )
@@ -218,10 +229,10 @@ def backfill_profiles(
                 INSERT INTO profile_runs (
                     run_id, experiment_name, workload_name, workload_kind,
                     system_name, system_kind, system_version, system_git_commit, system_repo, system_ref,
-                    variant_label, variant_setup_sql, query_name, query_path, join_variant, cluster_count,
+                    variant_label, variant_setup_sql, query_name, query_path, join_variant, cluster_count, query_parameters,
                     profile_path, cumulative_rows_scanned, total_rows_scanned, probe_rows_scanned, build_rows_scanned,
                     total_bytes_read, total_bytes_written, table_scan_file_count, profiled_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
                 """,
                 [
                     run_id,
@@ -240,6 +251,7 @@ def backfill_profiles(
                     query_path,
                     join_variant,
                     cluster_count,
+                    query_parameters,
                     str(profile_path),
                     metrics.total_rows_scanned,
                     metrics.total_rows_scanned,
@@ -261,16 +273,20 @@ def _default_baselines(config: ExperimentConfig) -> dict[str, str]:
 
 
 def _load_query_metadata(workload: PreparedWorkload) -> dict[str, dict]:
-    if workload.kind == "single_join_clusters":
+    if workload.kind in {"single_join_clusters", "cross_product"}:
         queries = load_queries(workload.queries_dir)
-        return {
+        structured = {
             query.name: {
+                **query.parameters,
                 "cluster_count": query.cluster_count,
                 "join_variant": query.join_variant,
             }
             for query in queries
         }
-    if workload.kind == "cross_product":
+        if workload.kind == "single_join_clusters" or any(
+            query.parameters for query in queries
+        ):
+            return structured
         metadata: dict[str, dict] = {}
         for query_path in sorted(workload.queries_dir.glob("*.sql")):
             stem = query_path.stem
@@ -492,6 +508,68 @@ def _absolute_metric_rows(
         con.close()
 
 
+def _filter_occurrence_rows(
+    results_db: Path,
+    experiment_name: str,
+    workload_name: str,
+    system_name: str,
+) -> list[dict]:
+    """Count PRF and Bloom dynamic-filter expressions from one profile per query variant."""
+    con = duckdb.connect(str(results_db))
+    try:
+        rows = con.execute(
+            """
+            SELECT variant_label, query_name, profile_path
+            FROM (
+                SELECT
+                    variant_label,
+                    query_name,
+                    profile_path,
+                    row_number() OVER (
+                        PARTITION BY variant_label, query_name, join_variant, cluster_count
+                        ORDER BY profiled_at DESC, run_id DESC
+                    ) AS profile_rank
+                FROM profile_runs
+                WHERE experiment_name = ?
+                  AND workload_name = ?
+                  AND system_name = ?
+            )
+            WHERE profile_rank = 1
+            ORDER BY variant_label, query_name
+            """,
+            [experiment_name, workload_name, system_name],
+        ).fetchall()
+    finally:
+        con.close()
+
+    totals: dict[str, dict] = {}
+    for variant_label, _query_name, profile_path in rows:
+        entry = totals.setdefault(
+            variant_label,
+            {
+                "variant_label": variant_label,
+                "profiled_queries": 0,
+                "prefix_range_filter_occurrences": 0,
+                "bloom_filter_occurrences": 0,
+            },
+        )
+        entry["profiled_queries"] += 1
+        profile_data = json.loads(Path(profile_path).read_text(encoding="utf-8"))
+        nodes = [profile_data]
+        while nodes:
+            node = nodes.pop()
+            nodes.extend(node.get("children", []))
+            dynamic_filters = node.get("extra_info", {}).get("Dynamic Filters")
+            if not isinstance(dynamic_filters, str):
+                continue
+            for filter_kind in DYNAMIC_FILTER_OCCURRENCE_RE.findall(dynamic_filters):
+                if filter_kind == "PRF":
+                    entry["prefix_range_filter_occurrences"] += 1
+                else:
+                    entry["bloom_filter_occurrences"] += 1
+    return [totals[variant_label] for variant_label in sorted(totals)]
+
+
 def _single_join_chart(workload_name: str, systems: list[str], rows_by_system: dict[str, list[dict]]) -> str:
     width = 1200
     per_system_height = 500
@@ -672,6 +750,12 @@ def analyze_experiment(
         query_metadata = _load_query_metadata(workload)
         for system_name in system_names:
             absolute_rows = _absolute_metric_rows(results_db, config.experiment_name, workload_name, system_name)
+            filter_occurrences = _filter_occurrence_rows(
+                results_db,
+                config.experiment_name,
+                workload_name,
+                system_name,
+            )
             for row in absolute_rows:
                 row.update(query_metadata.get(row["query_name"], {}))
             rows_for_chart[system_name] = absolute_rows
@@ -699,6 +783,7 @@ def analyze_experiment(
                     "more_rows_scanned": sum(1 for row in comparison_rows if (row["rows_scanned_ratio"] or 0) < 1),
                     "fewer_bytes_read": sum(1 for row in comparison_rows if (row["bytes_read_ratio"] or 0) > 1),
                     "more_bytes_read": sum(1 for row in comparison_rows if (row["bytes_read_ratio"] or 0) < 1),
+                    "filter_occurrences": filter_occurrences,
                 }
             )
         chart_path = analysis_paths.charts_dir / f"{workload_name}.svg"

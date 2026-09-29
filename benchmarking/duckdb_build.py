@@ -200,7 +200,11 @@ def ensure_duckdb_vcpkg_toolchain(clone_dir: Path, env: dict[str, str]) -> Path:
     return toolchain_path.resolve()
 
 
-def build_duckdb(clone_dir: Path, config: GitSystemConfig) -> None:
+def build_duckdb(
+    clone_dir: Path,
+    config: GitSystemConfig,
+    required_extensions: frozenset[str] = frozenset(),
+) -> Path:
     build_env = dict(os.environ)
     build_env["GEN"] = "ninja"
     build_env["CCACHE_DISABLE"] = "1"
@@ -208,16 +212,73 @@ def build_duckdb(clone_dir: Path, config: GitSystemConfig) -> None:
         build_env["CC"] = config.c_compiler
     if config.cxx_compiler is not None:
         build_env["CXX"] = config.cxx_compiler
-    run_command(["make"], cwd=clone_dir, env=build_env)
+    if "ducklake" not in required_extensions:
+        # Keep native paper builds separate from build/release. DuckLake builds
+        # configure that directory with a vcpkg toolchain, which CMake retains
+        # on later plain `make` invocations and can unexpectedly rebuild curl.
+        build_dir = clone_dir / "build" / "paper-native-release"
+        build_dir.mkdir(parents=True, exist_ok=True)
+        run_command(
+            [
+                "cmake",
+                "-G",
+                "Ninja",
+                "-DFORCE_COLORED_OUTPUT=1",
+                '-DLOCAL_EXTENSION_REPO=',
+                '-DOVERRIDE_GIT_DESCRIBE=',
+                '-DDUCKDB_EXPLICIT_VERSION=',
+                # Native paper workloads use DuckDB database files. Skipping
+                # Parquet also keeps the older RPT+ fork compatible with newer
+                # libc++, whose iterator requirements reject its bundled
+                # Thrift-generated enum iterator.
+                "-DSKIP_EXTENSIONS=parquet",
+                "-DCMAKE_BUILD_TYPE=Release",
+                "../..",
+            ],
+            cwd=build_dir,
+            env=build_env,
+        )
+        run_command(
+            ["cmake", "--build", ".", "--config", "Release"],
+            cwd=build_dir,
+            env=build_env,
+        )
+        return build_dir
+
+    extension_configs = [
+        clone_dir / ".github" / "config" / "extensions" / "ducklake.cmake"
+    ]
+    if "httpfs" in required_extensions:
+        extension_configs.append(
+            clone_dir / ".github" / "config" / "extensions" / "httpfs.cmake"
+        )
+    for extension_config in extension_configs:
+        if not extension_config.exists():
+            raise FileNotFoundError(f"extension config not found: {extension_config}")
+    toolchain_path = ensure_duckdb_vcpkg_toolchain(clone_dir, build_env)
+    build_env["DUCKDB_NEW_EXTENSION_BUILD"] = "1"
+    build_env["EXTENSION_CONFIGS"] = ";".join(
+        str(extension_config) for extension_config in extension_configs
+    )
+    build_env["VCPKG_TOOLCHAIN_PATH"] = str(toolchain_path)
+    run_command(["make", "sync_out_of_tree_extensions"], cwd=clone_dir, env=build_env)
+    run_command(["make", "release"], cwd=clone_dir, env=build_env)
+    return clone_dir / "build" / "release"
 
 
-def resolve_built_duckdb_binary(clone_dir: Path) -> Path:
-    candidates = [
+def resolve_built_duckdb_binary(
+    clone_dir: Path,
+    preferred_build_dir: Path | None = None,
+) -> Path:
+    candidates = []
+    if preferred_build_dir is not None:
+        candidates.append(preferred_build_dir / "duckdb")
+    candidates.extend([
         clone_dir / "build" / "release" / "duckdb",
         clone_dir / "build" / "debug" / "duckdb",
         clone_dir / "build" / "duckdb",
         clone_dir / "duckdb",
-    ]
+    ])
     for candidate in candidates:
         if candidate.exists() and candidate.is_file():
             return candidate.resolve()
@@ -231,7 +292,20 @@ def get_git_commit(clone_dir: Path) -> str:
     return run_command(["git", "rev-parse", "HEAD"], cwd=clone_dir)
 
 
-def _resolve_binary_system(config: BinarySystemConfig) -> ResolvedSystem:
+def _validate_required_extensions(
+    binary_path: Path,
+    required_extensions: frozenset[str],
+) -> None:
+    for extension_name in sorted(required_extensions):
+        run_command(
+            [str(binary_path), ":memory:", "-c", f"LOAD {extension_name};"],
+        )
+
+
+def _resolve_binary_system(
+    config: BinarySystemConfig,
+    required_extensions: frozenset[str] = frozenset(),
+) -> ResolvedSystem:
     binary_path = config.binary_path
     if binary_path.is_absolute() or binary_path.parent != Path("."):
         binary_path = binary_path.resolve()
@@ -240,6 +314,7 @@ def _resolve_binary_system(config: BinarySystemConfig) -> ResolvedSystem:
         if candidate is None:
             raise FileNotFoundError(f"DuckDB binary not found: {config.binary_path}")
         binary_path = Path(candidate).resolve()
+    _validate_required_extensions(binary_path, required_extensions)
     return ResolvedSystem(
         kind="binary",
         name=config.name,
@@ -251,11 +326,23 @@ def _resolve_binary_system(config: BinarySystemConfig) -> ResolvedSystem:
     )
 
 
-def _resolve_git_system(config: GitSystemConfig, checkout_options: DuckDBCheckoutOptions) -> ResolvedSystem:
-    checkout_dir = ensure_duckdb_checkout(checkout_options)
-    apply_compatibility_patches(checkout_dir)
-    build_duckdb(checkout_dir, config)
-    binary_path = resolve_built_duckdb_binary(checkout_dir)
+def _resolve_git_system(
+    config: GitSystemConfig,
+    checkout_options: DuckDBCheckoutOptions,
+    required_extensions: frozenset[str] = frozenset(),
+) -> ResolvedSystem:
+    uses_shared_checkout = config.checkout_dir is None
+    effective_options = (
+        checkout_options
+        if uses_shared_checkout
+        else DuckDBCheckoutOptions(checkout_dir=config.checkout_dir)
+    )
+    checkout_dir = ensure_duckdb_checkout(effective_options)
+    if uses_shared_checkout:
+        apply_compatibility_patches(checkout_dir)
+    build_dir = build_duckdb(checkout_dir, config, required_extensions)
+    binary_path = resolve_built_duckdb_binary(checkout_dir, build_dir)
+    _validate_required_extensions(binary_path, required_extensions)
     return ResolvedSystem(
         kind="git",
         name=config.name,
@@ -271,10 +358,15 @@ def resolve_system(
     config: SystemConfig,
     system_dir: Path,
     checkout_options: DuckDBCheckoutOptions | None = None,
+    required_extensions: frozenset[str] = frozenset(),
 ) -> ResolvedSystem:
     if config.kind == "binary":
-        return _resolve_binary_system(config)
-    return _resolve_git_system(config, checkout_options or DuckDBCheckoutOptions())
+        return _resolve_binary_system(config, required_extensions)
+    return _resolve_git_system(
+        config,
+        checkout_options or DuckDBCheckoutOptions(),
+        required_extensions,
+    )
 
 
 def resolve_existing_system(
@@ -284,7 +376,11 @@ def resolve_existing_system(
 ) -> ResolvedSystem:
     if config.kind == "binary":
         return _resolve_binary_system(config)
-    checkout_dir = (checkout_options or DuckDBCheckoutOptions()).checkout_dir.resolve()
+    checkout_dir = (
+        config.checkout_dir
+        if config.checkout_dir is not None
+        else (checkout_options or DuckDBCheckoutOptions()).checkout_dir
+    ).resolve()
     if not _looks_like_duckdb_source_tree(checkout_dir):
         raise RuntimeError(f"DuckDB checkout directory does not look usable: {checkout_dir}")
     binary_path = resolve_built_duckdb_binary(checkout_dir)

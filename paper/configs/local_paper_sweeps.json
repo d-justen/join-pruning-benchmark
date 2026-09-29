@@ -1,0 +1,274 @@
+{
+  "experiment_name": "paper-sweeps-local",
+  "output_root": "../../out/experiments",
+  "overwrite_output": true,
+  "workloads": [
+    {
+      "name": "jpb-sweep-joins",
+      "kind": "cross_product",
+      "post_variant_setup_sql": [
+        "SET disabled_optimizers=current_setting('disabled_optimizers') || ',join_order,build_side_probe_side';"
+      ],
+      "params": {
+        "fixed": {
+          "fact_rows": 500000000,
+          "dimension_cardinality": 100000000,
+          "key_domain_size": "dimension_cardinality",
+          "selectivity": 0.1,
+          "join_count": 1,
+          "build_key_multiplicity": 1,
+          "probe_layout": "uniform",
+          "row_group_size": 122880,
+          "dummy_string_cols": 2,
+          "dummy_string_len": 8,
+          "seed": 7
+        },
+        "sweep": {
+          "kind": "join_count",
+          "values": [1, 2, 3, 4, 5]
+        },
+        "query_types": [
+          {"kind": "shoulder", "probe_layouts": ["uniform"]},
+          {"kind": "scattered", "probe_layouts": ["uniform"]}
+        ]
+      }
+    },
+    {
+      "name": "jpb-sweep-multiplicity",
+      "kind": "cross_product",
+      "params": {
+        "fixed": {
+          "fact_rows": 500000000,
+          "dimension_cardinality": 100000000,
+          "key_domain_size": "dimension_distinct_keys",
+          "selectivity": 0.01,
+          "join_count": 1,
+          "build_key_multiplicity": 1,
+          "probe_layout": "ordered",
+          "row_group_size": 122880,
+          "dummy_string_cols": 2,
+          "dummy_string_len": 8,
+          "seed": 7
+        },
+        "sweep": {
+          "kind": "build_key_multiplicity",
+          "cardinality_mode": "fixed_dimension_cardinality",
+          "values": [1, 2, 4, 8, 16, 32, 64, 128]
+        },
+        "query_types": [
+          {"kind": "shoulder", "probe_layouts": ["ordered"]},
+          {"kind": "scattered", "probe_layouts": ["ordered"]}
+        ]
+      }
+    },
+    {
+      "name": "jpb-sweep-selectivity",
+      "kind": "cross_product",
+      "params": {
+        "fixed": {
+          "fact_rows": 500000000,
+          "dimension_cardinality": 100000000,
+          "key_domain_size": "dimension_cardinality",
+          "selectivity": 0.01,
+          "join_count": 1,
+          "build_key_multiplicity": 1,
+          "probe_layout": "ordered",
+          "row_group_size": 122880,
+          "dummy_string_cols": 2,
+          "dummy_string_len": 8,
+          "seed": 7
+        },
+        "sweep": {
+          "kind": "selectivity",
+          "values": [0.0001, 0.0003, 0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 0.5, 0.7, 0.9]
+        },
+        "query_types": [
+          {"kind": "shoulder", "probe_layouts": ["ordered"]},
+          {"kind": "scattered", "probe_layouts": ["ordered"]}
+        ]
+      }
+    },
+    {
+      "name": "jpb-sweep-density",
+      "kind": "cross_product",
+      "params": {
+        "fixed": {
+          "fact_rows": 500000000,
+          "dimension_cardinality": 1000000,
+          "key_domain_size": 1000000,
+          "selectivity": 0.1,
+          "join_count": 1,
+          "build_key_multiplicity": 1,
+          "probe_layout": "ordered",
+          "row_group_size": 122880,
+          "dummy_string_cols": 2,
+          "dummy_string_len": 8,
+          "seed": 7
+        },
+        "sweep": {
+          "kind": "key_domain_size",
+          "values": [1000000, 3000000, 10000000, 30000000, 100000000, 300000000, 1000000000]
+        },
+        "query_types": [
+          {"kind": "shoulder", "probe_layouts": ["ordered"]},
+          {"kind": "scattered", "probe_layouts": ["ordered"]}
+        ]
+      }
+    },
+    {
+      "name": "jpb-sweep-clusters",
+      "kind": "cross_product",
+      "params": {
+        "fixed": {
+          "fact_rows": 500000000,
+          "dimension_cardinality": 100000000,
+          "key_domain_size": "dimension_cardinality",
+          "selectivity": 0.01,
+          "join_count": 1,
+          "build_key_multiplicity": 1,
+          "probe_layout": "ordered",
+          "row_group_size": 122880,
+          "dummy_string_cols": 2,
+          "dummy_string_len": 8,
+          "seed": 7
+        },
+        "sweep": {
+          "kind": "cluster_count",
+          "values": [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 100000]
+        }
+      }
+    },
+    {
+      "name": "jpb-sweep-row-groups",
+      "kind": "cross_product",
+      "params": {
+        "fixed": {
+          "fact_rows": 500000000,
+          "dimension_cardinality": 100000000,
+          "key_domain_size": "dimension_cardinality",
+          "selectivity": 0.01,
+          "join_count": 1,
+          "build_key_multiplicity": 1,
+          "probe_layout": "ordered",
+          "row_group_size": 122880,
+          "dummy_string_cols": 2,
+          "dummy_string_len": 8,
+          "seed": 7
+        },
+        "sweep": {
+          "kind": "row_group_size",
+          "values": [2048, 8192, 32768, 122880, 524288, 2097152]
+        },
+        "query_types": [
+          {"kind": "shoulder", "probe_layouts": ["ordered"]},
+          {"kind": "scattered", "probe_layouts": ["ordered"]}
+        ]
+      }
+    }
+  ],
+  "systems": [
+    {
+      "name": "duckdb-paper",
+      "kind": "git",
+      "c_compiler": "clang",
+      "cxx_compiler": "clang++",
+      "variants": [
+        {
+          "label": "no prefilter",
+          "setup_sql": [
+            "SET enable_prefix_range_filter=false;",
+            "SET enable_join_min_max_filter_pushdown=false;",
+            "SET enable_join_bloom_filter_pushdown=false;",
+            "SET enable_perfect_hash_join_filter_pushdown=false;",
+            "SET dynamic_or_filter_threshold=0;",
+            "SET disabled_optimizers='compressed_materialization';"
+          ]
+        },
+        {
+          "label": "sip",
+          "setup_sql": [
+            "SET enable_prefix_range_filter=false;",
+            "SET enable_join_min_max_filter_pushdown=false;",
+            "SET enable_join_bloom_filter_pushdown=true;",
+            "SET enable_perfect_hash_join_filter_pushdown=false;",
+            "SET dynamic_or_filter_threshold=0;",
+            "SET disabled_optimizers='compressed_materialization';"
+          ]
+        },
+        {
+          "label": "sip + min/max",
+          "setup_sql": [
+            "SET enable_prefix_range_filter=false;",
+            "SET enable_join_min_max_filter_pushdown=true;",
+            "SET enable_join_bloom_filter_pushdown=true;",
+            "SET enable_perfect_hash_join_filter_pushdown=false;",
+            "SET dynamic_or_filter_threshold=0;",
+            "SET disabled_optimizers='compressed_materialization';"
+          ]
+        },
+        {
+          "label": "prf uncompressed",
+          "setup_sql": [
+            "SET enable_prefix_range_filter=true;",
+            "SET enable_prefix_range_filter_compression=false;",
+            "SET enable_join_min_max_filter_pushdown=true;",
+            "SET enable_join_bloom_filter_pushdown=true;",
+            "SET enable_perfect_hash_join_filter_pushdown=false;",
+            "SET dynamic_or_filter_threshold=0;",
+            "SET disabled_optimizers='compressed_materialization';"
+          ]
+        },
+        {
+          "label": "prf with fallback",
+          "setup_sql": [
+            "SET enable_prefix_range_filter=true;",
+            "SET enable_prefix_range_filter_compression=true;",
+            "SET enable_join_min_max_filter_pushdown=true;",
+            "SET enable_join_bloom_filter_pushdown=true;",
+            "SET enable_perfect_hash_join_filter_pushdown=false;",
+            "SET dynamic_or_filter_threshold=0;",
+            "SET disabled_optimizers='compressed_materialization';"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "rpt-plus",
+      "kind": "git",
+      "checkout_dir": "../../dynamic-predicate-transfer",
+      "c_compiler": "clang",
+      "cxx_compiler": "clang++",
+      "workload_names": [
+        "jpb-sweep-joins",
+        "jpb-sweep-multiplicity",
+        "jpb-sweep-selectivity",
+        "jpb-sweep-density",
+        "jpb-sweep-clusters",
+        "jpb-sweep-row-groups"
+      ],
+      "variants": [
+        {
+          "label": "rpt none",
+          "setup_sql": ["SET rpt_filter = 'none';"]
+        },
+        {
+          "label": "rpt cascade",
+          "setup_sql": ["SET rpt_filter = 'cascade';"]
+        },
+        {
+          "label": "rpt prf",
+          "setup_sql": [
+            "SET rpt_filter = 'prf';",
+            "SET rpt_prf_scan_pushdown = true;"
+          ]
+        }
+      ]
+    }
+  ],
+  "benchmark": {
+    "repetitions": 10,
+    "threads": 8,
+    "prepare_duckdb_binary": "duckdb",
+    "collect_profiles": true
+  }
+}

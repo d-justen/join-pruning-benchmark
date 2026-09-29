@@ -15,7 +15,10 @@ import duckdb
 
 from benchmarking.duckdb_build import ResolvedSystem
 from benchmarking.experiment_config import BenchmarkOptions, VariantConfig
-from benchmarking.manifests import PreparedWorkload
+from benchmarking.manifests import (
+    DUCKLAKE_HTTP_BASE_URL_PLACEHOLDER,
+    PreparedWorkload,
+)
 from benchmarking.query_inventory import QuerySpec, load_queries
 LABEL_COMPONENT_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -76,6 +79,7 @@ def ensure_results_schema(results_db: Path) -> None:
                 query_path VARCHAR,
                 join_variant VARCHAR,
                 cluster_count INTEGER,
+                query_parameters VARCHAR,
                 repetition INTEGER,
                 elapsed_ns BIGINT,
                 measured_at TIMESTAMP
@@ -101,6 +105,7 @@ def ensure_results_schema(results_db: Path) -> None:
                 query_path VARCHAR,
                 join_variant VARCHAR,
                 cluster_count INTEGER,
+                query_parameters VARCHAR,
                 profile_path VARCHAR,
                 cumulative_rows_scanned BIGINT,
                 profiled_at TIMESTAMP
@@ -113,6 +118,8 @@ def ensure_results_schema(results_db: Path) -> None:
         con.execute("ALTER TABLE profile_runs ADD COLUMN IF NOT EXISTS total_bytes_read BIGINT;")
         con.execute("ALTER TABLE profile_runs ADD COLUMN IF NOT EXISTS total_bytes_written BIGINT;")
         con.execute("ALTER TABLE profile_runs ADD COLUMN IF NOT EXISTS table_scan_file_count BIGINT;")
+        con.execute("ALTER TABLE timing_runs ADD COLUMN IF NOT EXISTS query_parameters VARCHAR;")
+        con.execute("ALTER TABLE profile_runs ADD COLUMN IF NOT EXISTS query_parameters VARCHAR;")
     finally:
         con.close()
 
@@ -183,6 +190,7 @@ def render_query_execution_block(
     query_sql = query.path.read_text(encoding="utf-8").strip().rstrip(";")
     join_variant_sql = sql_literal(query.join_variant) if query.join_variant is not None else "NULL"
     cluster_count_sql = str(query.cluster_count) if query.cluster_count is not None else "NULL"
+    query_parameters_sql = sql_literal(json.dumps(query.parameters, sort_keys=True))
     variant_setup_sql = sql_literal("\n".join(variant.setup_sql))
     statements: list[str] = [query_sql + ";"]
     for repetition in range(1, repetition_count + 1):
@@ -190,7 +198,12 @@ def render_query_execution_block(
             [
                 "SET VARIABLE benchmark_t0_ns = epoch_ns(current_timestamp);",
                 query_sql + ";",
-                "INSERT INTO benchmark_results.timing_runs VALUES (",
+                "INSERT INTO benchmark_results.timing_runs (",
+                "    run_id, experiment_name, workload_name, workload_kind,",
+                "    system_name, system_kind, system_version, system_git_commit, system_repo, system_ref,",
+                "    variant_label, variant_setup_sql, query_name, query_path, join_variant, cluster_count,",
+                "    query_parameters, repetition, elapsed_ns, measured_at",
+                ") VALUES (",
                 f"    {sql_literal(run_id)},",
                 f"    {sql_literal(experiment_name)},",
                 f"    {sql_literal(workload.name)},",
@@ -207,6 +220,7 @@ def render_query_execution_block(
                 f"    {sql_literal(str(query.path))},",
                 f"    {join_variant_sql},",
                 f"    {cluster_count_sql},",
+                f"    {query_parameters_sql},",
                 f"    {repetition},",
                 "    epoch_ns(current_timestamp) - getvariable('benchmark_t0_ns'),",
                 "    CAST(current_timestamp AS TIMESTAMP)",
@@ -229,6 +243,7 @@ def render_profile_execution_block(
     query_sql = query.path.read_text(encoding="utf-8").strip().rstrip(";")
     join_variant_sql = sql_literal(query.join_variant) if query.join_variant is not None else "NULL"
     cluster_count_sql = str(query.cluster_count) if query.cluster_count is not None else "NULL"
+    query_parameters_sql = sql_literal(json.dumps(query.parameters, sort_keys=True))
     variant_setup_sql = sql_literal("\n".join(variant.setup_sql))
     statements = [
         "SET enable_profiling = 'json';",
@@ -238,7 +253,7 @@ def render_profile_execution_block(
         "INSERT INTO benchmark_results.profile_runs (",
         "    run_id, experiment_name, workload_name, workload_kind,",
         "    system_name, system_kind, system_version, system_git_commit, system_repo, system_ref,",
-        "    variant_label, variant_setup_sql, query_name, query_path, join_variant, cluster_count,",
+        "    variant_label, variant_setup_sql, query_name, query_path, join_variant, cluster_count, query_parameters,",
         "    profile_path, cumulative_rows_scanned, total_rows_scanned, probe_rows_scanned, build_rows_scanned,",
         "    total_bytes_read, total_bytes_written, table_scan_file_count, profiled_at",
         ") VALUES (",
@@ -258,6 +273,7 @@ def render_profile_execution_block(
         f"    {sql_literal(str(query.path))},",
         f"    {join_variant_sql},",
         f"    {cluster_count_sql},",
+        f"    {query_parameters_sql},",
         f"    {sql_literal(str(profile_path))},",
         "    NULL,",
         "    NULL,",
@@ -293,6 +309,7 @@ def render_workload_sql(
         statements.append(f"SET threads = {benchmark.threads};")
     statements.extend(workload_setup_sql)
     statements.extend(variant.setup_sql)
+    statements.extend(workload.post_variant_setup_sql)
     for query in queries:
         statements.append(
             render_query_execution_block(
@@ -368,27 +385,65 @@ class RunOutput:
 class RemoteHttpService:
     process: subprocess.Popen[str]
     setup_sql: tuple[str, ...]
+    base_url: str
 
 
 def execute_workload(binary: Path, db_path: Path, sql_path: Path) -> None:
     run_command([str(binary), str(db_path), "-f", str(sql_path)])
 
 
+def bootstrap_ducklake_workload(
+    binary: Path,
+    workload: PreparedWorkload,
+    remote_service: RemoteHttpService | None = None,
+) -> None:
+    if workload.storage_mode != "ducklake":
+        return
+    bootstrap_sql_path = workload.ducklake_bootstrap_sql_path
+    if bootstrap_sql_path is None:
+        raise ValueError(f"DuckLake workload has no bootstrap SQL: {workload.name}")
+    bootstrap_sql = bootstrap_sql_path.read_text(encoding="utf-8")
+    if workload.ducklake_http_latency_ms is not None:
+        if remote_service is None:
+            raise ValueError(
+                f"DuckLake HTTP workload has no running HTTP service: {workload.name}"
+            )
+        bootstrap_sql = bootstrap_sql.replace(
+            DUCKLAKE_HTTP_BASE_URL_PLACEHOLDER,
+            remote_service.base_url,
+        )
+    if DUCKLAKE_HTTP_BASE_URL_PLACEHOLDER in bootstrap_sql:
+        raise ValueError(
+            f"DuckLake bootstrap SQL still contains an HTTP URL placeholder: {workload.name}"
+        )
+    run_command([str(binary), str(workload.db_path), "-c", bootstrap_sql])
+
+
 def load_workload_setup_sql(workload: PreparedWorkload) -> tuple[str, ...]:
     return tuple(path.read_text(encoding="utf-8").strip() for path in workload.setup_sql_paths)
 
 
-def start_remote_http_service(workload: PreparedWorkload) -> RemoteHttpService | None:
-    latency_ms = workload.remote_http_parquet_latency_ms
-    catalog_path = workload.remote_parquet_catalog_path
+def start_remote_http_service(
+    workload: PreparedWorkload, *, preferred_port: int | None = None
+) -> RemoteHttpService | None:
+    if workload.ducklake_http_latency_ms is not None:
+        latency_ms = workload.ducklake_http_latency_ms
+        catalog_path = workload.parquet_catalog_path
+        root_dir_name = "parquet"
+        create_parquet_views = False
+    else:
+        latency_ms = workload.remote_http_parquet_latency_ms
+        catalog_path = workload.remote_parquet_catalog_path
+        root_dir_name = "remote_parquet"
+        create_parquet_views = True
     if latency_ms is None or catalog_path is None:
         return None
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
+        sock.bind(("127.0.0.1", preferred_port or 0))
         host, port = sock.getsockname()
 
-    root_dir = catalog_path.parent / "remote_parquet"
+    root_dir = catalog_path.parent / root_dir_name
     process = subprocess.Popen(
         [
             sys.executable,
@@ -426,18 +481,24 @@ def start_remote_http_service(workload: PreparedWorkload) -> RemoteHttpService |
         raise RuntimeError("remote HTTP server did not become healthy within 5 seconds")
 
     catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    base_url = f"http://{host}:{port}"
     setup_sql = ["LOAD httpfs;"]
-    for table_name in sorted(catalog):
-        file_urls = [
-            f"http://{host}:{port}/{relative_path}"
-            for relative_path in catalog[table_name]
-        ]
-        file_list_sql = ", ".join(sql_literal(url) for url in file_urls)
-        setup_sql.append(
-            f"CREATE OR REPLACE TEMP VIEW {quote_identifier(table_name)} AS "
-            f"SELECT * FROM read_parquet([{file_list_sql}]);"
-        )
-    return RemoteHttpService(process=process, setup_sql=tuple(setup_sql))
+    if create_parquet_views:
+        for table_name in sorted(catalog):
+            file_urls = [
+                f"{base_url}/{relative_path}"
+                for relative_path in catalog[table_name]
+            ]
+            file_list_sql = ", ".join(sql_literal(url) for url in file_urls)
+            setup_sql.append(
+                f"CREATE OR REPLACE TEMP VIEW {quote_identifier(table_name)} AS "
+                f"SELECT * FROM read_parquet([{file_list_sql}]);"
+            )
+    return RemoteHttpService(
+        process=process,
+        setup_sql=tuple(setup_sql),
+        base_url=base_url,
+    )
 
 
 def stop_remote_http_service(service: RemoteHttpService | None) -> None:
@@ -449,6 +510,19 @@ def stop_remote_http_service(service: RemoteHttpService | None) -> None:
     except subprocess.TimeoutExpired:
         service.process.kill()
         service.process.wait(timeout=5)
+
+
+def reset_remote_http_stats(service: RemoteHttpService) -> None:
+    with urlopen(f"{service.base_url}/__reset_stats", timeout=5) as response:
+        if response.status != 200:
+            raise RuntimeError(f"failed to reset HTTP stats: status {response.status}")
+
+
+def read_remote_http_stats(service: RemoteHttpService) -> dict:
+    with urlopen(f"{service.base_url}/__stats", timeout=5) as response:
+        if response.status != 200:
+            raise RuntimeError(f"failed to read HTTP stats: status {response.status}")
+        return json.loads(response.read().decode("utf-8"))
 
 
 def populate_profile_metrics(results_db: Path, run_id: str) -> None:
@@ -504,6 +578,7 @@ def benchmark_workload(
     results_db: Path,
     sql_dir: Path,
     profiles_dir: Path,
+    remote_service: RemoteHttpService | None = None,
 ) -> RunOutput:
     ensure_results_schema(results_db)
     queries = load_queries(workload.queries_dir)
@@ -513,10 +588,11 @@ def benchmark_workload(
         f"Benchmarking workload={workload.name} system={system.name} queries={len(queries)}",
         file=sys.stderr,
     )
-    remote_service = start_remote_http_service(workload)
+    owns_remote_service = remote_service is None
+    active_remote_service = remote_service or start_remote_http_service(workload)
     workload_setup_sql = static_setup_sql
-    if remote_service is not None:
-        workload_setup_sql += remote_service.setup_sql
+    if active_remote_service is not None:
+        workload_setup_sql += active_remote_service.setup_sql
     try:
         for variant in variants:
             variant_dir = sql_dir / workload.name / system.name
@@ -538,9 +614,25 @@ def benchmark_workload(
                 ),
                 encoding="utf-8",
             )
+            if active_remote_service is not None:
+                reset_remote_http_stats(active_remote_service)
             execute_workload(system.binary_path, workload.db_path, sql_path)
+            if active_remote_service is not None:
+                http_stats_dir = workload_profile_dir / "http_stats"
+                http_stats_dir.mkdir(parents=True, exist_ok=True)
+                http_stats_path = http_stats_dir / (
+                    label_to_path_component(variant.label) + ".json"
+                )
+                http_stats_path.write_text(
+                    json.dumps(
+                        read_remote_http_stats(active_remote_service), indent=2, sort_keys=True
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
     finally:
-        stop_remote_http_service(remote_service)
+        if owns_remote_service:
+            stop_remote_http_service(active_remote_service)
     if benchmark.collect_profiles:
         populate_profile_metrics(results_db, run_id)
     return RunOutput(run_id=run_id, query_count=len(queries))

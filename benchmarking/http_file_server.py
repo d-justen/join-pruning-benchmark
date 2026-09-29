@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import mimetypes
+import threading
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -11,6 +13,24 @@ from pathlib import Path
 def build_handler(root_dir: Path, latency_ms: int) -> type[BaseHTTPRequestHandler]:
     root_dir = root_dir.resolve()
     latency_s = latency_ms / 1000.0
+    stats_lock = threading.Lock()
+    stats: dict[str, object] = {}
+
+    def reset_stats() -> None:
+        with stats_lock:
+            stats.clear()
+            stats.update(
+                {
+                    "requests": 0,
+                    "head_requests": 0,
+                    "get_requests": 0,
+                    "range_get_requests": 0,
+                    "bytes_sent": 0,
+                    "paths": {},
+                }
+            )
+
+    reset_stats()
 
     class Handler(BaseHTTPRequestHandler):
         def do_HEAD(self) -> None:
@@ -26,6 +46,25 @@ def build_handler(root_dir: Path, latency_ms: int) -> type[BaseHTTPRequestHandle
                 self.end_headers()
                 if send_body:
                     self.wfile.write(b"ok")
+                return
+            if self.path == "/__stats":
+                with stats_lock:
+                    payload = json.dumps(stats, sort_keys=True).encode("utf-8")
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                if send_body:
+                    self.wfile.write(payload)
+                return
+            if self.path == "/__reset_stats":
+                reset_stats()
+                payload = b"ok"
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                if send_body:
+                    self.wfile.write(payload)
                 return
 
             file_path = self._resolve_path()
@@ -46,6 +85,7 @@ def build_handler(root_dir: Path, latency_ms: int) -> type[BaseHTTPRequestHandle
                 if send_body:
                     with file_path.open("rb") as file_obj:
                         self.wfile.write(file_obj.read())
+                self._record_request(file_size if send_body else 0, ranged=False)
                 return
 
             if not range_header.startswith("bytes="):
@@ -69,10 +109,31 @@ def build_handler(root_dir: Path, latency_ms: int) -> type[BaseHTTPRequestHandle
             self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
             self.end_headers()
             if not send_body:
+                self._record_request(0, ranged=True)
                 return
             with file_path.open("rb") as file_obj:
                 file_obj.seek(start)
                 self.wfile.write(file_obj.read(content_length))
+            self._record_request(content_length, ranged=True)
+
+        def _record_request(self, byte_count: int, *, ranged: bool) -> None:
+            relative_path = self.path.split("?", 1)[0].split("#", 1)[0].lstrip("/")
+            with stats_lock:
+                stats["requests"] = int(stats["requests"]) + 1
+                method_key = "get_requests" if self.command == "GET" else "head_requests"
+                stats[method_key] = int(stats[method_key]) + 1
+                if ranged and self.command == "GET":
+                    stats["range_get_requests"] = int(stats["range_get_requests"]) + 1
+                stats["bytes_sent"] = int(stats["bytes_sent"]) + byte_count
+                paths = stats["paths"]
+                assert isinstance(paths, dict)
+                path_stats = paths.setdefault(
+                    relative_path,
+                    {"requests": 0, "range_get_requests": 0, "bytes_sent": 0},
+                )
+                path_stats["requests"] += 1
+                path_stats["range_get_requests"] += int(ranged and self.command == "GET")
+                path_stats["bytes_sent"] += byte_count
 
         def _resolve_path(self) -> Path | None:
             relative_path = self.path.split("?", 1)[0].split("#", 1)[0].lstrip("/")

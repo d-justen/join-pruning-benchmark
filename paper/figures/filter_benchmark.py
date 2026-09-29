@@ -18,7 +18,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.ticker import FuncFormatter, LogFormatterMathtext
+from matplotlib.ticker import FuncFormatter, LogFormatterMathtext, LogLocator, NullFormatter
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -62,10 +62,16 @@ PAGE_SIZES = {
     "two-column": (7.0, 3.15),
 }
 
-FILTER_BENCHMARK_EXTRA_HEIGHT = 0.70
+FILTER_BENCHMARK_EXTRA_HEIGHT = 2.20
 FILTER_BENCHMARK_LABEL_FONT_SIZE = 7.5
 FILTER_BENCHMARK_TICK_FONT_SIZE = 6.5
 FILTER_BENCHMARK_LEGEND_FONT_SIZE = 6.5
+CACHE_REFERENCE_COLOR = "#6b7280"
+CACHE_REFERENCE_LABEL_FONT_SIZE = 6.3
+CACHE_REFERENCE_LINES = (
+    (49_152, "L1d · 48 KiB"),
+    (2 * 1_024 * 1_024, "L2 · 2 MiB"),
+)
 
 
 @dataclass(frozen=True)
@@ -127,6 +133,16 @@ def _format_percent(value: float) -> str:
 
 def _format_ms(value: float) -> str:
     return f"{value:.2f}"
+
+
+def _format_compact_bytes(value: float, _: object) -> str:
+    if value < 1_000:
+        return f"{value:.0f}"
+    if value < 1_000_000:
+        return f"{value / 1_000:.0f}K"
+    if value < 1_000_000_000:
+        return f"{value / 1_000_000:.0f}M"
+    return f"{value / 1_000_000_000:.0f}G"
 
 
 def _aggregate(values: list[float], aggregate: str) -> float:
@@ -197,6 +213,46 @@ def build_summary_size_series(
     for row in rows:
         grouped.setdefault(row.filter_name, {}).setdefault(row.cluster_count, []).append(
             float(row.summary_bytes)
+        )
+    return {
+        filter_name: [
+            (cluster_count, _aggregate(values, aggregate))
+            for cluster_count, values in sorted(cluster_rows.items())
+        ]
+        for filter_name, cluster_rows in grouped.items()
+    }
+
+
+def build_build_time_series(
+    rows: list[FilterBenchmarkRow],
+    *,
+    aggregate: str,
+) -> dict[str, list[tuple[int, float]]]:
+    """Aggregate total filter construction time, expressed in milliseconds."""
+    grouped: dict[str, dict[int, list[float]]] = {}
+    for row in rows:
+        grouped.setdefault(row.filter_name, {}).setdefault(row.cluster_count, []).append(
+            row.total_build_time_ns / 1_000_000.0
+        )
+    return {
+        filter_name: [
+            (cluster_count, _aggregate(values, aggregate))
+            for cluster_count, values in sorted(cluster_rows.items())
+        ]
+        for filter_name, cluster_rows in grouped.items()
+    }
+
+
+def build_false_positive_rate_series(
+    rows: list[FilterBenchmarkRow],
+    *,
+    actual_negatives_by_cluster: dict[int, int],
+    aggregate: str,
+) -> dict[str, list[tuple[int, float]]]:
+    grouped: dict[str, dict[int, list[float]]] = {}
+    for row in rows:
+        grouped.setdefault(row.filter_name, {}).setdefault(row.cluster_count, []).append(
+            row.false_positives / actual_negatives_by_cluster[row.cluster_count]
         )
     return {
         filter_name: [
@@ -377,7 +433,7 @@ def write_filter_benchmark_summary_markdown(
         "# Filter Benchmark Summary",
         "",
         f"- CSV: `{csv_path}`",
-        f"- Throughput aggregation for line plot: `{aggregate}`",
+        f"- Aggregation for figure line plots: `{aggregate}`",
         f"- FPR denominator range: `{summary['actual_negative_probe_counts']['min']}` to "
         f"`{summary['actual_negative_probe_counts']['max']}` sampled negatives per run",
         "",
@@ -413,29 +469,40 @@ def draw_filter_benchmark_plot(
     *,
     throughput_series: dict[str, list[tuple[int, float]]],
     summary_size_series: dict[str, list[tuple[int, float]]],
+    build_time_series: dict[str, list[tuple[int, float]]],
+    false_positive_rate_series: dict[str, list[tuple[int, float]]],
     aggregate: str,
 ) -> dict[str, object]:
     width, base_height = PAGE_SIZES["one-column"]
     height = base_height + FILTER_BENCHMARK_EXTRA_HEIGHT
-    fig, (throughput_ax, size_ax) = plt.subplots(
-        2,
+    fig, (throughput_ax, size_ax, build_time_ax, false_positive_rate_ax) = plt.subplots(
+        4,
         1,
         figsize=(width, height),
         sharex=True,
-        gridspec_kw={"height_ratios": [1.0, 0.95], "hspace": 0.08},
+        gridspec_kw={"height_ratios": [1.0, 0.95, 0.95, 0.95], "hspace": 0.08},
         constrained_layout=False,
     )
     fig.patch.set_facecolor("white")
     throughput_ax.set_facecolor("white")
     size_ax.set_facecolor("white")
+    build_time_ax.set_facecolor("white")
+    false_positive_rate_ax.set_facecolor("white")
 
     plotted_filters = [filter_name for filter_name in FILTER_ORDER if filter_name in throughput_series]
     throughput_values = [value for points in throughput_series.values() for _, value in points if value > 0]
     summary_size_values = [value for points in summary_size_series.values() for _, value in points if value > 0]
+    build_time_values = [value for points in build_time_series.values() for _, value in points if value > 0]
+    false_positive_rate_values = [
+        value for points in false_positive_rate_series.values() for _, value in points if value > 0
+    ]
     throughput_ymin = min(throughput_values) * 0.95 if throughput_values else 1.0
     throughput_ymax = max(throughput_values) * 1.08 if throughput_values else 10.0
     summary_ymin = min(summary_size_values) * 0.95 if summary_size_values else 1.0
     summary_ymax = max(summary_size_values) * 1.08 if summary_size_values else 10.0
+    build_time_ymin = 0.0
+    build_time_ymax = max(build_time_values) * 1.08 if build_time_values else 10.0
+    false_positive_rate_ymax = max(false_positive_rate_values) * 1.08 if false_positive_rate_values else 0.01
 
     for filter_name in plotted_filters:
         throughput_points = throughput_series[filter_name]
@@ -443,6 +510,10 @@ def draw_filter_benchmark_plot(
         throughput_ys = [throughput for _, throughput in throughput_points]
         size_points = summary_size_series[filter_name]
         size_ys = [summary_bytes for _, summary_bytes in size_points]
+        build_time_points = build_time_series[filter_name]
+        build_time_ys = [build_time_ms for _, build_time_ms in build_time_points]
+        false_positive_rate_points = false_positive_rate_series[filter_name]
+        false_positive_rate_ys = [rate for _, rate in false_positive_rate_points]
         throughput_ax.plot(
             xs,
             throughput_ys,
@@ -458,6 +529,20 @@ def draw_filter_benchmark_plot(
             linestyle=FILTER_LINESTYLES[filter_name],
             linewidth=1.7,
         )
+        build_time_ax.plot(
+            xs,
+            build_time_ys,
+            color=FILTER_COLORS[filter_name],
+            linestyle=FILTER_LINESTYLES[filter_name],
+            linewidth=1.7,
+        )
+        false_positive_rate_ax.plot(
+            xs,
+            false_positive_rate_ys,
+            color=FILTER_COLORS[filter_name],
+            linestyle=FILTER_LINESTYLES[filter_name],
+            linewidth=1.7,
+        )
 
     throughput_ax.set_ylabel(
         "Probe throughput\n(M tuples/s)",
@@ -469,15 +554,47 @@ def draw_filter_benchmark_plot(
     throughput_ax.yaxis.set_minor_formatter(LogFormatterMathtext(base=10))
     throughput_ax.set_ylim(throughput_ymin, throughput_ymax)
 
-    size_ax.set_xlabel("Number of clusters", fontsize=FILTER_BENCHMARK_LABEL_FONT_SIZE)
     size_ax.set_ylabel("Summary size\n(bytes)", fontsize=FILTER_BENCHMARK_LABEL_FONT_SIZE)
     size_ax.set_xscale("log")
     size_ax.set_yscale("log")
-    size_ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:.0f}"))
-    size_ax.yaxis.set_minor_formatter(LogFormatterMathtext(base=10))
+    size_ax.yaxis.set_major_locator(LogLocator(base=10, subs=(1.0,), numticks=10))
+    size_ax.yaxis.set_major_formatter(FuncFormatter(_format_compact_bytes))
+    size_ax.yaxis.set_minor_formatter(NullFormatter())
     size_ax.set_ylim(summary_ymin, summary_ymax)
+    for cache_size, label in CACHE_REFERENCE_LINES:
+        size_ax.axhline(
+            cache_size,
+            color=CACHE_REFERENCE_COLOR,
+            linestyle=(0, (2.0, 2.0)),
+            linewidth=0.8,
+            zorder=1,
+        )
+        size_ax.annotate(
+            label,
+            xy=(0.99, cache_size),
+            xycoords=("axes fraction", "data"),
+            xytext=(0, -1.5),
+            textcoords="offset points",
+            ha="right",
+            va="top",
+            color=CACHE_REFERENCE_COLOR,
+            fontsize=CACHE_REFERENCE_LABEL_FONT_SIZE,
+            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.85, "pad": 0.4},
+            zorder=4,
+        )
 
-    for ax in (throughput_ax, size_ax):
+    build_time_ax.set_ylabel("Build time\n(ms)", fontsize=FILTER_BENCHMARK_LABEL_FONT_SIZE)
+    build_time_ax.set_xscale("log")
+    build_time_ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:.0f}"))
+    build_time_ax.set_ylim(build_time_ymin, build_time_ymax)
+
+    false_positive_rate_ax.set_xlabel("Number of clusters", fontsize=FILTER_BENCHMARK_LABEL_FONT_SIZE)
+    false_positive_rate_ax.set_ylabel("False-positive\nrate", fontsize=FILTER_BENCHMARK_LABEL_FONT_SIZE)
+    false_positive_rate_ax.set_xscale("log")
+    false_positive_rate_ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value * 100:.1f}%"))
+    false_positive_rate_ax.set_ylim(0.0, false_positive_rate_ymax)
+
+    for ax in (throughput_ax, size_ax, build_time_ax, false_positive_rate_ax):
         ax.tick_params(axis="both", labelsize=FILTER_BENCHMARK_TICK_FONT_SIZE)
         ax.grid(axis="y", color="#e5e7eb", linewidth=0.8)
         ax.grid(axis="x", which="major", color="#f3f4f6", linewidth=0.6)
@@ -505,7 +622,8 @@ def draw_filter_benchmark_plot(
         columnspacing=1.2,
         alignment="left",
     )
-    fig.subplots_adjust(left=0.20, right=0.995, bottom=0.11, top=0.87)
+    fig.subplots_adjust(left=0.20, right=0.995, bottom=0.09, top=0.87)
+    fig.align_ylabels((throughput_ax, size_ax, build_time_ax, false_positive_rate_ax))
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, format="pdf", bbox_inches="tight", pad_inches=0.03)
@@ -513,6 +631,8 @@ def draw_filter_benchmark_plot(
     return {
         "throughput_aggregate": aggregate,
         "summary_size_aggregate": aggregate,
+        "build_time_aggregate": aggregate,
+        "false_positive_rate_aggregate": aggregate,
         "plotted_filters": plotted_filters,
         "point_count_per_filter": {
             filter_name: len(throughput_series[filter_name]) for filter_name in plotted_filters
@@ -530,6 +650,7 @@ def build_filter_benchmark_artifacts(
     rows = load_filter_benchmark_rows(csv_path)
     series = build_throughput_series(rows, aggregate=aggregate)
     summary_size_series = build_summary_size_series(rows, aggregate=aggregate)
+    build_time_series = build_build_time_series(rows, aggregate=aggregate)
     actual_negatives_by_cluster = derive_actual_negatives_by_cluster(
         rows,
         generation_config=generation_config,
@@ -537,6 +658,11 @@ def build_filter_benchmark_artifacts(
     summary = summarize_filter_benchmark(
         rows,
         actual_negatives_by_cluster=actual_negatives_by_cluster,
+    )
+    false_positive_rate_series = build_false_positive_rate_series(
+        rows,
+        actual_negatives_by_cluster=actual_negatives_by_cluster,
+        aggregate=aggregate,
     )
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -548,6 +674,8 @@ def build_filter_benchmark_artifacts(
         figure_path,
         throughput_series=series,
         summary_size_series=summary_size_series,
+        build_time_series=build_time_series,
+        false_positive_rate_series=false_positive_rate_series,
         aggregate=aggregate,
     )
     write_filter_benchmark_summary_markdown(
@@ -612,7 +740,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--throughput-aggregate",
         choices=("median", "mean"),
         default="median",
-        help="aggregate repetitions with this statistic before plotting throughput",
+        help="aggregate repetitions with this statistic before plotting each metric",
     )
     return parser
 

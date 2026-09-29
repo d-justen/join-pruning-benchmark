@@ -15,16 +15,20 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
-from matplotlib.ticker import FuncFormatter, LogFormatterMathtext, MaxNLocator
+from matplotlib.ticker import FixedLocator, FuncFormatter, LogFormatterMathtext, MaxNLocator
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from benchmarking import load_experiment_config
 from paper.figure_specs import (
     FIGURES,
     JPB_ALL_QUERIES,
+    JPB_NATIVE_ALL_QUERIES,
+    PARAMETER_SWEEP_PANELS,
     STRING_JOIN_QUERIES,
     TPCH_SELECTED_QUERIES,
     VARIANT_ORDER,
@@ -40,7 +44,7 @@ from paper.figures.data import (
     load_metric_rows,
     load_plan_metric_rows,
     load_probe_scan_rows,
-    load_system_name,
+    load_system_names,
     select_queries,
     summarize_relative_probe_cardinality,
     summarize_benchmark_runtime,
@@ -66,18 +70,39 @@ COLORS = {
     "no prefilter": "#9ca3af",
     "sip": "#2563eb",
     "sip + min/max": "#d97706",
+    "prf uncompressed": "#06b6d4",
     "prf with fallback": "#0f766e",
+    "rpt none": "#6b7280",
+    "rpt cascade": "#9333ea",
+    "rpt prf": "#dc2626",
 }
 
-PROBE_CARDINALITY_VARIANTS = ("sip", "sip + min/max", "prf with fallback")
+PROBE_CARDINALITY_VARIANTS = (
+    "sip",
+    "sip + min/max",
+    "prf uncompressed",
+    "prf with fallback",
+    "rpt cascade",
+    "rpt prf",
+)
 PROBE_CARDINALITY_OUTLIER_THRESHOLD = 10.0
-PROBE_OUTPUT_HATCH = "////"
 PROBE_FILTERED_HATCH = "...."
+PROBE_SKIPPED_HATCH = "////"
 ROWS_SCANNED_HATCH = "////"
 BENCHMARK_RUNTIME_BOXPLOT_GROUPS = (
     (
         "join-pruning-workload",
         "JPB",
+        JPB_NATIVE_ALL_QUERIES,
+    ),
+    (
+        "join-pruning-workload-ducklake",
+        "JPB DuckLake",
+        JPB_ALL_QUERIES,
+    ),
+    (
+        "join-pruning-workload-ducklake-http-10ms",
+        "JPB DuckLake +10 ms",
         JPB_ALL_QUERIES,
     ),
     (
@@ -95,15 +120,40 @@ VARIANT_DISPLAY_LABELS = {
     "no prefilter": "No pre-filter",
     "sip": "Bloom",
     "sip + min/max": "Bloom + min/max",
+    "prf uncompressed": "PRF (uncompressed)",
     "prf with fallback": "Prefix Range Filter",
+    "rpt none": "RPT+ disabled",
+    "rpt cascade": "RPT+ Cascade",
+    "rpt prf": "RPT+ PRF",
 }
 VARIANT_PANEL_LABELS = {
     "no prefilter": "No\npre-\nfilter",
     "sip": "Bloom",
     "sip + min/max": "Bloom +\nmin/max",
+    "prf uncompressed": "PRF\n(uncompressed)",
     "prf with fallback": "Prefix\nRange\nFilter",
+    "rpt none": "RPT+\ndisabled",
+    "rpt cascade": "RPT+\nCascade",
+    "rpt prf": "RPT+\nPRF",
 }
 MULTI_JOIN_QUERY_PANEL_SIZE = 24
+
+SWEEP_LINE_STYLES = {
+    "shoulder": "-",
+    "scattered": ":",
+    "seasonal": "-",
+}
+
+SWEEP_MARKERS = {
+    "no prefilter": "o",
+    "sip": "s",
+    "sip + min/max": "^",
+    "prf uncompressed": "h",
+    "prf with fallback": "D",
+    "rpt none": "v",
+    "rpt cascade": "P",
+    "rpt prf": "X",
+}
 
 
 def _available_workload_names(rows: list) -> set[str]:
@@ -130,6 +180,29 @@ def _variant_display_label(label: str) -> str:
 
 def _variant_panel_label(label: str) -> str:
     return VARIANT_PANEL_LABELS.get(label, _variant_display_label(label))
+
+
+def _present_entry_variants(entries: list[dict[str, object]]) -> tuple[str, ...]:
+    present = {
+        item["variant_label"]
+        for entry in entries
+        for item in entry["series"]
+    }
+    return tuple(label for label in VARIANT_ORDER if label in present)
+
+
+def _variant_bar_geometry(
+    preferred_width: float,
+    variant_count: int | None = None,
+) -> tuple[float, list[float]]:
+    count = variant_count if variant_count is not None else len(VARIANT_ORDER)
+    if count <= 0:
+        raise ValueError("variant_count must be positive")
+    bar_width = min(preferred_width, 0.72 / count)
+    center = (count - 1) / 2
+    return bar_width, [
+        (index - center) * bar_width for index in range(count)
+    ]
 
 
 def _format_axis_value(metric: str):
@@ -244,6 +317,13 @@ def _verify_layout(fig, ax) -> dict[str, bool]:
     }
 
 
+def _artist_overlaps_axes(fig, artist, axes) -> bool:
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    artist_bbox = artist.get_window_extent(renderer)
+    return any(artist_bbox.overlaps(ax.get_window_extent(renderer)) for ax in axes)
+
+
 def _draw_vertical_grouped_bars(
     output_path: Path,
     *,
@@ -267,15 +347,18 @@ def _draw_vertical_grouped_bars(
     ax.set_facecolor("white")
 
     x_positions = list(range(count))
-    bar_width = 0.18 if count <= 9 else 0.16
-    offsets = [-1.5 * bar_width, -0.5 * bar_width, 0.5 * bar_width, 1.5 * bar_width]
+    present_variants = _present_entry_variants(entries)
+    bar_width, offsets = _variant_bar_geometry(
+        0.18 if count <= 9 else 0.16,
+        len(present_variants),
+    )
     ymax = 0.0
     for entry in entries:
         for item in entry["series"]:
             if item["value"] is not None:
                 ymax = max(ymax, float(item["value"]))
     ymax = ymax * 1.18 if ymax > 0 else 1.0
-    for series_index, variant_label in enumerate(VARIANT_ORDER):
+    for series_index, variant_label in enumerate(present_variants):
         values = []
         for entry in entries:
             match = next((item for item in entry["series"] if item["variant_label"] == variant_label), None)
@@ -357,6 +440,7 @@ def _draw_runtime_probe_bars(
     annotate_runtime_values: bool,
     runtime_log_axis: bool,
     rows_log_axis: bool,
+    split_scan_pruning: bool = False,
 ) -> dict[str, bool]:
     width, height = PAGE_SIZES[width_key]
     text_scale = _capped_text_scale(width_key, placement_width_key)
@@ -388,45 +472,74 @@ def _draw_runtime_probe_bars(
 
     count = len(entries)
     x_positions = list(range(count))
-    bar_width = 0.18
-    offsets = [-1.5 * bar_width, -0.5 * bar_width, 0.5 * bar_width, 1.5 * bar_width]
+    present_variants = _present_entry_variants(entries)
+    bar_width, offsets = _variant_bar_geometry(0.18, len(present_variants))
     runtime_max = 0.0
     rows_max = 0
     positive_runtime_values: list[float] = []
     positive_row_values: list[float] = []
 
-    series_data: list[tuple[str, list[float], list[int], list[int]]] = []
-    for variant_label in VARIANT_ORDER:
+    series_data: list[
+        tuple[str, list[float], list[int], list[int], list[int]]
+    ] = []
+    for variant_label in present_variants:
         runtime_values: list[float] = []
-        output_values: list[int] = []
+        probe_values: list[int] = []
         filtered_values: list[int] = []
+        skipped_values: list[int] = []
         for entry in entries:
             match = next(
                 (item for item in entry["series"] if item["variant_label"] == variant_label),
                 None,
             )
             runtime = float(match["median_ms"]) if match else 0.0
-            output_rows = int(match["probe_output_cardinality"]) if match else 0
-            filtered_rows = int(match["probe_rows_filtered_out"]) if match else 0
+            probe_rows = int(match["join_probe_rows"]) if match else 0
+            filtered_rows = (
+                int(match["probe_rows_filtered_after_scan"]) if match else 0
+            )
+            skipped_rows = (
+                int(match["probe_rows_skipped_at_scan"])
+                if match and split_scan_pruning
+                else 0
+            )
             runtime_values.append(runtime)
-            output_values.append(output_rows)
+            probe_values.append(probe_rows)
             filtered_values.append(filtered_rows)
+            skipped_values.append(skipped_rows)
             runtime_max = max(runtime_max, runtime)
-            rows_max = max(rows_max, output_rows + filtered_rows)
+            rows_max = max(rows_max, probe_rows + filtered_rows + skipped_rows)
             if runtime > 0:
                 positive_runtime_values.append(runtime)
-            if output_rows > 0:
-                positive_row_values.append(float(output_rows))
-            if output_rows + filtered_rows > 0:
-                positive_row_values.append(float(output_rows + filtered_rows))
-        series_data.append((variant_label, runtime_values, output_values, filtered_values))
+            if probe_rows > 0:
+                positive_row_values.append(float(probe_rows))
+            if probe_rows + filtered_rows > 0:
+                positive_row_values.append(float(probe_rows + filtered_rows))
+            if probe_rows + filtered_rows + skipped_rows > 0:
+                positive_row_values.append(
+                    float(probe_rows + filtered_rows + skipped_rows)
+                )
+        series_data.append(
+            (
+                variant_label,
+                runtime_values,
+                probe_values,
+                filtered_values,
+                skipped_values,
+            )
+        )
 
     runtime_bounds = _log_axis_bounds(positive_runtime_values)
     runtime_floor = runtime_bounds[0] if runtime_bounds else 1.0
     row_bounds = _log_axis_bounds(positive_row_values)
     row_floor = row_bounds[0] if row_bounds else 1.0
 
-    for series_index, (variant_label, runtime_values, output_values, filtered_values) in enumerate(series_data):
+    for series_index, (
+        variant_label,
+        runtime_values,
+        probe_values,
+        filtered_values,
+        skipped_values,
+    ) in enumerate(series_data):
         positions = [x + offsets[series_index] for x in x_positions]
 
         if runtime_log_axis:
@@ -473,56 +586,95 @@ def _draw_runtime_probe_bars(
                 )
 
         if rows_log_axis:
-            rendered_output_values = [
+            rendered_probe_values = [
                 _render_log_value(value, row_floor)
-                for value in output_values
+                for value in probe_values
+            ]
+            rendered_scanned_values = [
+                _render_log_value(probe + filtered, row_floor)
+                for probe, filtered in zip(probe_values, filtered_values)
             ]
             rendered_total_values = [
-                _render_log_value(output + filtered, row_floor)
-                for output, filtered in zip(output_values, filtered_values)
+                _render_log_value(probe + filtered + skipped, row_floor)
+                for probe, filtered, skipped in zip(
+                    probe_values, filtered_values, skipped_values
+                )
             ]
             rows_ax.bar(
                 positions,
-                [top - row_floor for top in rendered_output_values],
+                [top - row_floor for top in rendered_probe_values],
                 width=bar_width,
                 bottom=row_floor,
                 color=COLORS[variant_label],
                 edgecolor="#ffffff",
                 linewidth=0.45,
-                hatch=PROBE_OUTPUT_HATCH,
                 zorder=3,
             )
             rows_ax.bar(
                 positions,
-                [top - bottom for top, bottom in zip(rendered_total_values, rendered_output_values)],
+                [
+                    top - bottom
+                    for top, bottom in zip(
+                        rendered_scanned_values, rendered_probe_values
+                    )
+                ],
                 width=bar_width,
-                bottom=rendered_output_values,
+                bottom=rendered_probe_values,
                 color="white",
                 edgecolor=COLORS[variant_label],
                 linewidth=0.7,
                 hatch=PROBE_FILTERED_HATCH,
                 zorder=3,
             )
+            rows_ax.bar(
+                positions,
+                [
+                    top - bottom
+                    for top, bottom in zip(
+                        rendered_total_values, rendered_scanned_values
+                    )
+                ],
+                width=bar_width,
+                bottom=rendered_scanned_values,
+                color="white",
+                edgecolor=COLORS[variant_label],
+                linewidth=0.7,
+                hatch=PROBE_SKIPPED_HATCH,
+                zorder=3,
+            )
         else:
             rows_ax.bar(
                 positions,
-                output_values,
+                probe_values,
                 width=bar_width,
                 color=COLORS[variant_label],
                 edgecolor="#ffffff",
                 linewidth=0.45,
-                hatch=PROBE_OUTPUT_HATCH,
                 zorder=3,
             )
             rows_ax.bar(
                 positions,
                 filtered_values,
                 width=bar_width,
-                bottom=output_values,
+                bottom=probe_values,
                 color="white",
                 edgecolor=COLORS[variant_label],
                 linewidth=0.7,
                 hatch=PROBE_FILTERED_HATCH,
+                zorder=3,
+            )
+            rows_ax.bar(
+                positions,
+                skipped_values,
+                width=bar_width,
+                bottom=[
+                    probe + filtered
+                    for probe, filtered in zip(probe_values, filtered_values)
+                ],
+                color="white",
+                edgecolor=COLORS[variant_label],
+                linewidth=0.7,
+                hatch=PROBE_SKIPPED_HATCH,
                 zorder=3,
             )
 
@@ -549,7 +701,7 @@ def _draw_runtime_probe_bars(
         runtime_ax.yaxis.set_major_formatter(_format_axis_value("runtime_ms"))
         runtime_ax.set_ylim(0, runtime_max * 1.15 if runtime_max > 0 else 1.0)
     rows_ax.set_ylabel(
-        "Probe rows",
+        "Fact tuples",
         fontsize=label_font_size,
         labelpad=10,
     )
@@ -601,61 +753,60 @@ def _draw_runtime_probe_bars(
 
     variant_handles = [
         Patch(facecolor=COLORS[label], edgecolor="none", label=_variant_display_label(label))
-        for label in VARIANT_ORDER
+        for label in present_variants
     ]
     semantic_handles = [
         Patch(
-            facecolor="white",
-            edgecolor="#4b5563",
-            hatch=PROBE_OUTPUT_HATCH,
+            facecolor="#6b7280",
+            edgecolor="none",
             label="Join-probed tuples",
         ),
         Patch(
             facecolor="white",
             edgecolor="#4b5563",
             hatch=PROBE_FILTERED_HATCH,
-            label="Pre-filtered tuples",
+            label=(
+                "Tuple-filtered after scan"
+                if split_scan_pruning
+                else "Pre-filtered tuples"
+            ),
         ),
     ]
-    legend_handles = variant_handles + semantic_handles
-    if width_key == "one-column":
-        # Matplotlib fills multi-column legends column-first.
-        legend_handles = [
-            variant_handles[0],
-            variant_handles[2],
-            semantic_handles[0],
-            variant_handles[1],
-            variant_handles[3],
-            semantic_handles[1],
-        ]
-    if has_bar_labels:
-        fig.legend(
-            handles=legend_handles,
-            loc="upper center",
-            bbox_to_anchor=(0.5, 0.89),
-            ncol=3,
-            frameon=False,
-            fontsize=legend_font_size,
-            handlelength=1.5,
-            columnspacing=1.0,
+    if split_scan_pruning:
+        semantic_handles.append(
+            Patch(
+                facecolor="white",
+                edgecolor="#4b5563",
+                hatch=PROBE_SKIPPED_HATCH,
+                label="Skipped at scan",
+            )
         )
-    else:
-        runtime_ax.legend(
-            handles=legend_handles,
-            loc="upper center",
-            bbox_to_anchor=(0.5, 1.40 if compressed_column_layout else (1.42 if width_key == "one-column" else 1.31)),
-            ncol=3 if compressed_column_layout else (2 if width_key == "one-column" else 3),
-            frameon=False,
-            fontsize=legend_font_size,
-            handlelength=1.5,
-            columnspacing=1.1,
-        )
+    variant_legend = fig.legend(
+        handles=variant_handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.99),
+        ncol=2 if width_key == "one-column" else 4,
+        frameon=False,
+        fontsize=legend_font_size,
+        handlelength=1.5,
+        columnspacing=1.0,
+    )
+    semantic_legend = fig.legend(
+        handles=semantic_handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.78 if width_key == "one-column" else 0.87),
+        ncol=1 if width_key == "one-column" else 3,
+        frameon=False,
+        fontsize=legend_font_size,
+        handlelength=1.5,
+        columnspacing=1.0,
+    )
 
     fig.subplots_adjust(
         left=0.26 if width_key == "one-column" else (0.17 if compressed_column_layout else 0.10),
         right=0.992 if width_key == "one-column" else 0.997,
         bottom=0.08 if not show_query_labels else (0.18 if has_wrapped_xticklabels else (0.12 if compressed_column_layout else 0.11)),
-        top=0.74 if has_bar_labels else (0.72 if compressed_column_layout else (0.75 if width_key == "one-column" else 0.83)),
+        top=0.50 if width_key == "one-column" else 0.75,
     )
     runtime_ax.yaxis.set_label_coords(-0.11, 0.5)
     rows_ax.yaxis.set_label_coords(-0.11, 0.5)
@@ -669,6 +820,16 @@ def _draw_runtime_probe_bars(
         "text_outside_figure": (
             runtime_verification["text_outside_figure"]
             or rows_verification["text_outside_figure"]
+            or _artist_overlaps_axes(
+                fig,
+                variant_legend,
+                (runtime_ax, rows_ax),
+            )
+            or _artist_overlaps_axes(
+                fig,
+                semantic_legend,
+                (runtime_ax, rows_ax),
+            )
         ),
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -693,6 +854,9 @@ def _draw_runtime_total_rows_bars(
     workload_labels: bool,
     runtime_log_axis: bool,
     rows_log_axis: bool,
+    rows_metric_key: str = "rows_scanned",
+    rows_y_label: str = "Rows scanned",
+    rows_percent: bool = False,
 ) -> dict[str, bool]:
     width, height = PAGE_SIZES[width_key]
     text_scale = _capped_text_scale(width_key, placement_width_key)
@@ -722,15 +886,18 @@ def _draw_runtime_total_rows_bars(
 
     count = len(entries)
     x_positions = list(range(count))
-    bar_width = 0.15 if show_runtime_labels else 0.18
-    offsets = [-1.5 * bar_width, -0.5 * bar_width, 0.5 * bar_width, 1.5 * bar_width]
+    present_variants = _present_entry_variants(entries)
+    bar_width, offsets = _variant_bar_geometry(
+        0.15 if show_runtime_labels else 0.18,
+        len(present_variants),
+    )
     runtime_max = 0.0
     rows_max = 0.0
     positive_runtime_values: list[float] = []
     positive_row_values: list[float] = []
 
     series_data: list[tuple[str, list[float], list[float]]] = []
-    for variant_label in VARIANT_ORDER:
+    for variant_label in present_variants:
         runtime_values: list[float] = []
         row_values: list[float] = []
         for entry in entries:
@@ -739,7 +906,11 @@ def _draw_runtime_total_rows_bars(
                 None,
             )
             runtime = float(match["median_ms"]) if match else 0.0
-            rows_scanned = float(match["rows_scanned"]) if match else 0.0
+            rows_scanned = (
+                float(match[rows_metric_key])
+                if match and match.get(rows_metric_key) is not None
+                else 0.0
+            )
             runtime_values.append(runtime)
             row_values.append(rows_scanned)
             runtime_max = max(runtime_max, runtime)
@@ -844,7 +1015,7 @@ def _draw_runtime_total_rows_bars(
         runtime_ax.yaxis.set_major_formatter(_format_axis_value("runtime_ms"))
         runtime_ax.set_ylim(0, runtime_max * 1.15 if runtime_max > 0 else 1.0)
 
-    rows_ax.set_ylabel("Rows scanned", fontsize=label_font_size)
+    rows_ax.set_ylabel(rows_y_label, fontsize=label_font_size)
     if rows_log_axis:
         if row_bounds:
             row_floor, row_upper = row_bounds
@@ -856,9 +1027,18 @@ def _draw_runtime_total_rows_bars(
         else:
             rows_ax.set_ylim(1.0, 10.0)
     else:
-        rows_ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: _format_large_number(value)))
+        rows_ax.yaxis.set_major_formatter(
+            FuncFormatter(
+                (lambda value, _: f"{value * 100:.0f}%")
+                if rows_percent
+                else (lambda value, _: _format_large_number(value))
+            )
+        )
         rows_ax.yaxis.set_major_locator(MaxNLocator(nbins=4, prune="both"))
-        rows_ax.set_ylim(0, rows_max * 1.03 if rows_max > 0 else 1.0)
+        rows_ax.set_ylim(
+            0,
+            1.03 if rows_percent else (rows_max * 1.03 if rows_max > 0 else 1.0),
+        )
     rows_ax.invert_yaxis()
 
     for ax in (runtime_ax, rows_ax):
@@ -897,7 +1077,7 @@ def _draw_runtime_total_rows_bars(
             edgecolor="none",
             label=_variant_display_label(label),
         )
-        for label in VARIANT_ORDER
+        for label in present_variants
     ]
     if show_runtime_labels:
         fig.legend(
@@ -984,13 +1164,16 @@ def _draw_runtime_plan_work_bars(
 
     count = len(entries)
     x_positions = list(range(count))
-    variant_step = 0.18 if count <= 24 else 0.16
-    measure_width = 0.06 if count <= 24 else 0.05
-    variant_offsets = [-1.5 * variant_step, -0.5 * variant_step, 0.5 * variant_step, 1.5 * variant_step]
+    present_variants = _present_entry_variants(entries)
+    variant_step, variant_offsets = _variant_bar_geometry(
+        0.18 if count <= 24 else 0.16,
+        len(present_variants),
+    )
+    measure_width = variant_step / 3
     runtime_max = 0.0
     positive_work_values: list[float] = []
 
-    for series_index, variant_label in enumerate(VARIANT_ORDER):
+    for series_index, variant_label in enumerate(present_variants):
         runtime_values: list[float] = []
         join_probe_values: list[int] = []
         rows_scanned_values: list[int] = []
@@ -1087,7 +1270,7 @@ def _draw_runtime_plan_work_bars(
 
     variant_handles = [
         Patch(facecolor=COLORS[label], edgecolor="none", label=_variant_display_label(label))
-        for label in VARIANT_ORDER
+        for label in present_variants
     ]
     semantic_handles = [
         Patch(facecolor="white", edgecolor="#4b5563", label="Join-probed tuples"),
@@ -1151,8 +1334,29 @@ def _draw_relative_probe_cardinality_boxplot(
     fig.patch.set_facecolor("white")
     ax.set_facecolor("white")
 
-    data = [relative_values[label] for label in PROBE_CARDINALITY_VARIANTS]
-    positions = [1, 2, 3]
+    present_variants = [
+        label
+        for label in PROBE_CARDINALITY_VARIANTS
+        if label in relative_values and relative_values[label]
+    ]
+    if not present_variants:
+        ax.text(
+            0.5,
+            0.5,
+            "No comparable filtered scans",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            fontsize=8,
+            color="#4b5563",
+        )
+        ax.set_axis_off()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, format="pdf", bbox_inches="tight", pad_inches=0.01)
+        plt.close(fig)
+        return {"tick_label_overlap": False, "text_outside_figure": False}
+    data = [relative_values[label] for label in present_variants]
+    positions = list(range(1, len(present_variants) + 1))
     bp = ax.boxplot(
         data,
         positions=positions,
@@ -1164,13 +1368,13 @@ def _draw_relative_probe_cardinality_boxplot(
         whiskerprops={"linewidth": 0.9, "color": "#6b7280"},
         capprops={"linewidth": 0.9, "color": "#6b7280"},
     )
-    for patch, label in zip(bp["boxes"], PROBE_CARDINALITY_VARIANTS):
+    for patch, label in zip(bp["boxes"], present_variants):
         patch.set_facecolor(COLORS[label])
         patch.set_edgecolor("#374151")
         patch.set_alpha(0.9)
 
     ax.set_xticks(positions)
-    ax.set_xticklabels([_variant_display_label(label) for label in PROBE_CARDINALITY_VARIANTS], fontsize=7)
+    ax.set_xticklabels([_variant_display_label(label) for label in present_variants], fontsize=7)
     ax.set_ylabel("Relative scan cardinality (log)", fontsize=8)
     ax.tick_params(axis="y", labelsize=7)
     ax.grid(axis="y", color="#e5e7eb", linewidth=0.8, zorder=0)
@@ -1231,12 +1435,14 @@ def _draw_benchmark_runtime_boxplot(
     else:
         axes = [axes]
 
-    positions = (1, 2, 3, 4)
+    positions = tuple(range(1, len(VARIANT_ORDER) + 1))
     for index, (ax, distribution) in enumerate(zip(axes, distributions)):
         ax.set_facecolor("white")
         panel_values = []
         for variant_index, variant_label in enumerate(VARIANT_ORDER):
             values = distribution["values_by_variant"][variant_label]
+            if not values:
+                continue
             panel_values.extend(values)
             boxplot = ax.boxplot(
                 [values],
@@ -1273,7 +1479,7 @@ def _draw_benchmark_runtime_boxplot(
         ax.spines["right"].set_visible(False)
         ax.spines["left"].set_color("#9ca3af")
         ax.spines["bottom"].set_color("#9ca3af")
-        ax.set_xlim(0.35, 4.65)
+        ax.set_xlim(0.35, len(VARIANT_ORDER) + 0.65)
         ax.set_title(
             f"{distribution['benchmark_label']}\n(n={distribution['query_count']})",
             fontsize=title_font_size,
@@ -1287,6 +1493,11 @@ def _draw_benchmark_runtime_boxplot(
         else:
             ax.set_ylabel("")
 
+    present_variants = [
+        label
+        for label in VARIANT_ORDER
+        if any(distribution["values_by_variant"][label] for distribution in distributions)
+    ]
     fig.legend(
         handles=[
             Patch(
@@ -1294,11 +1505,11 @@ def _draw_benchmark_runtime_boxplot(
                 edgecolor="#374151",
                 label=_variant_display_label(label),
             )
-            for label in VARIANT_ORDER
+            for label in present_variants
         ],
         loc="upper center",
         bbox_to_anchor=(0.5, 1.08),
-        ncol=4,
+        ncol=min(4, len(present_variants)),
         frameon=False,
         fontsize=legend_font_size,
         handlelength=1.4,
@@ -1377,8 +1588,26 @@ def _benchmark_summaries(rows: list) -> dict[str, object]:
         summaries["join_pruning_benchmark"] = summarize_benchmark_runtime(
             rows,
             workload_name="join-pruning-workload",
-            query_names=JPB_ALL_QUERIES,
+            query_names=JPB_NATIVE_ALL_QUERIES,
             benchmark_label=WORKLOAD_LABELS["join-pruning-workload"],
+        )
+    if "join-pruning-workload-ducklake" in available_workloads:
+        summaries["join_pruning_benchmark_ducklake"] = summarize_benchmark_runtime(
+            rows,
+            workload_name="join-pruning-workload-ducklake",
+            query_names=JPB_ALL_QUERIES,
+            benchmark_label=WORKLOAD_LABELS["join-pruning-workload-ducklake"],
+        )
+    if "join-pruning-workload-ducklake-http-10ms" in available_workloads:
+        summaries["join_pruning_benchmark_ducklake_http_10ms"] = (
+            summarize_benchmark_runtime(
+                rows,
+                workload_name="join-pruning-workload-ducklake-http-10ms",
+                query_names=JPB_ALL_QUERIES,
+                benchmark_label=WORKLOAD_LABELS[
+                    "join-pruning-workload-ducklake-http-10ms"
+                ],
+            )
         )
     if "tpch-skew" in available_workloads:
         summaries["tpch_skew_selected"] = summarize_benchmark_runtime(
@@ -1462,7 +1691,10 @@ def _write_benchmark_summary_markdown(
             )
             for key in metric_keys
         }
-        for variant_index, variant_label in enumerate(VARIANT_ORDER):
+        present_variants = [
+            label for label in VARIANT_ORDER if label in variants
+        ]
+        for variant_index, variant_label in enumerate(present_variants):
             values = variants[variant_label]
             benchmark_cell = (
                 benchmark["benchmark_label"]
@@ -1546,18 +1778,256 @@ def _write_benchmark_summary_markdown(
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def _sweep_tick_formatter(sweep_kind: str):
+    if sweep_kind == "selectivity":
+        return FuncFormatter(lambda value, _: f"{value * 100:g}%")
+    if sweep_kind == "join_count":
+        return FuncFormatter(lambda value, _: f"{value:.0f}")
+    return FuncFormatter(lambda value, _: _format_large_number(value))
+
+
+def _parameter_sweep_series(
+    rows: list,
+) -> tuple[dict[str, dict[tuple[str, str], list[tuple[float, float]]]], dict[str, object]]:
+    result: dict[str, dict[tuple[str, str], list[tuple[float, float]]]] = {}
+    summary: dict[str, object] = {}
+    for panel in PARAMETER_SWEEP_PANELS:
+        grouped: dict[tuple[str, str], list[tuple[float, float]]] = {}
+        point_summary: list[dict[str, object]] = []
+        for row in rows:
+            if row.workload_name != panel.workload:
+                continue
+            parameters = row.query_parameters
+            if parameters is None:
+                raise ValueError(
+                    f"{panel.workload} results do not contain query_parameters"
+                )
+            if parameters.get("sweep_kind") != panel.sweep_kind:
+                raise ValueError(
+                    f"{panel.workload} expected sweep kind {panel.sweep_kind!r}, "
+                    f"got {parameters.get('sweep_kind')!r}"
+                )
+            sweep_value = parameters.get("sweep_value")
+            query_type = parameters.get("query_type")
+            if not isinstance(sweep_value, (int, float)) or isinstance(sweep_value, bool):
+                raise ValueError(f"{row.query_name} has no numeric sweep_value")
+            if not isinstance(query_type, str):
+                raise ValueError(f"{row.query_name} has no query_type")
+            point = (float(sweep_value), float(row.median_ms))
+            grouped.setdefault((row.variant_label, query_type), []).append(point)
+            point_summary.append(
+                {
+                    "query_name": row.query_name,
+                    "variant_label": row.variant_label,
+                    "query_type": query_type,
+                    "sweep_value": sweep_value,
+                    "median_ms": row.median_ms,
+                }
+            )
+        for points in grouped.values():
+            points.sort(key=lambda point: point[0])
+            if len({point[0] for point in points}) != len(points):
+                raise ValueError(f"duplicate sweep points found for {panel.workload}")
+        expected_query_types = (
+            {"seasonal"}
+            if panel.sweep_kind == "cluster_count"
+            else {"shoulder", "scattered"}
+        )
+        present_query_types = {query_type for _, query_type in grouped}
+        if present_query_types != expected_query_types:
+            raise ValueError(
+                f"{panel.workload} expected query types "
+                f"{sorted(expected_query_types)}, got {sorted(present_query_types)}"
+            )
+        expected_values = {
+            point[0]
+            for points in grouped.values()
+            for point in points
+        }
+        present_variants = {variant for variant, _ in grouped}
+        for variant in present_variants:
+            for query_type in expected_query_types:
+                actual_values = {
+                    point[0] for point in grouped.get((variant, query_type), [])
+                }
+                if actual_values != expected_values:
+                    raise ValueError(
+                        f"incomplete {panel.workload} series for "
+                        f"{variant}/{query_type}: expected {sorted(expected_values)}, "
+                        f"got {sorted(actual_values)}"
+                    )
+        result[panel.workload] = grouped
+        summary[panel.workload] = {
+            "sweep_kind": panel.sweep_kind,
+            "point_count": len(point_summary),
+            "points": sorted(
+                point_summary,
+                key=lambda point: (
+                    str(point["variant_label"]),
+                    str(point["query_type"]),
+                    float(point["sweep_value"]),
+                ),
+            ),
+        }
+    return result, summary
+
+
+def _draw_parameter_sweep_overview(
+    output_path: Path,
+    *,
+    rows: list,
+) -> tuple[dict[str, bool], dict[str, object]]:
+    panel_series, summary = _parameter_sweep_series(rows)
+    fig, axes = plt.subplots(2, 3, figsize=(7.0, 5.4), constrained_layout=False)
+    fig.patch.set_facecolor("white")
+    present_variants = tuple(
+        variant
+        for variant in VARIANT_ORDER
+        if any(
+            any(key[0] == variant for key in grouped)
+            for grouped in panel_series.values()
+        )
+    )
+    for ax, panel in zip(axes.flat, PARAMETER_SWEEP_PANELS):
+        ax.set_facecolor("white")
+        grouped = panel_series[panel.workload]
+        for variant in present_variants:
+            query_types = ("seasonal",) if panel.sweep_kind == "cluster_count" else (
+                "shoulder",
+                "scattered",
+            )
+            for query_type in query_types:
+                points = grouped.get((variant, query_type), [])
+                if not points:
+                    continue
+                ax.plot(
+                    [point[0] for point in points],
+                    [point[1] for point in points],
+                    color=COLORS[variant],
+                    marker=SWEEP_MARKERS[variant],
+                    markersize=3.0,
+                    markeredgewidth=0.4,
+                    linewidth=1.15,
+                    linestyle=SWEEP_LINE_STYLES[query_type],
+                    zorder=3,
+                )
+        if panel.x_scale == "log":
+            ax.set_xscale("log", base=panel.log_base)
+        ax.set_yscale("log")
+        if panel.x_ticks:
+            ax.xaxis.set_major_locator(FixedLocator(panel.x_ticks))
+        ax.xaxis.set_major_formatter(_sweep_tick_formatter(panel.sweep_kind))
+        ax.set_title(panel.title, fontsize=TITLE_FONT_SIZE, pad=4)
+        ax.set_xlabel(panel.x_label, fontsize=LABEL_FONT_SIZE, labelpad=2)
+        ax.tick_params(axis="both", labelsize=TICK_FONT_SIZE, pad=1.5)
+        ax.grid(axis="both", color="#e5e7eb", linewidth=0.7, zorder=0)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["left"].set_color("#9ca3af")
+        ax.spines["bottom"].set_color("#9ca3af")
+    fig.supylabel("Median execution time (ms)", fontsize=LABEL_FONT_SIZE, x=0.016)
+    method_handles = [
+        Line2D(
+            [],
+            [],
+            color=COLORS[variant],
+            marker=SWEEP_MARKERS[variant],
+            linestyle="None",
+            markersize=4,
+            label=_variant_display_label(variant),
+        )
+        for variant in present_variants
+    ]
+    query_handles = [
+        Line2D([], [], color="#111827", linestyle="-", linewidth=1.2, label="Shoulder"),
+        Line2D([], [], color="#111827", linestyle=":", linewidth=1.2, label="Scattered"),
+    ]
+    legend = fig.legend(
+        handles=method_handles + query_handles,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.012),
+        ncol=5,
+        frameon=False,
+        fontsize=LEGEND_FONT_SIZE,
+        handlelength=1.7,
+        columnspacing=1.1,
+    )
+    fig.subplots_adjust(
+        left=0.115,
+        right=0.975,
+        top=0.955,
+        bottom=0.205,
+        wspace=0.34,
+        hspace=0.42,
+    )
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    figure_bbox = fig.get_window_extent(renderer)
+    verifications = []
+    for ax in axes.flat:
+        axes_bbox = ax.get_window_extent(renderer)
+        visible_x_tick_boxes = []
+        visible_tick_boxes = []
+        for tick in ax.get_xticklabels():
+            if not tick.get_text():
+                continue
+            bbox = tick.get_window_extent(renderer)
+            if axes_bbox.x0 - 1 <= (bbox.x0 + bbox.x1) / 2 <= axes_bbox.x1 + 1:
+                visible_x_tick_boxes.append(bbox)
+                visible_tick_boxes.append(bbox)
+        for tick in ax.get_yticklabels():
+            if not tick.get_text():
+                continue
+            bbox = tick.get_window_extent(renderer)
+            if axes_bbox.y0 - 1 <= (bbox.y0 + bbox.y1) / 2 <= axes_bbox.y1 + 1:
+                visible_tick_boxes.append(bbox)
+        visible_x_tick_boxes.sort(key=lambda bbox: bbox.x0)
+        verifications.append(
+            {
+                "tick_label_overlap": any(
+                    left.x1 > right.x0
+                    for left, right in zip(
+                        visible_x_tick_boxes,
+                        visible_x_tick_boxes[1:],
+                    )
+                ),
+                "text_outside_figure": any(
+                    bbox.x0 < figure_bbox.x0
+                    or bbox.x1 > figure_bbox.x1
+                    or bbox.y0 < figure_bbox.y0
+                    or bbox.y1 > figure_bbox.y1
+                    for bbox in visible_tick_boxes
+                ),
+            }
+        )
+    verification = {
+        "tick_label_overlap": any(
+            item["tick_label_overlap"] for item in verifications
+        ),
+        "text_outside_figure": any(
+            item["text_outside_figure"] for item in verifications
+        )
+        or _artist_overlaps_axes(fig, legend, axes.flat),
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, format="pdf", bbox_inches="tight", pad_inches=0.01)
+    plt.close(fig)
+    return verification, summary
+
+
 def build_figures(experiment_root: Path, system_name: str | None) -> Path:
     experiment_root = experiment_root.resolve()
-    resolved_system_name = load_system_name(experiment_root, system_name)
-    rows = load_metric_rows(experiment_root, resolved_system_name)
-    plan_metric_rows = load_plan_metric_rows(experiment_root, resolved_system_name)
-    probe_scan_rows = load_probe_scan_rows(experiment_root, resolved_system_name)
+    experiment_config = load_experiment_config(experiment_root / "config.json")
+    resolved_system_names = load_system_names(experiment_root, system_name)
+    rows = load_metric_rows(experiment_root, resolved_system_names)
+    plan_metric_rows = load_plan_metric_rows(experiment_root, resolved_system_names)
+    probe_scan_rows = load_probe_scan_rows(experiment_root, resolved_system_names)
     output_dir = experiment_root / "paper"
     figures_dir = output_dir / "figures"
     available_workloads = _available_workload_names(rows)
     summary: dict[str, object] = {
         "experiment_root": str(experiment_root),
-        "system_name": resolved_system_name,
+        "system_names": list(resolved_system_names),
         "figures": {},
         "sections": {},
         "verification": {},
@@ -1567,7 +2037,7 @@ def build_figures(experiment_root: Path, system_name: str | None) -> Path:
         if not _figure_is_available(figure, available_workloads):
             summary["skipped_figures"].append(figure.slug)
             continue
-        if figure.metric == "runtime_and_probe_rows":
+        if figure.metric in {"runtime_and_probe_rows", "runtime_and_files_read"}:
             workload_name = figure.workloads[0]
             query_names = figure.queries_by_workload[workload_name]
             if figure.probe_table is None:
@@ -1580,6 +2050,20 @@ def build_figures(experiment_root: Path, system_name: str | None) -> Path:
                 workload_name,
                 query_names,
                 figure.probe_table,
+                logical_probe_rows=(
+                    next(
+                        (
+                            workload.fact_rows
+                            for workload in experiment_config.workloads
+                            if workload.name == workload_name
+                            and hasattr(workload, "fact_rows")
+                        ),
+                        None,
+                    )
+                    if workload_name == "join-pruning-workload"
+                    and figure.probe_table == "fact"
+                    else None
+                ),
             )
             runtime_summary = summarize_section(
                 [
@@ -1594,22 +2078,56 @@ def build_figures(experiment_root: Path, system_name: str | None) -> Path:
                 ],
                 "runtime_ms",
             )
+            detail_metric_key = (
+                "files_read_fraction"
+                if figure.metric == "runtime_and_files_read"
+                else "physical_rows_scanned"
+            )
             rows_summary = summarize_section(
                 [
                     {
                         **entry,
                         "series": [
-                            {**item, "value": item["probe_rows_scanned"]}
+                            {**item, "value": item[detail_metric_key]}
                             for item in entry["series"]
                         ],
                     }
                     for entry in entries
                 ],
-                "total_rows",
+                detail_metric_key,
             )
             section_summary = {
                 "runtime": runtime_summary,
-                "probe_rows": rows_summary,
+                (
+                    "fact_files_opened_fraction"
+                    if figure.metric == "runtime_and_files_read"
+                    else "probe_rows"
+                ): (
+                    rows_summary
+                    if figure.metric == "runtime_and_files_read"
+                    else {
+                        metric_key: summarize_section(
+                            [
+                                {
+                                    **entry,
+                                    "series": [
+                                        {**item, "value": item[metric_key]}
+                                        for item in entry["series"]
+                                    ],
+                                }
+                                for entry in entries
+                            ],
+                            metric_key,
+                        )
+                        for metric_key in (
+                            "logical_probe_rows",
+                            "physical_rows_scanned",
+                            "join_probe_rows",
+                            "probe_rows_filtered_after_scan",
+                            "probe_rows_skipped_at_scan",
+                        )
+                    }
+                ),
             }
         elif figure.metric == "runtime_and_total_rows":
             entries = []
@@ -1677,6 +2195,24 @@ def build_figures(experiment_root: Path, system_name: str | None) -> Path:
                 annotate_runtime_values=figure.annotate_runtime_values,
                 runtime_log_axis=figure.runtime_log_axis,
                 rows_log_axis=figure.rows_log_axis,
+                split_scan_pruning=(
+                    figure.workloads == ("join-pruning-workload",)
+                ),
+            )
+        elif figure.metric == "runtime_and_files_read":
+            verification = _draw_runtime_total_rows_bars(
+                figure_path,
+                entries=entries,
+                width_key=figure.width,
+                placement_width_key=figure.placement_width,
+                show_query_labels=figure.show_query_labels,
+                show_runtime_labels=figure.show_runtime_labels,
+                workload_labels=figure.query_workload_labels,
+                runtime_log_axis=figure.runtime_log_axis,
+                rows_log_axis=False,
+                rows_metric_key="files_read_fraction",
+                rows_y_label="Fact files opened",
+                rows_percent=True,
             )
         elif figure.metric == "runtime_and_total_rows":
             verification = _draw_runtime_total_rows_bars(
@@ -1703,6 +2239,19 @@ def build_figures(experiment_root: Path, system_name: str | None) -> Path:
         summary["figures"][figure.slug] = str(figure_path)
         summary["verification"][figure.slug] = verification
         summary["sections"].setdefault(figure.summary_key, {}).update({figure.slug: section_summary})
+
+    sweep_workloads = {panel.workload for panel in PARAMETER_SWEEP_PANELS}
+    if sweep_workloads.issubset(available_workloads):
+        sweep_path = figures_dir / "parameter_sweep_overview.pdf"
+        sweep_verification, sweep_summary = _draw_parameter_sweep_overview(
+            sweep_path,
+            rows=[row for row in rows if row.workload_name in sweep_workloads],
+        )
+        summary["figures"]["parameter_sweep_overview"] = str(sweep_path)
+        summary["verification"]["parameter_sweep_overview"] = sweep_verification
+        summary["sections"]["parameter_sweeps"] = sweep_summary
+    elif sweep_workloads.intersection(available_workloads):
+        summary["skipped_figures"].append("parameter_sweep_overview")
 
     def summarize_plan_work_entries(entries: list[dict[str, object]]) -> dict[str, object]:
         runtime_summary = summarize_section(
@@ -1863,7 +2412,7 @@ def build_figures(experiment_root: Path, system_name: str | None) -> Path:
         _write_benchmark_summary_markdown(
             benchmark_summary_path,
             experiment_root=experiment_root,
-            system_name=resolved_system_name,
+            system_name=", ".join(resolved_system_names),
             benchmark_summary=benchmark_metric_summary,
         )
         summary["benchmark_summary_path"] = str(benchmark_summary_path)
@@ -1879,7 +2428,7 @@ def _write_summary_markdown(path: Path, summary: dict[str, object]) -> None:
         "# Paper Summary",
         "",
         f"- experiment root: `{summary['experiment_root']}`",
-        f"- system: `{summary['system_name']}`",
+        f"- systems: `{', '.join(summary['system_names'])}`",
         "",
     ]
     for section_name, section_value in summary["sections"].items():

@@ -29,7 +29,11 @@ COLORS = {
     "no prefilter": rgb("#9ca3af"),
     "sip": rgb("#2563eb"),
     "sip + min/max": rgb("#d97706"),
+    "prf uncompressed": rgb("#06b6d4"),
     "prf with fallback": rgb("#0f766e"),
+    "rpt none": rgb("#6b7280"),
+    "rpt cascade": rgb("#9333ea"),
+    "rpt prf": rgb("#dc2626"),
 }
 
 TITLE_SIZE = 13.0

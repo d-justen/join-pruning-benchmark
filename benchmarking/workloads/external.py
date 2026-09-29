@@ -9,7 +9,12 @@ from pathlib import Path
 import duckdb
 
 from benchmarking.experiment_config import ExternalWorkloadConfig
-from benchmarking.manifests import PreparedWorkload, utc_now_iso, write_manifest
+from benchmarking.manifests import (
+    DUCKLAKE_HTTP_BASE_URL_PLACEHOLDER,
+    PreparedWorkload,
+    utc_now_iso,
+    write_manifest,
+)
 
 
 DEFAULT_REMOTE_PARQUET_FILE_SIZE_MB = 200
@@ -220,14 +225,28 @@ def materialize_existing_db(source_db_path: Path, artifact_dir: Path, db_handlin
     return db_path.resolve()
 
 
-def export_remote_parquet_catalog(source_db_path: Path, artifact_dir: Path) -> Path:
-    remote_root = artifact_dir / "remote_parquet"
-    if remote_root.exists():
-        shutil.rmtree(remote_root)
-    remote_root.mkdir(parents=True, exist_ok=True)
+def export_parquet_catalog(
+    source_db_path: Path,
+    artifact_dir: Path,
+    *,
+    root_dir_name: str,
+    catalog_filename: str,
+    file_size_mb: int = DEFAULT_REMOTE_PARQUET_FILE_SIZE_MB,
+    exclude_empty_files: bool = False,
+    export_threads: int | None = None,
+) -> Path:
+    parquet_root = artifact_dir / root_dir_name
+    if parquet_root.exists():
+        shutil.rmtree(parquet_root)
+    parquet_root.mkdir(parents=True, exist_ok=True)
 
     con = duckdb.connect(str(source_db_path))
     try:
+        if export_threads is not None:
+            if export_threads <= 0:
+                raise ValueError("export_threads must be positive")
+            con.execute(f"SET threads = {export_threads}")
+        con.execute("SET preserve_insertion_order = true")
         tables = [
             row[0]
             for row in con.execute(
@@ -243,27 +262,166 @@ def export_remote_parquet_catalog(source_db_path: Path, artifact_dir: Path) -> P
             raise ValueError(f"external workload database has no base tables: {source_db_path}")
         catalog: dict[str, list[str]] = {}
         for table_name in tables:
-            table_dir = remote_root / table_name
+            table_dir = parquet_root / table_name
             con.execute(
                 f"""
                 COPY {_quote_identifier(table_name)}
                 TO ?
                 (FORMAT parquet, COMPRESSION {DEFAULT_REMOTE_PARQUET_COMPRESSION}, FILE_SIZE_BYTES '{
-                    DEFAULT_REMOTE_PARQUET_FILE_SIZE_MB
+                    file_size_mb
                 }MB')
                 """,
                 [str(table_dir)],
             )
-            parquet_files = sorted(path.relative_to(remote_root).as_posix() for path in table_dir.rglob("*.parquet"))
+            exported_paths = sorted(table_dir.rglob("*.parquet"))
+            retained_paths = set(exported_paths)
+            if exclude_empty_files:
+                nonempty_paths = {
+                    Path(row[0]).resolve()
+                    for row in con.execute(
+                        "SELECT DISTINCT file_name FROM parquet_metadata(?)",
+                        [str(table_dir.resolve() / "*.parquet")],
+                    ).fetchall()
+                }
+                retained_paths = {
+                    path for path in exported_paths if path.resolve() in nonempty_paths
+                }
+                for path in exported_paths:
+                    if path not in retained_paths:
+                        path.unlink()
+            parquet_files = [
+                path.relative_to(parquet_root).as_posix()
+                for path in exported_paths
+                if path in retained_paths
+            ]
             if not parquet_files:
                 raise ValueError(f"no Parquet files exported for table {table_name}")
             catalog[table_name] = parquet_files
     finally:
         con.close()
 
-    catalog_path = artifact_dir / "remote_parquet_catalog.json"
+    catalog_path = artifact_dir / catalog_filename
     catalog_path.write_text(json.dumps(catalog, indent=2) + "\n", encoding="utf-8")
     return catalog_path.resolve()
+
+
+def read_table_schemas(db_path: Path) -> dict[str, list[tuple[str, str]]]:
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        tables = [
+            row[0]
+            for row in con.execute(
+                """
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'main' AND table_type = 'BASE TABLE'
+                ORDER BY table_name
+                """
+            ).fetchall()
+        ]
+        return {
+            table_name: [
+                (row[0], row[1])
+                for row in con.execute(
+                    f"DESCRIBE {_quote_identifier(table_name)}"
+                ).fetchall()
+            ]
+            for table_name in tables
+        }
+    finally:
+        con.close()
+
+
+def write_ducklake_sql(
+    artifact_dir: Path,
+    parquet_catalog_path: Path,
+    table_schemas: dict[str, list[tuple[str, str]]],
+    *,
+    use_http_data: bool,
+) -> tuple[Path, Path, Path, Path, Path, str]:
+    catalog_alias = "ducklake"
+    metadata_path = (artifact_dir / "ducklake_metadata.duckdb").resolve()
+    data_path = (artifact_dir / "ducklake_data").resolve()
+    runtime_db_path = (artifact_dir / "ducklake_runtime.duckdb").resolve()
+    bootstrap_path = (artifact_dir / "ducklake_bootstrap.sql").resolve()
+    setup_path = (artifact_dir / "ducklake_setup.sql").resolve()
+    data_path.mkdir(parents=True, exist_ok=True)
+
+    catalog = json.loads(parquet_catalog_path.read_text(encoding="utf-8"))
+    parquet_root = parquet_catalog_path.parent / "parquet"
+    attach_sql = (
+        f"ATTACH {_sql_literal('ducklake:' + str(metadata_path))} "
+        f"AS {_quote_identifier(catalog_alias)} "
+        f"(DATA_PATH {_sql_literal(str(data_path))}, DATA_INLINING_ROW_LIMIT 0);"
+    )
+    http_setup = (
+        [
+            "LOAD httpfs;",
+            "SET enable_external_file_cache=false;",
+            "SET enable_http_metadata_cache=false;",
+        ]
+        if use_http_data
+        else []
+    )
+    bootstrap_statements = [
+        "-- Generated by run_benchmarks.py",
+        *http_setup,
+        "LOAD ducklake;",
+        attach_sql,
+    ]
+    setup_statements = [
+        "-- Generated by run_benchmarks.py",
+        *http_setup,
+        "LOAD ducklake;",
+        attach_sql,
+    ]
+    for table_name in sorted(catalog):
+        if table_name not in table_schemas:
+            raise ValueError(f"missing schema for exported table {table_name}")
+        column_sql = ", ".join(
+            f"{_quote_identifier(column_name)} {column_type}"
+            for column_name, column_type in table_schemas[table_name]
+        )
+        bootstrap_statements.append(
+            f"CREATE TABLE {_quote_identifier(catalog_alias)}.{_quote_identifier(table_name)} "
+            f"({column_sql});"
+        )
+        data_files = [
+            (
+                f"{DUCKLAKE_HTTP_BASE_URL_PLACEHOLDER}/{relative_path}"
+                if use_http_data
+                else str((parquet_root / relative_path).resolve())
+            )
+            for relative_path in catalog[table_name]
+        ]
+        file_list_sql = ", ".join(_sql_literal(path) for path in data_files)
+        bootstrap_statements.append(
+            f"CALL ducklake_add_data_files({_sql_literal(catalog_alias)}, "
+            f"{_sql_literal(table_name)}, [{file_list_sql}]);"
+        )
+        setup_statements.append(
+            f"CREATE OR REPLACE TEMP VIEW {_quote_identifier(table_name)} AS "
+            f"SELECT * FROM {_quote_identifier(catalog_alias)}.{_quote_identifier(table_name)};"
+        )
+    bootstrap_path.write_text("\n".join(bootstrap_statements) + "\n", encoding="utf-8")
+    setup_path.write_text("\n".join(setup_statements) + "\n", encoding="utf-8")
+    return (
+        runtime_db_path,
+        bootstrap_path,
+        setup_path,
+        metadata_path,
+        data_path,
+        catalog_alias,
+    )
+
+
+def export_remote_parquet_catalog(source_db_path: Path, artifact_dir: Path) -> Path:
+    return export_parquet_catalog(
+        source_db_path,
+        artifact_dir,
+        root_dir_name="remote_parquet",
+        catalog_filename="remote_parquet_catalog.json",
+    )
 
 
 def prepare_external_workload(
@@ -302,9 +460,47 @@ def prepare_external_workload(
         setup_sql_path.write_text("\n".join(spec.setup_sql) + "\n", encoding="utf-8")
         setup_sql_paths = (setup_sql_path,)
     remote_parquet_catalog_path: Path | None = None
+    parquet_catalog_path: Path | None = None
+    ducklake_bootstrap_sql_path: Path | None = None
+    ducklake_metadata_path: Path | None = None
+    ducklake_data_path: Path | None = None
+    ducklake_catalog_alias: str | None = None
     runtime_db_path = db_path
     storage_mode = "duckdb"
-    if layout.remote_http_parquet_latency_ms is not None:
+    if spec.storage_kind == "ducklake":
+        if layout.remote_http_parquet_latency_ms is not None:
+            raise ValueError(
+                "external workload cannot combine source.json remote_http_parquet "
+                "with config storage.kind='ducklake'"
+            )
+        table_schemas = read_table_schemas(db_path)
+        parquet_catalog_path = export_parquet_catalog(
+            db_path,
+            artifact_dir,
+            root_dir_name="parquet",
+            catalog_filename="parquet_catalog.json",
+            file_size_mb=spec.parquet_file_size_mb,
+            exclude_empty_files=True,
+            # A single export thread preserves the source table order, which is
+            # part of the physical-layout experiment for TPC-H Skew.
+            export_threads=1,
+        )
+        (
+            runtime_db_path,
+            ducklake_bootstrap_sql_path,
+            ducklake_setup_sql_path,
+            ducklake_metadata_path,
+            ducklake_data_path,
+            ducklake_catalog_alias,
+        ) = write_ducklake_sql(
+            artifact_dir,
+            parquet_catalog_path,
+            table_schemas,
+            use_http_data=spec.ducklake_http_latency_ms is not None,
+        )
+        setup_sql_paths = (ducklake_setup_sql_path,) + setup_sql_paths
+        storage_mode = "ducklake"
+    elif layout.remote_http_parquet_latency_ms is not None:
         remote_parquet_catalog_path = export_remote_parquet_catalog(db_path, artifact_dir)
         runtime_db_path = (artifact_dir / "benchmark.duckdb").resolve()
         if runtime_db_path.exists():
@@ -325,6 +521,12 @@ def prepare_external_workload(
         storage_mode=storage_mode,
         remote_http_parquet_latency_ms=layout.remote_http_parquet_latency_ms,
         remote_parquet_catalog_path=remote_parquet_catalog_path,
+        parquet_catalog_path=parquet_catalog_path,
+        ducklake_bootstrap_sql_path=ducklake_bootstrap_sql_path,
+        ducklake_metadata_path=ducklake_metadata_path,
+        ducklake_data_path=ducklake_data_path,
+        ducklake_catalog_alias=ducklake_catalog_alias,
+        ducklake_http_latency_ms=spec.ducklake_http_latency_ms,
         prepared_at=utc_now_iso(),
     )
     write_manifest(artifact_dir / "manifest.json", manifest)

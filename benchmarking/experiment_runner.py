@@ -5,7 +5,14 @@ from pathlib import Path
 
 from benchmarking.artifact_layout import ExperimentPaths, prepare_experiment_root
 from benchmarking.duckdb_build import DuckDBCheckoutOptions, ResolvedSystem, resolve_system
-from benchmarking.duckdb_runner import benchmark_workload, summarize_results, write_summary
+from benchmarking.duckdb_runner import (
+    benchmark_workload,
+    bootstrap_ducklake_workload,
+    start_remote_http_service,
+    stop_remote_http_service,
+    summarize_results,
+    write_summary,
+)
 from benchmarking.experiment_config import ExperimentConfig
 from benchmarking.manifests import PreparedWorkload
 from benchmarking.workloads import (
@@ -54,26 +61,69 @@ def run_experiment_with_options(
         overwrite=config.overwrite_output,
     )
     copy_config(config.config_path, paths.copied_config_path)
-    resolved_systems = [
-        resolve_system(system_config, paths.system_dir(system_config.name), checkout_options)
-        for system_config in config.systems
-    ]
+    def selected_workload_configs(system_config):
+        if system_config.workload_names is None:
+            return config.workloads
+        selected = set(system_config.workload_names)
+        return tuple(workload for workload in config.workloads if workload.name in selected)
+
+    resolved_systems = []
+    for system_config in config.systems:
+        selected = selected_workload_configs(system_config)
+        required_extensions: set[str] = set()
+        if any(getattr(workload, "storage_kind", "duckdb") == "ducklake" for workload in selected):
+            required_extensions.add("ducklake")
+        if any(
+            getattr(workload, "storage_kind", "duckdb") == "ducklake"
+            and getattr(workload, "ducklake_http_latency_ms", None) is not None
+            for workload in selected
+        ):
+            required_extensions.add("httpfs")
+        resolved_systems.append(
+            resolve_system(
+                system_config,
+                paths.system_dir(system_config.name),
+                checkout_options,
+                frozenset(required_extensions),
+            )
+        )
     workloads = prepare_workloads(
         config,
         paths,
     )
-    for system_config, resolved_system in zip(config.systems, resolved_systems):
+    remote_services = {}
+    try:
         for workload in workloads:
-            benchmark_workload(
-                config.experiment_name,
+            remote_services[workload.name] = start_remote_http_service(workload)
+        for workload in workloads:
+            bootstrap_ducklake_workload(
+                resolved_systems[0].binary_path,
                 workload,
-                resolved_system,
-                system_config.variants,
-                config.benchmark,
-                paths.results_db,
-                paths.sql_dir,
-                paths.profiles_dir,
+                remote_services[workload.name],
             )
+        for system_config, resolved_system in zip(config.systems, resolved_systems):
+            selected_names = (
+                None
+                if system_config.workload_names is None
+                else set(system_config.workload_names)
+            )
+            for workload in workloads:
+                if selected_names is not None and workload.name not in selected_names:
+                    continue
+                benchmark_workload(
+                    config.experiment_name,
+                    workload,
+                    resolved_system,
+                    system_config.variants,
+                    config.benchmark,
+                    paths.results_db,
+                    paths.sql_dir,
+                    paths.profiles_dir,
+                    remote_services[workload.name],
+                )
+    finally:
+        for remote_service in remote_services.values():
+            stop_remote_http_service(remote_service)
     summary = summarize_results(paths.results_db, config.experiment_name)
     write_summary(paths.summary_json, summary)
     return paths

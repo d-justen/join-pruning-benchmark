@@ -9,6 +9,8 @@ from tempfile import TemporaryDirectory
 from paper.figures.filter_benchmark import (
     BenchmarkGenerationConfig,
     build_filter_benchmark_artifacts,
+    build_build_time_series,
+    build_false_positive_rate_series,
     build_throughput_series,
     derive_actual_negatives_by_cluster,
     load_filter_benchmark_rows,
@@ -94,6 +96,12 @@ class FilterBenchmarkTest(unittest.TestCase):
 
             rows = load_filter_benchmark_rows(csv_path)
             series = build_throughput_series(rows, aggregate="median")
+            build_time_series = build_build_time_series(rows, aggregate="median")
+            false_positive_rate_series = build_false_positive_rate_series(
+                rows,
+                actual_negatives_by_cluster={2: 900, 102: 880},
+                aggregate="median",
+            )
             summary = summarize_filter_benchmark(
                 rows,
                 actual_negatives_by_cluster={2: 900, 102: 880},
@@ -101,6 +109,10 @@ class FilterBenchmarkTest(unittest.TestCase):
 
             self.assertEqual(series["bloom"], [(2, 120.0)])
             self.assertEqual(series["prf"], [(2, 200.0), (102, 220.0)])
+            self.assertEqual(build_time_series["bloom"], [(2, 6.0)])
+            self.assertEqual(build_time_series["prf"], [(2, 8.0), (102, 12.0)])
+            self.assertEqual(false_positive_rate_series["bloom"], [(2, 20 / 900)])
+            self.assertEqual(false_positive_rate_series["prf"], [(2, 0.0), (102, 5 / 880)])
             bloom_summary = next(system for system in summary["systems"] if system["filter"] == "bloom")
             self.assertAlmostEqual(bloom_summary["build_time_ms"]["min"], 5.0)
             self.assertAlmostEqual(bloom_summary["build_time_ms"]["max"], 7.0)
@@ -169,6 +181,8 @@ class FilterBenchmarkTest(unittest.TestCase):
             self.assertTrue(json_path.exists())
             loaded_payload = json.loads(json_path.read_text(encoding="utf-8"))
             self.assertEqual(loaded_payload["generation_config"]["probe_count"], 20)
+            self.assertEqual(loaded_payload["verification"]["build_time_aggregate"], "median")
+            self.assertEqual(loaded_payload["verification"]["false_positive_rate_aggregate"], "median")
 
 
 if __name__ == "__main__":

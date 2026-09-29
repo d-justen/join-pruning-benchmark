@@ -1,0 +1,189 @@
+# name: test/sql/optimizer/test_rpt_prefix_range_filter.test
+# description: RPT+ Prefix Range Filter selection and correctness
+# group: [optimizer]
+
+query T
+SELECT current_setting('rpt_filter')
+----
+cascade
+
+statement error
+SET rpt_filter = 'invalid'
+----
+rpt_filter must be one of: cascade, prf, none
+
+statement ok
+CREATE TABLE prf_build(id INTEGER, payload INTEGER)
+
+statement ok
+INSERT INTO prf_build VALUES (-17, 1), (0, 2), (19, 3), (19, 4), (NULL, 5)
+
+statement ok
+CREATE TABLE prf_probe AS SELECT i::INTEGER id FROM range(-100, 101) t(i)
+
+statement ok
+CREATE TABLE prf_probe_large AS SELECT i::INTEGER id FROM range(-1000, 1001) t(i)
+
+statement ok
+SET rpt_filter = 'prf'
+
+# Exercise signed values, a domain crossing zero, duplicates, and NULLs.
+query I
+SELECT count(*)
+FROM prf_build b
+JOIN prf_probe p ON b.id = p.id
+JOIN prf_probe_large l ON p.id = l.id
+WHERE b.payload <= 5
+----
+4
+
+# An empty creator must produce an initialized reject-all filter.
+query I
+SELECT count(*)
+FROM prf_build b
+JOIN prf_probe p ON b.id = p.id
+JOIN prf_probe_large l ON p.id = l.id
+WHERE b.payload < 0
+----
+0
+
+# An all-NULL creator has rows but no numeric bounds and must also reject all probes.
+query I
+SELECT count(*)
+FROM prf_build b
+JOIN prf_probe p ON b.id = p.id
+JOIN prf_probe_large l ON p.id = l.id
+WHERE b.payload = 5
+----
+0
+
+# More than four widely separated runs force the bitmap compression path.
+statement ok
+CREATE TABLE prf_sparse_build(id INTEGER, payload INTEGER)
+
+statement ok
+INSERT INTO prf_sparse_build VALUES
+    (-2147483648, 1), (-2000000000, 1), (-123456789, 1), (0, 1),
+    (123456789, 1), (2000000000, 1), (2147483647, 1)
+
+statement ok
+CREATE TABLE prf_sparse_probe AS SELECT unnest([
+    -2147483648, -2147483647, -2000000000, -1999999999, -123456789,
+    -123456788, 0, 1, 123456789, 123456790, 2000000000, 2000000001,
+    2147483646, 2147483647
+])::INTEGER id
+
+statement ok
+CREATE TABLE prf_sparse_probe_2 AS SELECT * FROM prf_sparse_probe
+
+query I
+SELECT count(*)
+FROM prf_sparse_build b
+JOIN prf_sparse_probe p ON b.id = p.id
+JOIN prf_sparse_probe_2 p2 ON p.id = p2.id
+WHERE b.payload > 0
+----
+7
+
+statement ok
+CREATE TABLE prf_unsigned(id UBIGINT, payload INTEGER)
+
+statement ok
+INSERT INTO prf_unsigned VALUES (0, 1), (42, 2), (18446744073709551615, 3)
+
+statement ok
+CREATE TABLE prf_unsigned_probe AS
+SELECT unnest([0::UBIGINT, 1::UBIGINT, 42::UBIGINT, 1000000000000::UBIGINT, 18446744073709551615::UBIGINT]) id
+
+query I
+SELECT count(*)
+FROM prf_unsigned b
+JOIN prf_unsigned_probe p ON b.id = p.id
+WHERE b.payload > 0
+----
+3
+
+# VARCHAR is deliberately unsupported by the first PRF port and falls back to Cascade.
+statement ok
+CREATE TABLE prf_string_build(id VARCHAR, payload INTEGER)
+
+statement ok
+INSERT INTO prf_string_build VALUES ('a', 1), ('c', 2)
+
+statement ok
+CREATE TABLE prf_string_probe AS SELECT * FROM (VALUES ('a'), ('b'), ('c'), ('d')) t(id)
+
+query I
+SELECT count(*)
+FROM prf_string_build b
+JOIN prf_string_probe p ON b.id = p.id
+WHERE b.payload > 0
+----
+2
+
+# All three benchmark modes must preserve results.
+statement ok
+SET rpt_filter = 'cascade'
+
+query I
+SELECT count(*)
+FROM prf_build b
+JOIN prf_probe p ON b.id = p.id
+JOIN prf_probe_large l ON p.id = l.id
+WHERE b.payload <= 5
+----
+4
+
+statement ok
+SET rpt_filter = 'none'
+
+query I
+SELECT count(*)
+FROM prf_build b
+JOIN prf_probe p ON b.id = p.id
+JOIN prf_probe_large l ON p.id = l.id
+WHERE b.payload <= 5
+----
+4
+
+# Exercise the actual parallel finalize event, including nullable and duplicate keys.
+statement ok
+SET rpt_filter = 'prf'
+
+statement ok
+SET threads = 4
+
+statement ok
+PRAGMA verify_parallelism
+
+statement ok
+CREATE TABLE prf_parallel_a AS SELECT (i % 50000)::INTEGER id, i % 7 payload FROM range(200000) t(i)
+
+statement ok
+INSERT INTO prf_parallel_a VALUES (NULL, 0), (NULL, 0)
+
+statement ok
+CREATE TABLE prf_parallel_b AS SELECT i::INTEGER id FROM range(100000) t(i)
+
+statement ok
+CREATE TABLE prf_parallel_c AS SELECT i::INTEGER id FROM range(150000) t(i)
+
+query I
+SELECT count(*) FROM prf_parallel_a a JOIN prf_parallel_b b USING(id) JOIN prf_parallel_c c USING(id)
+WHERE a.payload = 0
+----
+28572
+
+statement ok
+PRAGMA disable_verify_parallelism
+
+statement ok
+RESET threads
+
+statement ok
+RESET rpt_filter
+
+query T
+SELECT current_setting('rpt_filter')
+----
+cascade

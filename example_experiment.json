@@ -32,28 +32,58 @@
       "name": "join-pruning-workload",
       "kind": "cross_product",
       "params": {
-        "build_sizes": [
-          100000,
-          10000000
-        ],
-        "selectivities": [
-          0.005,
-          0.05
-        ],
-        "predicate_types": [
-          "range",
-          "shoulder",
-          "seasonal",
-          "scattered"
-        ],
-        "probe_clusterings": [
-          "ordered",
-          "uniform"
-        ],
-        "fact_rows": 100000000,
-        "dummy_string_cols": 2,
-        "dummy_string_len": 8,
-        "seed": 7
+        "fixed": {
+          "fact_rows": 100000000,
+          "dimension_cardinality": 100000,
+          "key_domain_size": "dimension_cardinality",
+          "selectivity": 0.005,
+          "join_count": 1,
+          "build_key_multiplicity": 1,
+          "probe_layout": "uniform",
+          "row_group_size": 122880,
+          "dummy_string_cols": 2,
+          "dummy_string_len": 8,
+          "seed": 7
+        },
+        "sweep": {
+          "kind": "dimension_cardinality",
+          "values": [100000, 10000000]
+        },
+        "query_types": [
+          {"kind": "range", "probe_layouts": ["ordered", "uniform"]},
+          {"kind": "shoulder", "probe_layouts": ["ordered", "uniform"]},
+          {"kind": "seasonal", "cluster_count": 10, "probe_layouts": ["ordered", "uniform"]},
+          {"kind": "scattered", "probe_layouts": ["ordered", "uniform"]}
+        ]
+      }
+    },
+    {
+      "name": "join-pruning-selectivity",
+      "kind": "cross_product",
+      "params": {
+        "fixed": {
+          "fact_rows": 100000000,
+          "dimension_cardinality": 10000000,
+          "key_domain_size": "dimension_cardinality",
+          "selectivity": 0.005,
+          "join_count": 1,
+          "build_key_multiplicity": 1,
+          "probe_layout": "uniform",
+          "row_group_size": 122880,
+          "dummy_string_cols": 2,
+          "dummy_string_len": 8,
+          "seed": 7
+        },
+        "sweep": {
+          "kind": "selectivity",
+          "values": [0.005, 0.05]
+        },
+        "query_types": [
+          {"kind": "range", "probe_layouts": ["ordered", "uniform"]},
+          {"kind": "shoulder", "probe_layouts": ["ordered", "uniform"]},
+          {"kind": "seasonal", "cluster_count": 10, "probe_layouts": ["ordered", "uniform"]},
+          {"kind": "scattered", "probe_layouts": ["ordered", "uniform"]}
+        ]
       }
     },
     {

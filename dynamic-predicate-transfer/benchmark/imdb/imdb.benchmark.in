@@ -1,0 +1,25 @@
+# name: ${FILE_PATH}
+# description: ${DESCRIPTION}
+# group: [imdb]
+
+name Q${QUERY_NUMBER_PADDED}
+group imdb
+
+argument rpt_filter cascade
+argument rpt_prf_scan_pushdown true
+
+init
+SET rpt_filter = '${rpt_filter}';
+SET rpt_prf_scan_pushdown = ${rpt_prf_scan_pushdown};
+
+require httpfs load_only
+
+require parquet
+
+cache imdb.duckdb
+
+load benchmark/imdb/init/load.sql
+
+run benchmark/imdb_plan_cost/queries/${QUERY_NUMBER_PADDED}.sql
+
+result benchmark/imdb/answers/${QUERY_NUMBER_PADDED}.csv

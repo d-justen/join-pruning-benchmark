@@ -6,6 +6,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+DUCKLAKE_HTTP_BASE_URL_PLACEHOLDER = "__DUCKLAKE_HTTP_BASE_URL__"
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -24,9 +27,19 @@ class PreparedWorkload:
     source_db_path: Path | None = None
     db_handling: str | None = None
     setup_sql_paths: tuple[Path, ...] = ()
+    post_variant_setup_sql: tuple[str, ...] = ()
     storage_mode: str = "duckdb"
     remote_http_parquet_latency_ms: int | None = None
     remote_parquet_catalog_path: Path | None = None
+    parquet_catalog_path: Path | None = None
+    ducklake_bootstrap_sql_path: Path | None = None
+    ducklake_metadata_path: Path | None = None
+    ducklake_data_path: Path | None = None
+    ducklake_catalog_alias: str | None = None
+    ducklake_http_latency_ms: int | None = None
+    definition_path: Path | None = None
+    cases_path: Path | None = None
+    query_catalog_path: Path | None = None
 
 
 def manifest_to_dict(manifest: PreparedWorkload) -> dict:
@@ -51,6 +64,17 @@ def manifest_to_dict(manifest: PreparedWorkload) -> dict:
         if manifest.remote_parquet_catalog_path is not None
         else None
     )
+    for field_name in (
+        "parquet_catalog_path",
+        "ducklake_bootstrap_sql_path",
+        "ducklake_metadata_path",
+        "ducklake_data_path",
+        "definition_path",
+        "cases_path",
+        "query_catalog_path",
+    ):
+        field_value = getattr(manifest, field_name)
+        data[field_name] = str(field_value) if field_value is not None else None
     return data
 
 
@@ -83,8 +107,20 @@ def load_manifest(path: Path) -> PreparedWorkload:
         init_sql_paths=tuple(Path(item).resolve() for item in raw.get("init_sql_paths", [])),
         db_handling=raw.get("db_handling"),
         setup_sql_paths=tuple(Path(item).resolve() for item in raw.get("setup_sql_paths", [])),
+        post_variant_setup_sql=tuple(raw.get("post_variant_setup_sql", [])),
         storage_mode=raw.get("storage_mode", "duckdb"),
         remote_http_parquet_latency_ms=raw.get("remote_http_parquet_latency_ms"),
         remote_parquet_catalog_path=_resolve_optional_path(raw.get("remote_parquet_catalog_path")),
+        parquet_catalog_path=_resolve_optional_path(raw.get("parquet_catalog_path")),
+        ducklake_bootstrap_sql_path=_resolve_optional_path(
+            raw.get("ducklake_bootstrap_sql_path")
+        ),
+        ducklake_metadata_path=_resolve_optional_path(raw.get("ducklake_metadata_path")),
+        ducklake_data_path=_resolve_optional_path(raw.get("ducklake_data_path")),
+        ducklake_catalog_alias=raw.get("ducklake_catalog_alias"),
+        ducklake_http_latency_ms=raw.get("ducklake_http_latency_ms"),
+        definition_path=_resolve_optional_path(raw.get("definition_path")),
+        cases_path=_resolve_optional_path(raw.get("cases_path")),
+        query_catalog_path=_resolve_optional_path(raw.get("query_catalog_path")),
         prepared_at=raw["prepared_at"],
     )
