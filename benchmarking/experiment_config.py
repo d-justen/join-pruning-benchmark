@@ -367,8 +367,11 @@ def _parse_cross_product_definition(params: dict) -> CrossProductExperimentDefin
                 "build_key_multiplicity currently requires "
                 "cardinality_mode='fixed_dimension_cardinality'"
             )
+    elif sweep_kind == "key_domain_size":
+        if cardinality_mode not in (None, "fixed_selected_build_and_probe"):
+            raise ValueError("unsupported key_domain_size cardinality_mode")
     elif cardinality_mode is not None:
-        raise ValueError("sweep.cardinality_mode is only valid for build_key_multiplicity")
+        raise ValueError("sweep.cardinality_mode is only valid for multiplicity or density")
 
     key_domain_size_raw = fixed_raw.get("key_domain_size")
     if key_domain_size_raw in (None, "dimension_cardinality"):

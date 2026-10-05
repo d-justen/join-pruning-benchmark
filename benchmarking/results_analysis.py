@@ -11,6 +11,9 @@ import duckdb
 from benchmarking.duckdb_build import DuckDBCheckoutOptions, resolve_existing_system
 from benchmarking.duckdb_runner import _extract_profile_metrics
 from benchmarking.experiment_config import ExperimentConfig, VariantConfig, load_experiment_config
+from benchmarking.filter_profiles import (
+    ensure_filter_profile_columns, extract_join_filter_metrics, store_join_filter_metrics,
+)
 from benchmarking.manifests import PreparedWorkload, load_manifest
 from benchmarking.query_inventory import load_queries
 from benchmarking.svg_charts import PALETTE, grouped_bar_chart, line_chart, svg_document, text
@@ -83,6 +86,7 @@ def _ensure_profile_runs_table(results_db: Path) -> None:
         con.execute("ALTER TABLE profile_runs ADD COLUMN IF NOT EXISTS table_scan_file_count BIGINT;")
         con.execute("ALTER TABLE profile_runs ADD COLUMN IF NOT EXISTS query_parameters VARCHAR;")
         con.execute("ALTER TABLE timing_runs ADD COLUMN IF NOT EXISTS query_parameters VARCHAR;")
+        ensure_filter_profile_columns(con)
     finally:
         con.close()
 
@@ -117,6 +121,7 @@ def _profile_sql(
     statements.extend(workload_setup_sql)
     statements.extend(variant.setup_sql)
     statements.extend(post_variant_setup_sql)
+    statements.append("SET profiling_mode='standard';")
     statements.append("SET enable_profiling='json';")
     escaped_profile_path = str(profile_path).replace("'", "''")
     statements.append(f"SET profiling_output='{escaped_profile_path}';")
@@ -262,6 +267,7 @@ def backfill_profiles(
                     metrics.table_scan_file_count,
                 ],
             )
+            store_join_filter_metrics(con, run_id, str(profile_path), extract_join_filter_metrics(profile_data))
             inserted += 1
         return inserted
     finally:
@@ -570,6 +576,28 @@ def _filter_occurrence_rows(
     return [totals[variant_label] for variant_label in sorted(totals)]
 
 
+def _filter_phase_rows(results_db: Path, experiment_name: str, workload_name: str, system_name: str) -> list[dict]:
+    """Report one complete profile per query/variant; never mix phase maxima."""
+    con = duckdb.connect(str(results_db))
+    try:
+        rows = con.execute("""
+            SELECT run_id, variant_label, query_name, profile_path FROM profile_runs
+            WHERE experiment_name = ? AND workload_name = ? AND system_name = ?
+            QUALIFY row_number() OVER (
+                PARTITION BY variant_label, query_name ORDER BY profiled_at DESC, run_id DESC
+            ) = 1
+            ORDER BY variant_label, query_name
+        """, [experiment_name, workload_name, system_name]).fetchall()
+        result = []
+        for run_id, variant, query, path in rows:
+            metrics = extract_join_filter_metrics(json.loads(Path(path).read_text(encoding="utf-8")))
+            store_join_filter_metrics(con, run_id, path, metrics)
+            result.append({"variant_label": variant, "query_name": query, **metrics.to_dict()})
+        return result
+    finally:
+        con.close()
+
+
 def _single_join_chart(workload_name: str, systems: list[str], rows_by_system: dict[str, list[dict]]) -> str:
     width = 1200
     per_system_height = 500
@@ -784,6 +812,9 @@ def analyze_experiment(
                     "fewer_bytes_read": sum(1 for row in comparison_rows if (row["bytes_read_ratio"] or 0) > 1),
                     "more_bytes_read": sum(1 for row in comparison_rows if (row["bytes_read_ratio"] or 0) < 1),
                     "filter_occurrences": filter_occurrences,
+                    "filter_phases": _filter_phase_rows(
+                        results_db, config.experiment_name, workload_name, system_name,
+                    ),
                 }
             )
         chart_path = analysis_paths.charts_dir / f"{workload_name}.svg"

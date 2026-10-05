@@ -10,8 +10,48 @@
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
+#include "duckdb/storage/statistics/base_statistics.hpp"
 
 namespace duckdb {
+
+// Match join-filter pushdown: source cardinality / source distinct count,
+// applied later to the actual retained rows. Derived expressions have no estimate.
+static double RPTBuildKeyMultiplicity(LogicalOperator &node, ColumnBinding binding, ClientContext &context) {
+	auto current = &node;
+	while (current->type == LogicalOperatorType::LOGICAL_FILTER ||
+	       current->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		if (current->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+			auto &projection = current->Cast<LogicalProjection>();
+			if (binding.table_index != projection.table_index ||
+			    binding.column_index >= projection.expressions.size() ||
+			    projection.expressions[binding.column_index]->GetExpressionClass() !=
+			        ExpressionClass::BOUND_COLUMN_REF) {
+				return 1.0;
+			}
+			binding = projection.expressions[binding.column_index]->Cast<BoundColumnRefExpression>().binding;
+		}
+		current = current->children[0].get();
+	}
+	if (current->type != LogicalOperatorType::LOGICAL_GET) {
+		return 1.0;
+	}
+	auto &get = current->Cast<LogicalGet>();
+	auto table = get.GetTable();
+	if (!table || !table->IsDuckTable() || binding.table_index != get.table_index ||
+	    binding.column_index >= get.GetColumnIds().size() || !get.function.cardinality || !get.function.statistics) {
+		return 1.0;
+	}
+	auto &column = get.GetColumnIds()[binding.column_index];
+	if (column.IsVirtualColumn() || column.HasChildren()) {
+		return 1.0;
+	}
+	auto statistics = get.function.statistics(context, get.bind_data.get(), column.GetPrimaryIndex());
+	auto cardinality = get.function.cardinality(context, get.bind_data.get());
+	if (!statistics || !statistics->GetDistinctCount() || !cardinality || !cardinality->has_estimated_cardinality) {
+		return 1.0;
+	}
+	return MaxValue(1.0, double(cardinality->estimated_cardinality) / double(statistics->GetDistinctCount()));
+}
 
 unique_ptr<LogicalOperator> PredicateTransferOptimizer::PreOptimize(unique_ptr<LogicalOperator> plan) {
 	graph_manager.Build(*plan);
@@ -198,6 +238,11 @@ void PredicateTransferOptimizer::GetAllBFsToCreate(idx_t cur_node_id,
 			}
 		}
 		if (!bf_plan->build.empty()) {
+			bf_plan->reverse_transfer = reverse;
+			if (bf_plan->build.size() == 1) {
+				bf_plan->build_key_multiplicity =
+				    RPTBuildKeyMultiplicity(*base_table, bf_plan->build[0], graph_manager.context);
+			}
 			bfs_to_create_plan.emplace_back(std::move(bf_plan));
 		} else {
 			throw InternalException("No built column found!");

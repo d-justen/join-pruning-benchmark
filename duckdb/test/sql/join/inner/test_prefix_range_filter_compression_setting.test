@@ -1,0 +1,244 @@
+# name: test/sql/join/inner/test_prefix_range_filter_compression_setting.test
+# description: Test disabling prefix range filter compression and fallback generation
+# group: [inner]
+
+statement ok
+SET disabled_optimizers = 'join_order,build_side_probe_side';
+
+statement ok
+CREATE TABLE probe AS
+SELECT (i * 1000000000)::BIGINT AS k, (i % 7)::INTEGER AS g
+FROM range(0, 100000) t(i);
+
+statement ok
+CREATE TABLE build AS
+SELECT (i * 2000000000)::BIGINT AS k, (i % 7)::INTEGER AS g
+FROM range(0, 30000) t(i);
+
+# Compression performs post-build analysis and registers a deferred Bloom fallback.
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM probe p
+JOIN build b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<REGEX>:.*IN PRF\(k\).*
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM probe p
+JOIN build b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<REGEX>:.*IN BF\(k\).*
+
+query I
+SELECT count(*)
+FROM probe p
+JOIN build b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+17144
+
+# The sparse range exceeds the PRF's FPR threshold. Bloom must be filled from
+# the original build hashes before hash-table finalization overwrites them.
+statement ok
+SET enable_perfect_hash_join_filter_pushdown=false
+
+statement ok
+SET enable_join_min_max_filter_pushdown=false
+
+statement ok
+CREATE TABLE sparse_probe AS
+SELECT (i * 1000000000)::BIGINT AS k FROM range(0, 200000) t(i)
+
+statement ok
+CREATE TABLE sparse_build AS
+SELECT (i * 2000000000)::BIGINT AS k FROM range(0, 100000) t(i)
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM sparse_probe p JOIN sparse_build b ON p.k = b.k
+----
+analyzed_plan	<REGEX>:.*"bloom_fallback_selected": 1.*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM sparse_probe p JOIN sparse_build b ON p.k = b.k
+----
+analyzed_plan	<REGEX>:.*"final_prf_enabled": 0.*
+
+query I
+SELECT count(*) FROM sparse_probe p JOIN sparse_build b ON p.k = b.k
+----
+100000
+
+statement ok
+CREATE TABLE sparse_build_second AS
+SELECT (i * 2000000000)::BIGINT AS k FROM range(0, 100000) t(i)
+
+query I
+SELECT count(*)
+FROM sparse_probe p
+JOIN sparse_build b ON p.k = b.k
+JOIN sparse_build_second c ON p.k = c.k
+----
+100000
+
+statement ok
+SET enable_join_bloom_filter_pushdown=false
+
+query I
+SELECT count(*) FROM sparse_probe p JOIN sparse_build b ON p.k = b.k
+----
+100000
+
+statement ok
+RESET enable_join_bloom_filter_pushdown
+
+statement ok
+SET enable_prefix_range_filter_compression=false
+
+# This sparse bitmap stays below the FPR threshold without compression.
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM probe p
+JOIN build b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<REGEX>:.*IN PRF\(k\).*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*)
+FROM probe p
+JOIN build b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<REGEX>:.*"bloom_fallback_selected": 0.*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*)
+FROM probe p
+JOIN build b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<REGEX>:.*"final_prf_enabled": 1.*
+
+query I
+SELECT count(*)
+FROM probe p
+JOIN build b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+17144
+
+# A higher FPR rejects the uncompressed PRF and enables the deferred Bloom filter.
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM sparse_probe p JOIN sparse_build b ON p.k=b.k
+----
+analyzed_plan	<REGEX>:.*"bloom_fallback_selected": 1.*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM sparse_probe p JOIN sparse_build b ON p.k=b.k
+----
+analyzed_plan	<REGEX>:.*"final_prf_enabled": 0.*
+
+query I
+SELECT count(*) FROM sparse_probe p JOIN sparse_build b ON p.k=b.k
+----
+100000
+
+# Contiguous key runs have negligible bitmap FPR even though the domain requires a shift.
+statement ok
+CREATE TABLE clustered_build AS
+SELECT i::INTEGER k FROM range(50000) t(i)
+UNION ALL
+SELECT (i + 66500000)::INTEGER k FROM range(50000) t(i)
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM clustered_build p JOIN clustered_build b ON p.k=b.k
+----
+analyzed_plan	<REGEX>:.*"final_prf_enabled": 1.*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM clustered_build p JOIN clustered_build b ON p.k=b.k
+----
+analyzed_plan	<REGEX>:.*"bloom_fallback_selected": 0.*
+
+query I
+SELECT count(*) FROM clustered_build p JOIN clustered_build b ON p.k=b.k
+----
+100000
+
+# With Bloom disabled, analysis still rejects a high-FPR PRF and leaves the join correct.
+statement ok
+SET enable_join_bloom_filter_pushdown=false
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM sparse_probe p JOIN sparse_build b ON p.k=b.k
+----
+analyzed_plan	<REGEX>:.*"final_prf_enabled": 0.*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM sparse_probe p JOIN sparse_build b ON p.k=b.k
+----
+analyzed_plan	<REGEX>:.*"bloom_fallback_selected": 0.*
+
+query I
+SELECT count(*) FROM sparse_probe p JOIN sparse_build b ON p.k=b.k
+----
+100000
+
+statement ok
+RESET enable_join_bloom_filter_pushdown
+
+# A wide exact bitmap (shift zero) needs no analysis when compression is disabled.
+statement ok
+CREATE TABLE exact_build AS
+SELECT i::INTEGER k FROM range(50000) t(i)
+UNION ALL
+SELECT (i + 10000000)::INTEGER k FROM range(50000) t(i)
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM exact_build p JOIN exact_build b ON p.k=b.k
+----
+analyzed_plan	<REGEX>:.*"final_prf_enabled": 1.*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM exact_build p JOIN exact_build b ON p.k=b.k
+----
+analyzed_plan	<REGEX>:.*"bloom_fallback_selected": 0.*
+
+query I
+SELECT count(*) FROM exact_build p JOIN exact_build b ON p.k=b.k
+----
+100000
+
+statement ok
+RESET enable_prefix_range_filter_compression
+
+statement ok
+RESET enable_perfect_hash_join_filter_pushdown
+
+statement ok
+RESET enable_join_min_max_filter_pushdown

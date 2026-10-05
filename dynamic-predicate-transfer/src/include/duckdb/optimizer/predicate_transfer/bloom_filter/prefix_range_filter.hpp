@@ -7,6 +7,7 @@
 #pragma once
 
 #include "duckdb/common/allocator.hpp"
+#include "duckdb/common/insertion_order_preserving_map.hpp"
 #include "duckdb/optimizer/predicate_transfer/bloom_filter/runtime_filter.hpp"
 
 #include <array>
@@ -26,7 +27,7 @@ public:
 	static constexpr double MAX_COMPRESSION_FALSE_POSITIVE_RATE = 0.001;
 	static constexpr idx_t MAX_DIRECT_RANGES = 4;
 
-	explicit PrefixRangeFilter(LogicalType key_type_p);
+	explicit PrefixRangeFilter(LogicalType key_type_p, double estimated_multiplicity_p = 1.0);
 
 	static bool SupportedType(const LogicalType &type);
 
@@ -46,9 +47,16 @@ public:
 	unique_ptr<PrefixRangeFilter> CreateLocal(ClientContext &context) const;
 	void MergeLocal(const PrefixRangeFilter &local);
 	string GetBuildTimings() const;
+	InsertionOrderPreservingMap<string> GetDiagnostics() const;
+	bool NeedsBloomFallback() const {
+		return use_bloom;
+	}
+	void CompleteBloomFallback() {
+		bloom_ready = true;
+	}
 
 	bool IsValid() const override {
-		return finalized;
+		return finalized && (!use_bloom || bloom_ready);
 	}
 	bool RequiresBounds() const override {
 		return true;
@@ -73,6 +81,11 @@ private:
 	void AllocateBitmap(ClientContext &context, idx_t buckets);
 	void Compress(ClientContext &context);
 	void BuildLookupIndex();
+	void InitializeBloom(ClientContext &context);
+	void InsertBloomHash(hash_t hash);
+	bool LookupBloomHash(hash_t hash) const;
+	template <class T>
+	bool LookupValue(T value) const;
 	struct BitmapMetrics {
 		idx_t active = 0;
 		idx_t runs = 0;
@@ -84,6 +97,8 @@ private:
 		void Finish(idx_t buckets);
 	};
 	void ConvertToDirectRanges(const BitmapMetrics &metrics);
+	BitmapMetrics AnalyzeBitmap(ClientContext &context, const uint64_t *source, idx_t buckets,
+	                            uint64_t *destination = nullptr);
 	double FalsePositiveRate(idx_t active_buckets, idx_t candidate_shift) const;
 	bool LookupComparable(uint64_t comparable) const;
 	FilterPropagateResult LookupRange(uint64_t lower, uint64_t upper) const;
@@ -119,7 +134,10 @@ private:
 	idx_t shift = 0;
 	idx_t logical_bucket_count = 0;
 	idx_t word_count = 0;
-	idx_t base_active_bucket_count = 0;
+	idx_t positive_count_estimate = 0;
+	idx_t build_row_count = 0;
+	idx_t initial_shift = 0;
+	double estimated_multiplicity;
 	idx_t active_bucket_count = 0;
 	double false_positive_rate = 0;
 	AllocatedData bitmap_data;
@@ -133,6 +151,11 @@ private:
 	};
 	vector<HomogeneousRun> homogeneous_runs;
 	bool single_writer = false;
+	bool use_bloom = false;
+	bool bloom_ready = false;
+	AllocatedData bloom_data;
+	uint64_t *bloom = nullptr;
+	idx_t bloom_mask = 0;
 	double initialize_ms = 0, insert_ms = 0, merge_ms = 0, compress_ms = 0, index_ms = 0;
 };
 

@@ -15,6 +15,9 @@ import duckdb
 
 from benchmarking.duckdb_build import ResolvedSystem
 from benchmarking.experiment_config import BenchmarkOptions, VariantConfig
+from benchmarking.filter_profiles import (
+    ensure_filter_profile_columns, extract_join_filter_metrics, store_join_filter_metrics,
+)
 from benchmarking.manifests import (
     DUCKLAKE_HTTP_BASE_URL_PLACEHOLDER,
     PreparedWorkload,
@@ -120,6 +123,7 @@ def ensure_results_schema(results_db: Path) -> None:
         con.execute("ALTER TABLE profile_runs ADD COLUMN IF NOT EXISTS table_scan_file_count BIGINT;")
         con.execute("ALTER TABLE timing_runs ADD COLUMN IF NOT EXISTS query_parameters VARCHAR;")
         con.execute("ALTER TABLE profile_runs ADD COLUMN IF NOT EXISTS query_parameters VARCHAR;")
+        ensure_filter_profile_columns(con)
     finally:
         con.close()
 
@@ -246,6 +250,7 @@ def render_profile_execution_block(
     query_parameters_sql = sql_literal(json.dumps(query.parameters, sort_keys=True))
     variant_setup_sql = sql_literal("\n".join(variant.setup_sql))
     statements = [
+        "SET profiling_mode = 'standard';",
         "SET enable_profiling = 'json';",
         f"SET profiling_output = {sql_literal(str(profile_path))};",
         query_sql + ";",
@@ -528,6 +533,7 @@ def read_remote_http_stats(service: RemoteHttpService) -> dict:
 def populate_profile_metrics(results_db: Path, run_id: str) -> None:
     con = duckdb.connect(str(results_db))
     try:
+        ensure_filter_profile_columns(con)
         rows = con.execute(
             """
             SELECT variant_label, query_name, profile_path
@@ -539,6 +545,7 @@ def populate_profile_metrics(results_db: Path, run_id: str) -> None:
         for variant_label, query_name, profile_path in rows:
             profile_data = json.loads(Path(profile_path).read_text(encoding="utf-8"))
             metrics = _extract_profile_metrics(profile_data)
+            store_join_filter_metrics(con, run_id, profile_path, extract_join_filter_metrics(profile_data))
             con.execute(
                 """
                 UPDATE profile_runs

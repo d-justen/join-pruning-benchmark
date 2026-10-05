@@ -3,6 +3,7 @@
 #include "duckdb/parallel/base_pipeline_event.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
+#include "duckdb/parallel/task_executor.hpp"
 #include "duckdb/parallel/meta_pipeline.hpp"
 #include "duckdb/common/types/row/tuple_data_collection.hpp"
 #include "duckdb/common/types/column/partitioned_column_data.hpp"
@@ -41,7 +42,8 @@ PhysicalCreateBF::PhysicalCreateBF(vector<LogicalType> types, const vector<share
 			                                  plan->bound_cols_apply.size() == 1 && plan->return_types.size() == 1 &&
 			                                  PrefixRangeFilter::SupportedType(plan->return_types[0]);
 			if (can_use_prefix_range) {
-				unique_runtime_filters[cols_build] = make_shared_ptr<PrefixRangeFilter>(plan->return_types[0]);
+				unique_runtime_filters[cols_build] =
+				    make_shared_ptr<PrefixRangeFilter>(plan->return_types[0], plan->build_key_multiplicity);
 			} else {
 				unique_runtime_filters[cols_build] = make_shared_ptr<BloomFilter>();
 			}
@@ -382,6 +384,30 @@ static bool FinalizeSingleThreaded(const CreateBFGlobalSinkState &sink) {
 
 using PRFTaskFilters = unordered_map<RuntimeFilter *, unique_ptr<PrefixRangeFilter>>;
 
+class PRFFallbackTask : public BaseExecutorTask {
+public:
+	PRFFallbackTask(TaskExecutor &executor, CreateBFGlobalSinkState &sink_p, idx_t begin_p, idx_t end_p)
+	    : BaseExecutorTask(executor), sink(sink_p), begin(begin_p), end(end_p) {
+	}
+	void ExecuteTask() override {
+		DataChunk chunk;
+		sink.data_collection->InitializeScanChunk(chunk);
+		for (idx_t i = begin; i < end; i++) {
+			sink.data_collection->FetchChunk(i, chunk);
+			for (auto &entry : sink.op.unique_runtime_filters) {
+				if (entry.second->GetType() == RuntimeFilterType::PREFIX_RANGE &&
+				    static_cast<PrefixRangeFilter &>(*entry.second).NeedsBloomFallback()) {
+					entry.second->Insert(chunk, entry.first);
+				}
+			}
+		}
+	}
+
+private:
+	CreateBFGlobalSinkState &sink;
+	idx_t begin, end;
+};
+
 class CreateBFFinalizeTask : public ExecutorTask {
 public:
 	CreateBFFinalizeTask(shared_ptr<Event> event_p, ClientContext &context, CreateBFGlobalSinkState &sink_p,
@@ -500,6 +526,27 @@ public:
 		for (auto &pair : sink.op.unique_runtime_filters) {
 			pair.second->Finalize(sink.context);
 		}
+		bool fallback = false;
+		for (auto &pair : sink.op.unique_runtime_filters) {
+			fallback |= pair.second->GetType() == RuntimeFilterType::PREFIX_RANGE &&
+			            static_cast<PrefixRangeFilter &>(*pair.second).NeedsBloomFallback();
+		}
+		if (fallback) {
+			TaskExecutor executor(sink.context);
+			const auto chunks = sink.data_collection->ChunkCount();
+			const auto tasks = MaxValue<idx_t>(1, MinValue(sink.num_threads, (chunks + 63) / 64));
+			const auto per_task = (chunks + tasks - 1) / tasks;
+			for (idx_t task = 0; task < tasks; task++) {
+				executor.ScheduleTask(make_uniq<PRFFallbackTask>(executor, sink, task * per_task,
+				                                                 MinValue(chunks, (task + 1) * per_task)));
+			}
+			executor.WorkOnTasks();
+			for (auto &pair : sink.op.unique_runtime_filters) {
+				if (pair.second->GetType() == RuntimeFilterType::PREFIX_RANGE) {
+					static_cast<PrefixRangeFilter &>(*pair.second).CompleteBloomFallback();
+				}
+			}
+		}
 		sink.PushPrefixRangeFilters();
 	}
 
@@ -604,6 +651,15 @@ InsertionOrderPreservingMap<string> PhysicalCreateBF::ParamsToString() const {
 
 	result["Filter Mode"] = filter_mode;
 	result["Filter Number"] = std::to_string(plan_filters.size());
+	for (idx_t i = 0; i < plan_filters.size(); i++) {
+		if (plan_filters[i]->GetType() == RuntimeFilterType::PREFIX_RANGE) {
+			const auto prefix = "PRF " + std::to_string(i) + " ";
+			for (const auto &metric : static_cast<PrefixRangeFilter &>(*plan_filters[i]).GetDiagnostics()) {
+				result[prefix + metric.first] = metric.second;
+			}
+			result[prefix + "transfer_direction"] = filter_plans[i]->reverse_transfer ? "backward" : "forward";
+		}
+	}
 	idx_t filter_memory = 0;
 	for (auto &entry : unique_runtime_filters) {
 		filter_memory += entry.second->GetMemoryUsage();

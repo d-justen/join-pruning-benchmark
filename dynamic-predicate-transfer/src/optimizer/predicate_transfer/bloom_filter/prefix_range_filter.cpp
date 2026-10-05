@@ -1,6 +1,9 @@
 #include "duckdb/optimizer/predicate_transfer/bloom_filter/prefix_range_filter.hpp"
 
 #include "duckdb/common/bit_utils.hpp"
+#include "duckdb/common/types/hash.hpp"
+#include "duckdb/parallel/task_executor.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/storage/statistics/numeric_stats.hpp"
@@ -9,6 +12,9 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <functional>
+#include <iomanip>
+#include <sstream>
 #include <type_traits>
 
 namespace duckdb {
@@ -52,7 +58,8 @@ static uint64_t PackMergedPairs(uint64_t word) {
 
 } // namespace
 
-PrefixRangeFilter::PrefixRangeFilter(LogicalType key_type_p) : key_type(std::move(key_type_p)) {
+PrefixRangeFilter::PrefixRangeFilter(LogicalType key_type_p, double estimated_multiplicity_p)
+    : key_type(std::move(key_type_p)), estimated_multiplicity(estimated_multiplicity_p) {
 }
 
 bool PrefixRangeFilter::SupportedType(const LogicalType &type) {
@@ -131,7 +138,14 @@ void PrefixRangeFilter::Initialize(ClientContext &context, idx_t row_count, cons
 	bitmap_data.Reset();
 	bitmap = nullptr;
 	word_count = logical_bucket_count = direct_range_count = 0;
-	base_active_bucket_count = active_bucket_count = 0;
+	active_bucket_count = 0;
+	build_row_count = row_count;
+	positive_count_estimate = 0;
+	initial_shift = 0;
+	shift = 0;
+	use_bloom = bloom_ready = false;
+	bloom_data.Reset();
+	bloom = nullptr;
 	false_positive_rate = 0;
 	homogeneous_runs.clear();
 	initialize_ms = insert_ms = merge_ms = compress_ms = index_ms = 0;
@@ -154,6 +168,7 @@ void PrefixRangeFilter::Initialize(ClientContext &context, idx_t row_count, cons
 		shift++;
 	}
 	const auto buckets = static_cast<idx_t>((span >> shift) + 1);
+	initial_shift = shift;
 	AllocateBitmap(context, buckets);
 	initialize_ms = ElapsedMS(start);
 }
@@ -172,6 +187,10 @@ void PrefixRangeFilter::InsertVector(Vector &keys, idx_t count) {
 		if (comparable < minimum || comparable > maximum) {
 			continue;
 		}
+		if (use_bloom) {
+			InsertBloomHash(Hash<T>(values[source_idx]));
+			continue;
+		}
 		const auto bucket = static_cast<idx_t>((comparable - minimum) >> shift);
 		if (SINGLE_WRITER) {
 			bitmap[bucket / 64] |= uint64_t(1) << (bucket % 64);
@@ -183,6 +202,10 @@ void PrefixRangeFilter::InsertVector(Vector &keys, idx_t count) {
 }
 
 void PrefixRangeFilter::Insert(DataChunk &chunk, const vector<idx_t> &bound_cols_built) {
+	if (use_bloom) {
+		InsertInternal<false>(chunk, bound_cols_built);
+		return;
+	}
 	if (single_writer) {
 		const auto start = BuildClock::now();
 		InsertInternal<true>(chunk, bound_cols_built);
@@ -265,6 +288,43 @@ bool PrefixRangeFilter::LookupComparable(uint64_t comparable) const {
 	return (bitmap[bucket / 64] >> (bucket % 64)) & 1;
 }
 
+// Same 64-bit sector Bloom filter as the regular join-filter fallback. Cascade
+// remains a separate RPT variant and is not substituted for this fallback.
+static uint64_t PRFBloomMask(hash_t hash) {
+	uint64_t mask = 0;
+	for (idx_t byte = 4; byte < 8; byte++) {
+		mask |= uint64_t(1) << ((hash >> (byte * 8)) & 63);
+	}
+	return mask;
+}
+
+void PrefixRangeFilter::InitializeBloom(ClientContext &context) {
+	const auto sectors =
+	    MinValue<idx_t>(NextPowerOfTwo(MaxValue<idx_t>(512, build_row_count * 12)) >> 6, idx_t(1) << 26);
+	bloom_mask = sectors - 1;
+	bloom_data =
+	    BufferManager::GetBufferManager(context).GetBufferAllocator().Allocate(64 + sectors * sizeof(uint64_t));
+	bloom = reinterpret_cast<uint64_t *>((reinterpret_cast<uintptr_t>(bloom_data.get()) + 63) & ~uintptr_t(63));
+	std::fill_n(bloom, sectors, 0);
+}
+
+void PrefixRangeFilter::InsertBloomHash(hash_t hash) {
+	auto &slot = *reinterpret_cast<std::atomic<uint64_t> *>(&bloom[hash & bloom_mask]);
+	slot.fetch_or(PRFBloomMask(hash), std::memory_order_relaxed);
+}
+
+bool PrefixRangeFilter::LookupBloomHash(hash_t hash) const {
+	const auto mask = PRFBloomMask(hash);
+	return (bloom[hash & bloom_mask] & mask) == mask;
+}
+
+template <class T>
+bool PrefixRangeFilter::LookupValue(T value) const {
+	const auto comparable = ToComparable<T>(value);
+	return use_bloom ? (!empty && comparable >= minimum && comparable <= maximum && LookupBloomHash(Hash<T>(value)))
+	                 : LookupComparable(comparable);
+}
+
 template <class T>
 void PrefixRangeFilter::LookupVector(Vector &keys, idx_t count, vector<uint32_t> &results) const {
 	UnifiedVectorFormat data;
@@ -272,15 +332,14 @@ void PrefixRangeFilter::LookupVector(Vector &keys, idx_t count, vector<uint32_t>
 	auto values = UnifiedVectorFormat::GetData<T>(data);
 	for (idx_t row_idx = 0; row_idx < count; row_idx++) {
 		const auto source_idx = data.sel->get_index(row_idx);
-		results[row_idx] =
-		    data.validity.RowIsValid(source_idx) && LookupComparable(ToComparable<T>(values[source_idx]));
+		results[row_idx] = data.validity.RowIsValid(source_idx) && LookupValue<T>(values[source_idx]);
 	}
 }
 
 int PrefixRangeFilter::Lookup(DataChunk &chunk, vector<uint32_t> &results,
                               const vector<idx_t> &bound_cols_applied) const {
 	const auto count = chunk.size();
-	if (!finalized) {
+	if (!IsValid()) {
 		std::fill_n(results.begin(), count, 1);
 		return static_cast<int>(count);
 	}
@@ -334,7 +393,9 @@ idx_t PrefixRangeFilter::SelectLoop(UnifiedVectorFormat &data, idx_t count, Sele
 		}
 		const auto comparable = ToComparable<T>(values[source_idx]);
 		uint64_t matches = 0;
-		if (RANGE_COUNT == 0) {
+		if (use_bloom) {
+			matches = comparable >= minimum && comparable <= maximum && LookupBloomHash(Hash<T>(values[source_idx]));
+		} else if (RANGE_COUNT == 0) {
 			const auto offset = comparable - minimum;
 			const uint64_t in_range = offset <= span;
 			const auto bucket = offset >> shift;
@@ -372,7 +433,7 @@ idx_t PrefixRangeFilter::SelectVectorMode(UnifiedVectorFormat &data, bool flat, 
 template <class T>
 idx_t PrefixRangeFilter::SelectVector(Vector &keys, idx_t count, SelectionVector &sel) const {
 	if (keys.GetVectorType() == VectorType::CONSTANT_VECTOR) {
-		if (ConstantVector::IsNull(keys) || !LookupComparable(ToComparable<T>(*ConstantVector::GetData<T>(keys)))) {
+		if (ConstantVector::IsNull(keys) || !LookupValue<T>(*ConstantVector::GetData<T>(keys))) {
 			return 0;
 		}
 		for (idx_t i = 0; i < count; i++) {
@@ -404,8 +465,7 @@ template <class T>
 idx_t PrefixRangeFilter::SelectScanType(Vector &keys, UnifiedVectorFormat &data, const SelectionVector &input,
                                       idx_t count, SelectionVector &result) const {
 	if (keys.GetVectorType() == VectorType::CONSTANT_VECTOR) {
-		if (!data.validity.RowIsValid(0) ||
-		    !LookupComparable(ToComparable<T>(*UnifiedVectorFormat::GetData<T>(data)))) {
+		if (!data.validity.RowIsValid(0) || !LookupValue<T>(*UnifiedVectorFormat::GetData<T>(data))) {
 			return 0;
 		}
 		for (idx_t i = 0; i < count; i++) {
@@ -457,7 +517,7 @@ idx_t PrefixRangeFilter::SelectScanType(Vector &keys, UnifiedVectorFormat &data,
 
 idx_t PrefixRangeFilter::SelectScan(Vector &keys, UnifiedVectorFormat &data, const SelectionVector &input,
                                   idx_t count, SelectionVector &result) const {
-	if (!finalized) {
+	if (!IsValid()) {
 		for (idx_t i = 0; i < count; i++) { result.set_index(i, input.get_index(i)); }
 		return count;
 	}
@@ -478,7 +538,7 @@ idx_t PrefixRangeFilter::SelectScan(Vector &keys, UnifiedVectorFormat &data, con
 idx_t PrefixRangeFilter::Select(DataChunk &chunk, SelectionVector &sel, vector<uint32_t> &,
                                 const vector<idx_t> &bound_cols_applied) const {
 	const auto count = chunk.size();
-	if (!finalized) {
+	if (!IsValid()) {
 		for (idx_t i = 0; i < count; i++) {
 			sel.set_index(i, i);
 		}
@@ -544,9 +604,89 @@ void PrefixRangeFilter::BitmapMetrics::Finish(idx_t buckets) {
 	D_ASSERT(runs > MAX_DIRECT_RANGES || runs == ended);
 }
 
+namespace {
+class PRFAnalysisTask : public BaseExecutorTask {
+public:
+	PRFAnalysisTask(TaskExecutor &executor, std::function<void()> work_p)
+	    : BaseExecutorTask(executor), work(std::move(work_p)) {
+	}
+	void ExecuteTask() override {
+		work();
+	}
+
+private:
+	std::function<void()> work;
+};
+} // namespace
+
+PrefixRangeFilter::BitmapMetrics PrefixRangeFilter::AnalyzeBitmap(ClientContext &context, const uint64_t *source,
+                                                                  idx_t buckets, uint64_t *destination) {
+	const auto target_buckets = destination ? (buckets + 1) / 2 : buckets;
+	const auto words = (target_buckets + 63) / 64;
+	const auto source_words = (buckets + 63) / 64;
+	const auto max_tasks = TaskScheduler::GetScheduler(context).NumberOfThreads();
+	const idx_t task_count = source_words * sizeof(uint64_t) < 4 * 1024 * 1024
+	                             ? 1
+	                             : MaxValue<idx_t>(1, MinValue<idx_t>(max_tasks, (words + 32767) / 32768));
+	const auto words_per_task = ((words + task_count * 64 - 1) / (task_count * 64)) * 64;
+	vector<BitmapMetrics> parts(task_count);
+	auto analyze = [&](idx_t task) {
+		const auto begin = MinValue(words, task * words_per_task);
+		const auto end = MinValue(words, begin + words_per_task);
+		auto &metrics = parts[task];
+		for (idx_t i = begin; i < end; i++) {
+			uint64_t word;
+			if (destination) {
+				word = PackMergedPairs(source[i * 2]);
+				if (i * 2 + 1 < source_words) {
+					word |= PackMergedPairs(source[i * 2 + 1]) << 32;
+				}
+			} else {
+				word = source[i];
+			}
+			const auto valid = MinValue<idx_t>(64, target_buckets - i * 64);
+			word &= ValidBitsMask(valid);
+			if (destination) {
+				destination[i] = word;
+			}
+			metrics.Add(word, i * 64, valid);
+		}
+		metrics.Finish(MinValue(target_buckets, end * 64));
+	};
+	if (task_count == 1) {
+		analyze(0);
+		return parts[0];
+	}
+	TaskExecutor executor(context);
+	for (idx_t task = 0; task < task_count; task++) {
+		executor.ScheduleTask(make_uniq<PRFAnalysisTask>(executor, [&, task]() { analyze(task); }));
+	}
+	executor.WorkOnTasks();
+	BitmapMetrics result;
+	for (auto &part : parts) {
+		result.active += part.active;
+		if (result.runs > MAX_DIRECT_RANGES || part.runs > MAX_DIRECT_RANGES) {
+			result.runs = MAX_DIRECT_RANGES + 1;
+			continue;
+		}
+		for (idx_t i = 0; i < part.runs; i++) {
+			if (result.runs && result.ends[result.runs - 1] + 1 == part.starts[i]) {
+				result.ends[result.runs - 1] = part.ends[i];
+			} else if (result.runs < MAX_DIRECT_RANGES) {
+				result.starts[result.runs] = part.starts[i];
+				result.ends[result.runs++] = part.ends[i];
+			} else {
+				result.runs = MAX_DIRECT_RANGES + 1;
+				break;
+			}
+		}
+	}
+	return result;
+}
+
 double PrefixRangeFilter::FalsePositiveRate(idx_t active_buckets, idx_t candidate_shift) const {
 	const long double domain_values = static_cast<long double>(span) + 1;
-	const long double positive_lower_bound = static_cast<long double>(base_active_bucket_count);
+	const long double positive_lower_bound = static_cast<long double>(positive_count_estimate);
 	if (domain_values <= positive_lower_bound) {
 		return 0;
 	}
@@ -581,13 +721,17 @@ void PrefixRangeFilter::ConvertToDirectRanges(const BitmapMetrics &metrics) {
 }
 
 void PrefixRangeFilter::Compress(ClientContext &context) {
-	BitmapMetrics metrics;
-	for (idx_t i = 0; i < word_count; i++) {
-		metrics.Add(bitmap[i], i * 64, MinValue<idx_t>(64, logical_bucket_count - i * 64));
-	}
-	metrics.Finish(logical_bucket_count);
+	auto metrics = AnalyzeBitmap(context, bitmap, logical_bucket_count);
 	active_bucket_count = metrics.active;
-	base_active_bucket_count = active_bucket_count;
+	// The estimate is fixed at the initial level, exactly as in the regular PRF.
+	// An occupied two-key bucket is not evidence that only one key is present.
+	const auto distinct = estimated_multiplicity > 1.0
+	                          ? static_cast<idx_t>(double(build_row_count) / estimated_multiplicity)
+	                          : build_row_count;
+	const auto covered = MinValue<long double>(static_cast<long double>(span) + 1,
+	                                           std::ldexp(static_cast<long double>(active_bucket_count), shift));
+	positive_count_estimate = MaxValue(
+	    active_bucket_count, covered >= static_cast<long double>(distinct) ? distinct : static_cast<idx_t>(covered));
 	false_positive_rate = FalsePositiveRate(active_bucket_count, shift);
 	if (active_bucket_count == 0) {
 		empty = true;
@@ -618,17 +762,7 @@ void PrefixRangeFilter::Compress(ClientContext &context) {
 			    reinterpret_cast<uint64_t *>((reinterpret_cast<uintptr_t>(scratch_data.get()) + 63) & ~uintptr_t(63));
 			scratch_capacity = candidate_word_count;
 		}
-		BitmapMetrics candidate_metrics;
-		for (idx_t i = 0; i < candidate_word_count; i++) {
-			auto word = PackMergedPairs(bitmap[i * 2]);
-			if (i * 2 + 1 < word_count) {
-				word |= PackMergedPairs(bitmap[i * 2 + 1]) << 32;
-			}
-			const auto valid = MinValue<idx_t>(64, candidate_bucket_count - i * 64);
-			scratch[i] = word & ValidBitsMask(valid);
-			candidate_metrics.Add(scratch[i], i * 64, valid);
-		}
-		candidate_metrics.Finish(candidate_bucket_count);
+		auto candidate_metrics = AnalyzeBitmap(context, bitmap, logical_bucket_count, scratch);
 		const auto candidate_active = candidate_metrics.active;
 		const auto candidate_shift = shift + 1;
 		const auto candidate_fpr = FalsePositiveRate(candidate_active, candidate_shift);
@@ -710,6 +844,10 @@ void PrefixRangeFilter::Finalize(ClientContext &context) {
 		start = BuildClock::now();
 		BuildLookupIndex();
 		index_ms = ElapsedMS(start);
+		use_bloom = false_positive_rate > MAX_COMPRESSION_FALSE_POSITIVE_RATE;
+		if (use_bloom) {
+			InitializeBloom(context);
+		}
 	}
 	finalized = true;
 }
@@ -778,7 +916,7 @@ FilterPropagateResult PrefixRangeFilter::LookupRange(uint64_t lower, uint64_t up
 }
 
 FilterPropagateResult PrefixRangeFilter::CheckStatistics(BaseStatistics &stats) const {
-	if (!finalized || stats.GetType() != key_type || stats.GetStatsType() != StatisticsType::NUMERIC_STATS ||
+	if (!IsValid() || stats.GetType() != key_type || stats.GetStatsType() != StatisticsType::NUMERIC_STATS ||
 	    !NumericStats::HasMinMax(stats)) {
 		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
 	}
@@ -802,12 +940,13 @@ string PrefixRangeFilter::GetInfo() const {
 		return "direct ranges=" + std::to_string(direct_range_count) + " shift=" + std::to_string(shift) +
 		       " fpr=" + std::to_string(false_positive_rate);
 	}
-	return "bitmap buckets=" + std::to_string(logical_bucket_count) + " active=" + std::to_string(active_bucket_count) +
+	return string(use_bloom ? "bloom fallback; bitmap buckets=" : "bitmap buckets=") +
+	       std::to_string(logical_bucket_count) + " active=" + std::to_string(active_bucket_count) +
 	       " shift=" + std::to_string(shift) + " fpr=" + std::to_string(false_positive_rate);
 }
 
 idx_t PrefixRangeFilter::GetMemoryUsage() const {
-	return bitmap_data.GetSize() + homogeneous_runs.capacity() * sizeof(HomogeneousRun) +
+	return bitmap_data.GetSize() + bloom_data.GetSize() + homogeneous_runs.capacity() * sizeof(HomogeneousRun) +
 	       direct_range_count * sizeof(DirectRange);
 }
 
@@ -815,6 +954,29 @@ string PrefixRangeFilter::GetBuildTimings() const {
 	return "init_ms=" + std::to_string(initialize_ms) + " insert_task_ms=" + std::to_string(insert_ms) +
 	       " merge_ms=" + std::to_string(merge_ms) + " compress_ms=" + std::to_string(compress_ms) +
 	       " index_ms=" + std::to_string(index_ms);
+}
+
+InsertionOrderPreservingMap<string> PrefixRangeFilter::GetDiagnostics() const {
+	InsertionOrderPreservingMap<string> result;
+	auto precise = [](double value) {
+		std::ostringstream out;
+		out << std::setprecision(17) << value;
+		return out.str();
+	};
+	result["build_rows"] = std::to_string(build_row_count);
+	result["filter_ready"] = IsValid() ? "true" : "false";
+	result["estimated_multiplicity"] = precise(estimated_multiplicity);
+	result["estimated_distinct_keys"] = std::to_string(positive_count_estimate);
+	result["initial_shift"] = std::to_string(initial_shift);
+	result["final_shift"] = std::to_string(shift);
+	result["final_mode"] = mode == Mode::DIRECT_RANGES ? "direct_ranges" : "bitmap";
+	result["range_count"] = std::to_string(direct_range_count);
+	result["active_buckets"] = std::to_string(active_bucket_count);
+	result["false_positive_rate"] = precise(false_positive_rate);
+	result["bloom_fallback_selected"] = use_bloom ? "true" : "false";
+	result["bitmap_allocation_bytes"] = std::to_string(bitmap_data.GetSize());
+	result["compression_elapsed_ms"] = std::to_string(compress_ms);
+	return result;
 }
 
 } // namespace duckdb

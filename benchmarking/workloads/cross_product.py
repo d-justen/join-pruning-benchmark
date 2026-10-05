@@ -83,7 +83,11 @@ CROSS_PRODUCT_PARAMETER_DESCRIPTIONS = {
     "dimension_distinct_keys": "Derived as dimension_cardinality / build_key_multiplicity.",
     "selected_distinct_keys": "Derived selected key count after the dimension predicate.",
     "selected_build_rows": "Selected distinct keys multiplied by build-key multiplicity.",
-    "expected_query_selectivity": "Individual join selectivity raised to join_count.",
+    "dimension_predicate_selectivity": "Fraction of dimension keys selected by its predicate.",
+    "probe_selectivity": "Expected fraction of fact rows matching one filtered dimension, before duplicate expansion.",
+    "expected_query_selectivity": "Probe selectivity raised to join_count.",
+    "expected_join_output_rows": "Expected matching fact rows multiplied by the build-key multiplicities; realized counts may differ.",
+    "reference_domain_size": "Anchor domain whose per-row membership is preserved by fixed-output density sweeps.",
 }
 
 CROSS_PRODUCT_QUERY_TYPE_DESCRIPTIONS = {
@@ -106,7 +110,7 @@ CROSS_PRODUCT_EXPERIMENT_CONFIGURATIONS = {
     },
     "key_domain_size": {
         "query_types": True,
-        "description": "Sweep key density; fact keys are drawn only from existing dimension keys.",
+        "description": "Sweep key density; optionally fix selected build keys and matching probe rows using per-query foreign keys.",
     },
     "build_key_multiplicity": {
         "query_types": True,
@@ -150,6 +154,12 @@ class ResolvedSweepCase:
     row_group_size: int
     seed: int
     legacy_build_label: str | None = None
+    probe_selectivity: float | None = None
+    reference_domain_size: int | None = None
+
+
+def _fixed_density(definition: CrossProductExperimentDefinition) -> bool:
+    return definition.sweep.cardinality_mode == "fixed_selected_build_and_probe"
 
 
 def _case_label(kind: str, value: int | float) -> str:
@@ -181,6 +191,14 @@ def _resolve_sweep_cases(
     elif not definition.query_types:
         raise ValueError("query_types must not be empty")
     cases: list[ResolvedSweepCase] = []
+    if _fixed_density(definition):
+        if (sweep.kind != "key_domain_size" or fixed.build_key_multiplicity != 1
+                or fixed.join_count != 1 or fixed.key_domain_size not in (None, fixed.dimension_cardinality)
+                or storage_kind != "duckdb" or fixed.row_group_size != 122_880
+                or not 0 < fixed.selectivity < 1
+                or any(q.kind not in ("shoulder", "scattered") or q.probe_layouts != ("uniform",)
+                       for q in definition.query_types)):
+            raise ValueError("fixed density requires a dense distinct reference, one join, shoulder/scattered uniform queries, and default native row groups")
     for raw_value in sweep.values:
         dimension_cardinality = fixed.dimension_cardinality
         selectivity = fixed.selectivity
@@ -200,6 +218,13 @@ def _resolve_sweep_cases(
             join_count = int(raw_value)
         elif sweep.kind == "row_group_size":
             row_group_size = int(raw_value)
+
+        if _fixed_density(definition):
+            selected = int(round(fixed.dimension_cardinality * fixed.selectivity))
+            if int(domain_size) <= selected:
+                raise ValueError("density domain must exceed selected build cardinality")
+            dimension_cardinality = int(domain_size)
+            selectivity = selected / dimension_cardinality
 
         if dimension_cardinality <= 0:
             raise ValueError("dimension_cardinality must be positive")
@@ -288,6 +313,8 @@ def _resolve_sweep_cases(
                 row_group_size=row_group_size,
                 seed=fixed.seed,
                 legacy_build_label=legacy_label,
+                probe_selectivity=fixed.selectivity if _fixed_density(definition) else selectivity,
+                reference_domain_size=fixed.dimension_cardinality if _fixed_density(definition) else None,
             )
         )
     return cases
@@ -426,8 +453,10 @@ def _sweep_key_expr(
     cases: list[ResolvedSweepCase] | tuple[ResolvedSweepCase, ...],
     case: ResolvedSweepCase,
     rank_expr: str,
+    query_type: CrossProductQueryTypeConfig | None = None,
 ) -> str:
-    layout = _shoulder_layout(definition, cases, case)
+    layout = (_shoulder_layout(definition, cases, case)
+              if query_type is None or query_type.kind == "shoulder" else None)
     if layout is None:
         return _spread_key_expr(
             rank_expr,
@@ -568,7 +597,14 @@ def _sweep_mask_column(
     return f"mask_{selectivity_id}_{_query_type_id(query_type)}"
 
 
-def _sweep_dimension_table_name(case: ResolvedSweepCase, join_index: int) -> str:
+def _key_layout_suffix(case: ResolvedSweepCase, query_type: CrossProductQueryTypeConfig | None) -> str:
+    if query_type is None or case.legacy_build_label is not None or case.key_domain_size == case.dimension_distinct_keys:
+        return ""
+    return "_shoulder" if query_type.kind == "shoulder" else "_spread"
+
+
+def _sweep_dimension_table_name(case: ResolvedSweepCase, join_index: int,
+                              query_type: CrossProductQueryTypeConfig | None = None) -> str:
     if case.legacy_build_label is not None and join_index == 1:
         return f"dim_{case.legacy_build_label}"
     shared_ids = {
@@ -578,13 +614,14 @@ def _sweep_dimension_table_name(case: ResolvedSweepCase, join_index: int) -> str
         "row_group_size": "row_groups",
     }
     relation_id = shared_ids.get(case.sweep_kind, case.case_id)
-    return f"dim_{relation_id}_j{join_index:02d}"
+    return f"dim_{relation_id}_j{join_index:02d}{_key_layout_suffix(case, query_type)}"
 
 
 def _sweep_fk_column_name(
     case: ResolvedSweepCase,
     join_index: int,
     probe_layout: str,
+    query_type: CrossProductQueryTypeConfig | None = None,
 ) -> str:
     if case.legacy_build_label is not None and join_index == 1:
         return f"fk_{case.legacy_build_label}_{probe_layout}"
@@ -594,7 +631,9 @@ def _sweep_fk_column_name(
         "cluster_count": "clusters",
     }
     relation_id = shared_ids.get(case.sweep_kind, case.case_id)
-    return f"fk_{relation_id}_j{join_index:02d}_{probe_layout}"
+    suffix = (f"_{query_type.kind}" if case.reference_domain_size is not None and query_type is not None
+              else _key_layout_suffix(case, query_type))
+    return f"fk_{relation_id}_j{join_index:02d}_{probe_layout}{suffix}"
 
 
 def _create_sweep_dimension_table(
@@ -602,11 +641,12 @@ def _create_sweep_dimension_table(
     definition: CrossProductExperimentDefinition,
     cases: list[ResolvedSweepCase],
     join_index: int,
+    key_query_type: CrossProductQueryTypeConfig | None = None,
 ) -> dict:
     case = cases[0]
-    table_name = _sweep_dimension_table_name(case, join_index)
+    table_name = _sweep_dimension_table_name(case, join_index, key_query_type)
     base_table_name = f"{table_name}_base"
-    key_expr = _sweep_key_expr(definition, cases, case, "key_rank")
+    key_expr = _sweep_key_expr(definition, cases, case, "key_rank", key_query_type)
     if case.legacy_build_label is not None:
         dummy_exprs = [
             build_dummy_column_expr(
@@ -652,6 +692,8 @@ def _create_sweep_dimension_table(
     scattered_rank_table: str | None = None
     for mask_case in cases:
         for query_type in _case_query_types(definition, mask_case):
+            if _key_layout_suffix(mask_case, query_type) != _key_layout_suffix(case, key_query_type):
+                continue
             mask_name = _sweep_mask_column(mask_case, query_type)
             if mask_name in seen_mask_names:
                 continue
@@ -751,8 +793,9 @@ def _fact_key_expr(
     cases: list[ResolvedSweepCase] | tuple[ResolvedSweepCase, ...],
     case: ResolvedSweepCase,
     rank_expr: str,
+    query_type: CrossProductQueryTypeConfig | None = None,
 ) -> str:
-    return _sweep_key_expr(definition, cases, case, rank_expr)
+    return _sweep_key_expr(definition, cases, case, rank_expr, query_type)
 
 
 def _fact_column_expr(
@@ -762,6 +805,7 @@ def _fact_column_expr(
     join_index: int,
     probe_layout: str,
     column_name: str,
+    query_type: CrossProductQueryTypeConfig | None = None,
 ) -> str:
     if probe_layout == "ordered":
         rank_expr = (
@@ -778,7 +822,7 @@ def _fact_column_expr(
         rank_expr = (
             f"CAST(hash(i + {salt}) % {case.dimension_distinct_keys} AS BIGINT)"
         )
-    return f"{_fact_key_expr(definition, cases, case, rank_expr)} AS {column_name}"
+    return f"{_fact_key_expr(definition, cases, case, rank_expr, query_type)} AS {column_name}"
 
 
 def _case_probe_layouts(
@@ -796,6 +840,107 @@ def _case_probe_layouts(
     )
 
 
+def _create_fixed_density_tables(
+    con: duckdb.DuckDBPyConnection,
+    definition: CrossProductExperimentDefinition,
+    cases: list[ResolvedSweepCase],
+) -> dict[tuple[str, int], dict]:
+    """Preserve each reference fact row's membership, using O(selected keys) maps.
+
+    The complement map stores gaps between selected keys, not every rejected
+    key. An ASOF lookup maps a uniform complement ordinal to its actual key.
+    Thus large numeric domains do not require equally large FK lookup tables.
+    """
+    fixed = definition.fixed
+    reference = fixed.dimension_cardinality
+    selected = int(round(reference * fixed.selectivity))
+    leading, trailing = selected // 2, selected - selected // 2
+    salt = fixed.seed + 104_729
+    scattered = any(q.kind == "scattered" for q in definition.query_types)
+    domains = sorted({reference, *(case.key_domain_size for case in cases)})
+    if scattered:
+        for domain in domains:
+            # Keep the same exact, hash-ranked selection as the ordinary sweeps.
+            con.execute(f"""
+                CREATE TEMP TABLE density_selected_{domain} AS
+                SELECT key_rank, row_number() OVER (ORDER BY hash(key_rank + {salt}), key_rank) - 1
+                       AS selection_rank
+                FROM (SELECT r AS key_rank FROM range({domain}) keys(r)
+                      ORDER BY hash(r + {salt}), r LIMIT {selected}) chosen
+            """)
+            con.execute(f"""
+                CREATE TEMP TABLE density_gaps_{domain} AS
+                SELECT gap_start, max(skipped) AS skipped FROM (
+                    SELECT key_rank - (row_number() OVER (ORDER BY key_rank) - 1) AS gap_start,
+                           row_number() OVER (ORDER BY key_rank) AS skipped
+                    FROM density_selected_{domain}
+                    UNION ALL SELECT 0, 0
+                ) gaps GROUP BY gap_start
+            """)
+
+    dimensions = {}
+    columns = ["i AS fact_id"]
+    joins = ([f"LEFT JOIN density_selected_{reference} ref ON anchor_rank = ref.key_rank"]
+             if scattered else [])
+    gap_joins = []
+    for case in cases:
+        domain = case.key_domain_size
+        table = _sweep_dimension_table_name(case, 1)
+        masks = []
+        mask_metadata = {}
+        for q in definition.query_types:
+            mask = _sweep_mask_column(case, q)
+            condition = (f"(b.key_rank < {leading} OR b.key_rank >= {domain - trailing})"
+                         if q.kind == "shoulder" else "(selected_keys.key_rank IS NOT NULL)")
+            masks.append(f"{condition} AS {mask}")
+            mask_metadata[mask] = {"query_type": q.kind, "cluster_count": None,
+                                   "selected_distinct_keys": selected, "selected_build_rows": selected}
+            column = _sweep_fk_column_name(case, 1, "uniform", q)
+            if domain == reference:
+                expression = "anchor_rank + 1"
+            elif q.kind == "shoulder":
+                positive = f"(anchor_rank < {leading} OR anchor_rank >= {reference - trailing})"
+                rank = f"(pick_positive % {selected})"
+                selected_key = f"CASE WHEN {rank} < {leading} THEN {rank} + 1 ELSE {domain - selected} + {rank} + 1 END"
+                rejected_key = f"{leading + 1} + pick_negative % {domain - selected}"
+                expression = f"CASE WHEN {positive} THEN {selected_key} ELSE {rejected_key} END"
+            else:
+                joins.append(f"LEFT JOIN density_selected_{domain} sel_{domain} "
+                             f"ON pick_positive % {selected} = sel_{domain}.selection_rank")
+                gap_joins.append(f"ASOF LEFT JOIN density_gaps_{domain} gap_{domain} "
+                                 f"ON pick_negative % {domain - selected} >= gap_{domain}.gap_start")
+                expression = (f"CASE WHEN ref.key_rank IS NOT NULL THEN sel_{domain}.key_rank + 1 "
+                              f"ELSE pick_negative % {domain - selected} + gap_{domain}.skipped + 1 END")
+            columns.append(f"CAST({expression} AS BIGINT) AS {column}")
+        payload = [f"substr(md5('dummy_{j}:' || CAST(d_key AS VARCHAR) || ':dup:0:seed:{fixed.seed}'), "
+                   f"1, {fixed.dummy_string_len}) AS dummy_s{j}"
+                   for j in range(1, fixed.dummy_string_cols + 1)]
+        selected_join = (f"LEFT JOIN density_selected_{domain} selected_keys "
+                         "ON b.key_rank = selected_keys.key_rank" if scattered else "")
+        con.execute(f"""
+            CREATE TABLE {table} AS SELECT {', '.join(['d_key'] + payload + masks)}
+            FROM (SELECT r AS key_rank, r + 1 AS d_key FROM range({domain}) keys(r)) b
+            {selected_join}
+        """)
+        dimensions[(table, 1)] = {"table_name": table, "join_index": 1,
+                                  "row_count": domain, "distinct_keys": domain,
+                                  "key_domain_size": domain, "key_multiplicity": 1,
+                                  "masks": mask_metadata}
+    columns.append("i * 17 AS measure")
+    # ASOF joins may reorder by complement rank. Restore the reference fact
+    # order so these uniform probes do not become physically clustered.
+    con.execute(f"""
+        CREATE TABLE fact AS SELECT {', '.join(columns)}
+        FROM (SELECT i, CAST(hash(i + {salt}) % {reference} AS BIGINT) AS anchor_rank,
+                     hash(i + {salt + 1_000_003}) AS pick_positive,
+                     hash(i + {salt + 2_000_033}) AS pick_negative
+              FROM range(1, {fixed.fact_rows + 1}) rows(i)) f
+        {' '.join(joins + gap_joins)}
+        ORDER BY i
+    """)
+    return dimensions
+
+
 def _create_shared_sweep_fact_table(
     con: duckdb.DuckDBPyConnection,
     definition: CrossProductExperimentDefinition,
@@ -804,21 +949,14 @@ def _create_shared_sweep_fact_table(
     columns: dict[str, str] = {}
     for case in cases:
         for join_index in range(1, case.join_count + 1):
-            for probe_layout in _case_probe_layouts(definition, case):
-                column_name = _sweep_fk_column_name(case, join_index, probe_layout)
-                expression = _fact_column_expr(
-                    definition,
-                    cases,
-                    case,
-                    join_index,
-                    probe_layout,
-                    column_name,
-                )
-                previous = columns.setdefault(column_name, expression)
-                if previous != expression:
-                    raise ValueError(
-                        f"shared fact column {column_name} resolves to different expressions"
-                    )
+            for query_type in _case_query_types(definition, case):
+                for probe_layout in query_type.probe_layouts:
+                    column_name = _sweep_fk_column_name(case, join_index, probe_layout, query_type)
+                    expression = _fact_column_expr(definition, cases, case, join_index,
+                                                   probe_layout, column_name, query_type)
+                    previous = columns.setdefault(column_name, expression)
+                    if previous != expression:
+                        raise ValueError(f"shared fact column {column_name} resolves to different expressions")
     select_list = ",\n            ".join(
         ["i AS fact_id"] + list(columns.values()) + ["i * 17 AS measure"]
     )
@@ -848,22 +986,15 @@ def _create_row_group_fact_database(
             f"ATTACH {sql_literal(str(db_path.resolve()))} AS {quote_identifier(alias)} "
             f"(ROW_GROUP_SIZE {case.row_group_size}, STORAGE_VERSION 'v1.2.0')"
         )
-        columns: list[str] = []
+        columns: dict[str, str] = {}
         for join_index in range(1, case.join_count + 1):
-            for probe_layout in _case_probe_layouts(definition, case):
-                column_name = f"fk_j{join_index:02d}_{probe_layout}"
-                columns.append(
-                    _fact_column_expr(
-                        definition,
-                        (case,),
-                        case,
-                        join_index,
-                        probe_layout,
-                        column_name,
-                    )
-                )
+            for query_type in _case_query_types(definition, case):
+                for probe_layout in query_type.probe_layouts:
+                    column_name = f"fk_j{join_index:02d}_{probe_layout}{_key_layout_suffix(case, query_type)}"
+                    columns[column_name] = _fact_column_expr(definition, (case,), case,
+                                                           join_index, probe_layout, column_name, query_type)
         select_list = ",\n                ".join(
-            ["i AS fact_id"] + columns + ["i * 17 AS measure"]
+            ["i AS fact_id"] + list(columns.values()) + ["i * 17 AS measure"]
         )
         coordinator.execute(
             f"""
@@ -1148,11 +1279,11 @@ def _render_sweep_query(
     joins: list[str] = []
     predicates: list[str] = []
     for join_index in range(1, case.join_count + 1):
-        dimension_table = _sweep_dimension_table_name(case, join_index)
+        dimension_table = _sweep_dimension_table_name(case, join_index, query_type)
         fk_column = (
-            f"fk_j{join_index:02d}_{probe_layout}"
+            f"fk_j{join_index:02d}_{probe_layout}{_key_layout_suffix(case, query_type)}"
             if row_group_fact
-            else _sweep_fk_column_name(case, join_index, probe_layout)
+            else _sweep_fk_column_name(case, join_index, probe_layout, query_type)
         )
         joins.append(
             f"JOIN {dimension_table} AS d{join_index}\n"
@@ -1188,31 +1319,33 @@ def _write_sweep_workload(
         seed_value = ((definition.fixed.seed % 10_000_000) + 0.5) / 10_000_001
         con.execute(f"SELECT setseed({seed_value})")
         dimension_groups: dict[tuple[str, int], list[ResolvedSweepCase]] = {}
+        key_queries: dict[tuple[str, int], CrossProductQueryTypeConfig] = {}
         for case in cases:
             for join_index in range(1, case.join_count + 1):
-                group_key = (_sweep_dimension_table_name(case, join_index), join_index)
-                dimension_groups.setdefault(group_key, []).append(case)
-        physical_dimensions = {
-            group_key: _create_sweep_dimension_table(
-                con,
-                definition,
-                group_cases,
-                group_key[1],
-            )
-            for group_key, group_cases in dimension_groups.items()
-        }
+                for query_type in _case_query_types(definition, case):
+                    group_key = (_sweep_dimension_table_name(case, join_index, query_type), join_index)
+                    group_cases = dimension_groups.setdefault(group_key, [])
+                    if case not in group_cases:
+                        group_cases.append(case)
+                    key_queries[group_key] = query_type
+        if _fixed_density(definition):
+            physical_dimensions = _create_fixed_density_tables(con, definition, cases)
+        else:
+            physical_dimensions = {
+                group_key: _create_sweep_dimension_table(con, definition, group_cases,
+                                                        group_key[1], key_queries[group_key])
+                for group_key, group_cases in dimension_groups.items()
+            }
         for case in cases:
-            dimensions[case.case_id] = [
-                physical_dimensions[
-                    (_sweep_dimension_table_name(case, join_index), join_index)
-                ]
-                for join_index in range(1, case.join_count + 1)
-            ]
+            keys = dict.fromkeys((_sweep_dimension_table_name(case, j, q), j)
+                                 for j in range(1, case.join_count + 1)
+                                 for q in _case_query_types(definition, case))
+            dimensions[case.case_id] = [physical_dimensions[key] for key in keys]
         separate_fact_databases = (
             definition.sweep.kind == "row_group_size"
             or definition.fixed.row_group_size != 122_880
         )
-        if not separate_fact_databases:
+        if not separate_fact_databases and not _fixed_density(definition):
             _create_shared_sweep_fact_table(con, definition, cases)
     finally:
         con.close()
@@ -1265,11 +1398,12 @@ def _write_sweep_workload(
                     ),
                     encoding="utf-8",
                 )
-                expected_selectivity = case.selectivity ** case.join_count
+                expected_selectivity = case.probe_selectivity ** case.join_count
                 query_catalog[filename] = {
                     "case_id": case.case_id,
                     "sweep_kind": case.sweep_kind,
                     "sweep_value": case.sweep_value,
+                    "cardinality_mode": definition.sweep.cardinality_mode,
                     "query_type": query_type.kind,
                     "cluster_count": query_type.cluster_count,
                     "probe_layout": probe_layout,
@@ -1282,9 +1416,20 @@ def _write_sweep_workload(
                     "key_domain_size": case.key_domain_size,
                     "key_density": case.key_density,
                     "dimension_key_density": case.dimension_key_density,
-                    "individual_join_selectivity": case.selectivity,
+                    "individual_join_selectivity": case.probe_selectivity,
+                    "dimension_predicate_selectivity": case.selectivity,
+                    "probe_selectivity": case.probe_selectivity,
                     "expected_query_selectivity": expected_selectivity,
                     "expected_output_multiplier": case.build_key_multiplicity ** case.join_count,
+                    "expected_join_output_rows": (case.fact_rows * expected_selectivity
+                                                  * case.build_key_multiplicity ** case.join_count),
+                    "reference_domain_size": case.reference_domain_size,
+                    "probe_key_distribution": "baseline_membership_conditioned" if _fixed_density(definition) else probe_layout,
+                    "key_layout": "shoulder" if query_type.kind == "shoulder" else "spread",
+                    "key_domain_min": 1,
+                    "key_domain_max": case.key_domain_size,
+                    "dimension_tables": [_sweep_dimension_table_name(case, j, query_type)
+                                         for j in range(1, case.join_count + 1)],
                     "row_group_size": case.row_group_size,
                 }
 

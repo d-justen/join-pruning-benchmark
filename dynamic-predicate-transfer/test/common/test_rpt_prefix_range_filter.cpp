@@ -69,6 +69,10 @@ void ExercisePRFVectors(ClientContext &context, const LogicalType &type, const v
 	filter.Initialize(context, build.size(), keys.front(), keys.back());
 	filter.Insert(build, {1});
 	filter.Finalize(context);
+	if (filter.NeedsBloomFallback()) {
+		filter.Insert(build, {1});
+		filter.CompleteBloomFallback();
+	}
 	if (exact) {
 		const auto ranges = expected_ranges ? expected_ranges : keys.size();
 		const auto representation = ranges <= 4 ? "direct ranges=" + std::to_string(ranges) : "bitmap";
@@ -216,7 +220,11 @@ TEST_CASE("RPT PRF compression matches a scalar dyadic reference", "[rpt_prf]") 
 			}
 			bits.front() = bits.back() = 1;
 			PrefixRangeFilter filter(LogicalType::UINTEGER);
-			filter.Initialize(*con.context, domain, Value::UINTEGER(0), Value::UINTEGER(domain - 1));
+			idx_t build_rows = 0;
+			for (auto bit : bits) {
+				build_rows += bit;
+			}
+			filter.Initialize(*con.context, build_rows, Value::UINTEGER(0), Value::UINTEGER(domain - 1));
 			filter.SetSingleWriter();
 			DataChunk chunk;
 			chunk.Initialize(Allocator::DefaultAllocator(), {LogicalType::UINTEGER});
@@ -274,6 +282,114 @@ TEST_CASE("RPT PRF compression matches a scalar dyadic reference", "[rpt_prf]") 
 			}
 		}
 	}
+}
+
+TEST_CASE("RPT PRF shoulder compression survives selectivity and multiplicity changes", "[rpt_prf]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	const idx_t domain = 100000000;
+	for (idx_t threads : {idx_t(1), idx_t(4)}) {
+		REQUIRE(!con.Query("SET threads=" + std::to_string(threads))->HasError());
+		for (idx_t rows : {idx_t(10000), idx_t(100000), idx_t(300000), idx_t(1000000)}) {
+			for (idx_t multiplicity : {idx_t(1), idx_t(8)}) {
+				INFO(threads);
+				INFO(rows);
+				INFO(multiplicity);
+				const auto distinct = rows / multiplicity;
+				PrefixRangeFilter filter(LogicalType::BIGINT, double(multiplicity));
+				filter.Initialize(*con.context, rows, Value::BIGINT(0), Value::BIGINT(domain - 1));
+				filter.SetSingleWriter();
+				DataChunk chunk;
+				chunk.Initialize(Allocator::DefaultAllocator(), {LogicalType::BIGINT});
+				for (idx_t begin = 0; begin < rows; begin += STANDARD_VECTOR_SIZE) {
+					const auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, rows - begin);
+					for (idx_t i = 0; i < count; i++) {
+						const auto rank = (begin + i) / multiplicity;
+						const auto key = rank < distinct / 2 ? rank : domain - distinct + rank;
+						chunk.SetValue(0, i, Value::BIGINT(key));
+					}
+					chunk.SetCardinality(count);
+					filter.Insert(chunk, {0});
+				}
+				filter.Finalize(*con.context);
+				REQUIRE(filter.IsValid());
+				REQUIRE(!filter.NeedsBloomFallback());
+				REQUIRE(filter.GetInfo().find("direct ranges=2") == 0);
+				auto diagnostics = filter.GetDiagnostics();
+				REQUIRE(diagnostics["initial_shift"] == "1");
+				REQUIRE(diagnostics["estimated_distinct_keys"] == std::to_string(distinct));
+				// Check boundary membership, holes, out-of-domain keys and NULL.
+				vector<int64_t> probes {0,
+				                        int64_t(distinct / 2 - 1),
+				                        int64_t(distinct / 2 + 2),
+				                        int64_t(domain / 2),
+				                        int64_t(domain - distinct / 2),
+				                        int64_t(domain - 1),
+				                        -1,
+				                        int64_t(domain)};
+				for (idx_t i = 0; i < probes.size(); i++)
+					chunk.SetValue(0, i, Value::BIGINT(probes[i]));
+				chunk.SetValue(0, probes.size(), Value(LogicalType::BIGINT));
+				chunk.SetCardinality(probes.size() + 1);
+				vector<uint32_t> lookup(STANDARD_VECTOR_SIZE);
+				filter.Lookup(chunk, lookup, {0});
+				for (idx_t i = 0; i < probes.size(); i++) {
+					const auto key = probes[i];
+					REQUIRE(lookup[i] ==
+					        uint32_t(key >= 0 && key < int64_t(domain) &&
+					                 (key < int64_t(distinct / 2) || key >= int64_t(domain - distinct / 2))));
+				}
+				REQUIRE(lookup[probes.size()] == 0);
+			}
+		}
+	}
+}
+
+TEST_CASE("RPT PRF multiplicity can trigger sector Bloom fallback", "[rpt_prf]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	// A 70M span starts with width-two buckets. Each selected bucket contains
+	// one key: a fractional source multiplicity must not count duplicates as
+	// another occupied value. Ignoring multiplicity would accept this bitmap.
+	PrefixRangeFilter filter(LogicalType::BIGINT, 1.5);
+	DataChunk chunk;
+	chunk.Initialize(Allocator::DefaultAllocator(), {LogicalType::BIGINT});
+	filter.Initialize(*con.context, 150000, Value::BIGINT(0), Value::BIGINT(99999 * 700));
+	auto insert = [&]() {
+		for (idx_t begin = 0; begin < 150000; begin += STANDARD_VECTOR_SIZE) {
+			const auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, 150000 - begin);
+			for (idx_t i = 0; i < count; i++)
+				chunk.SetValue(0, i, Value::BIGINT(((begin + i) % 100000) * 700));
+			chunk.SetCardinality(count);
+			filter.Insert(chunk, {0});
+		}
+	};
+	insert();
+	filter.Finalize(*con.context);
+	REQUIRE(filter.NeedsBloomFallback());
+	REQUIRE(!filter.IsValid());
+	insert();
+	filter.CompleteBloomFallback();
+	REQUIRE(filter.IsValid());
+	idx_t negatives_passed = 0;
+	vector<uint32_t> lookup(STANDARD_VECTOR_SIZE);
+	for (idx_t begin = 0; begin < 200000; begin += STANDARD_VECTOR_SIZE) {
+		const auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, 200000 - begin);
+		for (idx_t i = 0; i < count; i++) {
+			const auto rank = begin + i;
+			chunk.SetValue(0, i, Value::BIGINT((rank / 2) * 700 + rank % 2));
+		}
+		chunk.SetCardinality(count);
+		filter.Lookup(chunk, lookup, {0});
+		for (idx_t i = 0; i < count; i++) {
+			if ((begin + i) % 2 == 0)
+				REQUIRE(lookup[i] == 1);
+			else
+				negatives_passed += lookup[i];
+		}
+	}
+	// The PRF bitmap would accept virtually all these adjacent negative keys.
+	REQUIRE(negatives_passed < 10000);
 }
 
 TEST_CASE("RPT PRF private construction and homogeneous range classification", "[rpt_prf]") {

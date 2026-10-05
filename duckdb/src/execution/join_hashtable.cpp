@@ -2,6 +2,7 @@
 
 #include "duckdb/common/enums/join_type.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/profiler.hpp"
 #include "duckdb/common/radix_partitioning.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/ht_entry.hpp"
@@ -741,10 +742,6 @@ void JoinHashTable::InsertHashes(Vector &hashes_v, const idx_t count, TupleDataC
 	}
 }
 
-void JoinHashTable::BuildBloomFilter(idx_t chunk_idx_from, idx_t chunk_idx_to) {
-	BuildRuntimeJoinFilters(chunk_idx_from, chunk_idx_to, nullptr, true);
-}
-
 void JoinHashTable::BuildRuntimeJoinFilters(idx_t chunk_idx_from, idx_t chunk_idx_to,
                                             optional_ptr<PrefixRangeFilter::BuildState> prefix_range_state,
                                             bool build_bloom_filter) {
@@ -779,34 +776,122 @@ void JoinHashTable::BuildRuntimeJoinFilters(idx_t chunk_idx_from, idx_t chunk_id
 
 unique_ptr<PrefixRangeFilter::BuildState> JoinHashTable::InitializePrefixRangeBuildState() {
 	D_ASSERT(prefix_range_filter);
-	return prefix_range_filter->InitializeBuildState(context);
+	Profiler timer;
+	auto telemetry = prefix_range_filter->GetDetailedTelemetry();
+	if (telemetry) {
+		timer.Start();
+	}
+	auto state = prefix_range_filter->InitializeBuildState(context);
+	if (telemetry) {
+		timer.End();
+		const auto elapsed = timer.ElapsedNanos();
+		state->profiling_initialization_ns += elapsed;
+	}
+	return state;
 }
 
 void JoinHashTable::InsertPrefixRangeChunk(TupleDataChunkState &chunk_state, idx_t count,
                                            PrefixRangeFilter::BuildState &state) {
 	D_ASSERT(prefix_range_filter);
+	Profiler timer;
+	auto telemetry = prefix_range_filter->GetDetailedTelemetry();
+	if (telemetry) {
+		timer.Start();
+	}
 	Vector build_keys(layout_ptr->GetTypes()[0], count);
 	auto &sel = *FlatVector::IncrementalSelectionVector();
 	data_collection->Gather(chunk_state.row_locations, sel, count, 0, build_keys, sel, nullptr);
 	FlatVector::SetSize(build_keys, count_t(count));
 	prefix_range_filter->InsertKeys(build_keys, count, state);
+	if (telemetry) {
+		timer.End();
+		const auto elapsed = timer.ElapsedNanos();
+		state.profiling_insertion_ns += elapsed;
+	}
 }
 
 void JoinHashTable::MergePrefixRangeBuildState(PrefixRangeFilter::BuildState &state) {
 	D_ASSERT(prefix_range_filter);
+	Profiler timer;
+	auto telemetry = prefix_range_filter->GetDetailedTelemetry();
+	if (telemetry) {
+		timer.Start();
+	}
 	prefix_range_filter->MergeBuildState(state);
+	if (telemetry) {
+		timer.End();
+		const auto elapsed = timer.ElapsedNanos();
+		telemetry->build_merge_ns.fetch_add(elapsed, std::memory_order_relaxed);
+		telemetry->build_initialization_ns.fetch_add(state.profiling_initialization_ns, std::memory_order_relaxed);
+		telemetry->build_insertion_ns.fetch_add(state.profiling_insertion_ns, std::memory_order_relaxed);
+		telemetry->build_worker_ns.fetch_add(state.profiling_initialization_ns + state.profiling_insertion_ns + elapsed,
+		                                     std::memory_order_relaxed);
+	}
+}
+
+static void RecordPrefixRangeFinalState(PrefixRangeFilter &filter, bool bloom_fallback_selected,
+                                        double false_positive_rate = 0) {
+	auto telemetry = filter.GetTelemetry();
+	if (!telemetry) {
+		return;
+	}
+	const auto info = filter.GetCompressionInfo(false);
+	telemetry->final_mode.store(static_cast<idx_t>(info.mode), std::memory_order_relaxed);
+	telemetry->final_bitmap_allocation_bytes.store(info.bitmap_allocation_bytes, std::memory_order_relaxed);
+	telemetry->final_false_positive_rate.store(false_positive_rate, std::memory_order_relaxed);
+	telemetry->final_prf_enabled.store(filter.AllowsTupleFiltering(), std::memory_order_relaxed);
+	telemetry->bloom_fallback_selected.store(bloom_fallback_selected, std::memory_order_relaxed);
+	telemetry->final_state_recorded.store(true, std::memory_order_release);
+}
+
+void JoinHashTable::CompletePrefixRangeFilterBuild() {
+	should_build_prefix_range_filter = false;
+	if (prefix_range_filter && !ShouldAnalyzePrefixRangeFilter()) {
+		RecordPrefixRangeFinalState(*prefix_range_filter, false);
+	}
 }
 
 bool JoinHashTable::AnalyzePrefixRangeFilter() {
-	if (!ShouldAnalyzePrefixRangeFilter()) {
+	if (!ShouldCompressPrefixRangeFilter()) {
 		return false;
 	}
 	D_ASSERT(prefix_range_filter);
-	prefix_range_filter->Compress(context, prefix_range_filter_false_positive_rate_threshold);
-	const auto analysis = prefix_range_filter->Analyze();
+	auto telemetry = prefix_range_filter->GetDetailedTelemetry();
+	Profiler timer;
+	if (telemetry) {
+		timer.Start();
+	}
+	const auto analysis = prefix_range_filter->Compress(context, prefix_range_filter_false_positive_rate_threshold);
+	if (telemetry) {
+		timer.End();
+		telemetry->compression_worker_ns.fetch_add(timer.ElapsedNanos(), std::memory_order_relaxed);
+	}
+	return CompletePrefixRangeFilterAnalysis(analysis);
+}
+
+bool JoinHashTable::AnalyzeUncompressedPrefixRangeFilter() {
+	if (!ShouldAnalyzePrefixRangeFilter() || ShouldCompressPrefixRangeFilter()) {
+		return false;
+	}
+	return CompletePrefixRangeFilterAnalysis(prefix_range_filter->Analyze());
+}
+
+unique_ptr<PrefixRangeFilter::ParallelCompressionState>
+JoinHashTable::InitializeParallelPrefixRangeCompression(idx_t max_tasks) {
+	if (!ShouldCompressPrefixRangeFilter()) {
+		return nullptr;
+	}
+	return prefix_range_filter->InitializeParallelCompression(context,
+	                                                          prefix_range_filter_false_positive_rate_threshold, max_tasks);
+}
+
+bool JoinHashTable::CompletePrefixRangeFilterAnalysis(const PrefixRangeFilter::Analysis &analysis) {
+	D_ASSERT(ShouldAnalyzePrefixRangeFilter());
 	const bool exceeds_threshold = analysis.false_positive_rate > prefix_range_filter_false_positive_rate_threshold;
 	prefix_range_filter->SetAllowsTupleFiltering(!exceeds_threshold);
-	should_analyze_prefix_range_filter = false;
+	prefix_range_filter_post_build_mode = PrefixRangeFilterPostBuildMode::NONE;
+	RecordPrefixRangeFinalState(*prefix_range_filter, exceeds_threshold && HasDeferredBloomFilter(),
+	                            analysis.false_positive_rate);
 	return exceeds_threshold;
 }
 
@@ -1949,8 +2034,10 @@ void JoinHashTable::ResetForNewIterationSinglePartition() {
 	total_probe_matches = 0;
 	load_factor = DEFAULT_LOAD_FACTOR;
 	should_build_bloom_filter = false;
+	deferred_bloom_filter_registered = false;
 	prefix_range_filter.reset();
 	should_build_prefix_range_filter = false;
+	prefix_range_filter_post_build_mode = PrefixRangeFilterPostBuildMode::NONE;
 	ResetCorrelatedMarkJoinInfo(*this);
 }
 

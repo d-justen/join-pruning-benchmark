@@ -15,6 +15,8 @@ void FilterPlan::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<vector<LogicalType>>(202, "return_types", return_types);
 	serializer.WritePropertyWithDefault<vector<idx_t>>(203, "bound_cols_build", bound_cols_build);
 	serializer.WritePropertyWithDefault<vector<idx_t>>(204, "bound_cols_apply", bound_cols_apply);
+	serializer.WritePropertyWithDefault<double>(205, "build_key_multiplicity", build_key_multiplicity, 1.0);
+	serializer.WritePropertyWithDefault<bool>(206, "reverse_transfer", reverse_transfer, false);
 }
 
 unique_ptr<FilterPlan> FilterPlan::Deserialize(Deserializer &deserializer) {
@@ -24,6 +26,8 @@ unique_ptr<FilterPlan> FilterPlan::Deserialize(Deserializer &deserializer) {
 	deserializer.ReadPropertyWithDefault<vector<LogicalType>>(202, "return_types", result->return_types);
 	deserializer.ReadPropertyWithDefault<vector<idx_t>>(203, "bound_cols_build", result->bound_cols_build);
 	deserializer.ReadPropertyWithDefault<vector<idx_t>>(204, "bound_cols_apply", result->bound_cols_apply);
+	deserializer.ReadPropertyWithExplicitDefault<double>(205, "build_key_multiplicity", result->build_key_multiplicity, 1.0);
+	deserializer.ReadPropertyWithExplicitDefault<bool>(206, "reverse_transfer", result->reverse_transfer, false);
 	return result;
 }
 

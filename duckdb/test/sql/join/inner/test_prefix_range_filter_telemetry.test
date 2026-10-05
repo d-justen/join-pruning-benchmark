@@ -1,0 +1,158 @@
+# name: test/sql/join/inner/test_prefix_range_filter_telemetry.test
+# description: Join finalization and PRF postprocessing are elapsed timings; worker metrics are opt-in
+# group: [inner]
+
+statement ok
+SET threads=4
+
+statement ok
+SET disabled_optimizers='join_order,build_side_probe_side'
+
+statement ok
+SET enable_perfect_hash_join_filter_pushdown=false
+
+statement ok
+SET enable_join_bloom_filter_pushdown=false
+
+statement ok
+SET enable_join_min_max_filter_pushdown=false
+
+statement ok
+CREATE TABLE prf_telemetry_build AS
+SELECT i::INTEGER k FROM range(50000) t(i)
+UNION ALL
+SELECT (i + 66500000)::INTEGER k FROM range(50000) t(i)
+
+statement ok
+CREATE TABLE prf_telemetry_probe AS
+SELECT k FROM prf_telemetry_build
+UNION ALL
+SELECT (k + 500000)::INTEGER k FROM prf_telemetry_build
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM prf_telemetry_probe p JOIN prf_telemetry_build b ON p.k=b.k
+----
+analyzed_plan	<REGEX>:.*"prefix_range_filter".*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM prf_telemetry_probe p JOIN prf_telemetry_build b ON p.k=b.k
+----
+analyzed_plan	<REGEX>:.*"join_finalize_build_elapsed_seconds": [0-9].*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM prf_telemetry_probe p JOIN prf_telemetry_build b ON p.k=b.k
+----
+analyzed_plan	<REGEX>:.*"prf_compression_elapsed_seconds": [0-9].*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM prf_telemetry_probe p JOIN prf_telemetry_build b ON p.k=b.k
+----
+analyzed_plan	<!REGEX>:.*"probe_worker_seconds".*
+
+statement ok
+SET enable_prefix_range_filter_compression=false
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM prf_telemetry_probe p JOIN prf_telemetry_build b ON p.k=b.k
+----
+analyzed_plan	<REGEX>:.*"prf_compression_elapsed_seconds": 0.*
+
+query I
+SELECT count(*) FROM prf_telemetry_probe p JOIN prf_telemetry_build b ON p.k=b.k
+----
+100000
+
+statement ok
+SET enable_prefix_range_filter_compression=true
+
+# This bitmap is below the parallel cutoff and uses serial analysis/compression.
+statement ok
+CREATE TABLE prf_telemetry_small_build AS
+SELECT (i * 20)::INTEGER k FROM range(5000) t(i)
+
+statement ok
+CREATE TABLE prf_telemetry_small_probe AS
+SELECT i::INTEGER k FROM range(200000) t(i)
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM prf_telemetry_small_probe p JOIN prf_telemetry_small_build b ON p.k=b.k
+----
+analyzed_plan	<REGEX>:.*"prf_compression_elapsed_seconds": [0-9].*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM prf_telemetry_small_probe p JOIN prf_telemetry_small_build b ON p.k=b.k
+----
+analyzed_plan	<REGEX>:.*"build_task_count": 1.*
+
+query I
+SELECT count(*) FROM prf_telemetry_small_probe p JOIN prf_telemetry_small_build b ON p.k=b.k
+----
+5000
+
+# More than 64 * 4 stored chunks require multiple claims per bounded build task.
+statement ok
+CREATE TABLE prf_telemetry_many_chunks AS
+SELECT i::INTEGER k FROM range(650000) t(i)
+UNION ALL
+SELECT (i + 66500000)::INTEGER k FROM range(650000) t(i)
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM prf_telemetry_many_chunks p JOIN prf_telemetry_many_chunks b ON p.k=b.k
+----
+analyzed_plan	<REGEX>:.*"build_chunk_count": [3-9][0-9][0-9].*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM prf_telemetry_many_chunks p JOIN prf_telemetry_many_chunks b ON p.k=b.k
+----
+analyzed_plan	<REGEX>:.*"build_task_count": 4.*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM prf_telemetry_many_chunks p JOIN prf_telemetry_many_chunks b ON p.k=b.k
+----
+analyzed_plan	<REGEX>:.*"local_bitmap_count": 4.*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM prf_telemetry_many_chunks p JOIN prf_telemetry_many_chunks b ON p.k=b.k
+----
+analyzed_plan	<REGEX>:.*"local_bitmap_peak_bytes": [1-9][0-9]*.*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM prf_telemetry_many_chunks p JOIN prf_telemetry_many_chunks b ON p.k=b.k
+----
+analyzed_plan	<REGEX>:.*"final_prf_false_positive_rate": [0-9].*
+
+query I
+SELECT count(*) FROM prf_telemetry_many_chunks p JOIN prf_telemetry_many_chunks b ON p.k=b.k
+----
+1300000
+
+# Detailed instrumentation is explicitly requested, including for EXPLAIN ANALYZE.
+statement ok
+SET profiling_mode='detailed'
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM prf_telemetry_probe p JOIN prf_telemetry_build b ON p.k=b.k
+----
+analyzed_plan	<REGEX>:.*"build_worker_seconds": [0-9].*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM prf_telemetry_probe p JOIN prf_telemetry_build b ON p.k=b.k
+----
+analyzed_plan	<REGEX>:.*"probe_worker_seconds": [0-9].*
+
+statement ok
+SET profiling_mode='standard'

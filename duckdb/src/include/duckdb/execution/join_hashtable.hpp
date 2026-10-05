@@ -222,7 +222,6 @@ public:
 	void BuildRuntimeJoinFilters(idx_t chunk_idx_from, idx_t chunk_idx_to,
 	                             optional_ptr<PrefixRangeFilter::BuildState> prefix_range_state = nullptr,
 	                             bool build_bloom_filter = false);
-	void BuildBloomFilter(idx_t chunk_idx_from, idx_t chunk_idx_to);
 	//! Probe the HT with the given input chunk, resulting in the given result
 	void Probe(ScanStructure &scan_structure, DataChunk &keys, TupleDataChunkState &key_state, ProbeState &probe_state,
 	           optional_ptr<Vector> precomputed_hashes = nullptr);
@@ -426,10 +425,12 @@ private:
 	//! Whether or not to use a bloom filter will be determined by the operator
 	BloomFilter bloom_filter;
 	bool should_build_bloom_filter = false;
+	bool deferred_bloom_filter_registered = false;
 
 	unique_ptr<PrefixRangeFilter> prefix_range_filter;
 	bool should_build_prefix_range_filter = false;
-	bool should_analyze_prefix_range_filter = false;
+	enum class PrefixRangeFilterPostBuildMode : uint8_t { NONE, COMPRESS, ANALYZE_ONLY };
+	PrefixRangeFilterPostBuildMode prefix_range_filter_post_build_mode = PrefixRangeFilterPostBuildMode::NONE;
 	double prefix_range_filter_false_positive_rate_threshold = 0.0;
 
 	//! Copying not allowed
@@ -515,6 +516,12 @@ public:
 	bool ShouldBuildBloomFilter() const {
 		return should_build_bloom_filter;
 	}
+	void RegisterDeferredBloomFilter() {
+		deferred_bloom_filter_registered = true;
+	}
+	bool HasDeferredBloomFilter() const {
+		return deferred_bloom_filter_registered;
+	}
 	void EnsureBloomFilterInitialized() {
 		if (!bloom_filter.IsInitialized()) {
 			bloom_filter.Initialize(context, Count());
@@ -532,9 +539,11 @@ public:
 	void SetBuildPrefixRangeFilter() {
 		should_build_prefix_range_filter = true;
 	}
+	void CompletePrefixRangeFilterBuild();
 
-	void SetAnalyzePrefixRangeFilter(double false_positive_rate_threshold) {
-		should_analyze_prefix_range_filter = true;
+	void SetAnalyzePrefixRangeFilter(double false_positive_rate_threshold, bool enable_compression) {
+		prefix_range_filter_post_build_mode = enable_compression ? PrefixRangeFilterPostBuildMode::COMPRESS
+		                                                         : PrefixRangeFilterPostBuildMode::ANALYZE_ONLY;
 		prefix_range_filter_false_positive_rate_threshold = false_positive_rate_threshold;
 	}
 
@@ -547,10 +556,17 @@ public:
 	}
 
 	bool ShouldAnalyzePrefixRangeFilter() const {
-		return should_analyze_prefix_range_filter && prefix_range_filter;
+		return prefix_range_filter_post_build_mode != PrefixRangeFilterPostBuildMode::NONE && prefix_range_filter;
+	}
+
+	bool ShouldCompressPrefixRangeFilter() const {
+		return prefix_range_filter_post_build_mode == PrefixRangeFilterPostBuildMode::COMPRESS && prefix_range_filter;
 	}
 
 	bool AnalyzePrefixRangeFilter();
+	bool AnalyzeUncompressedPrefixRangeFilter();
+	unique_ptr<PrefixRangeFilter::ParallelCompressionState> InitializeParallelPrefixRangeCompression(idx_t max_tasks);
+	bool CompletePrefixRangeFilterAnalysis(const PrefixRangeFilter::Analysis &analysis);
 
 	unique_ptr<PrefixRangeFilter::BuildState> InitializePrefixRangeBuildState();
 	void InsertPrefixRangeChunk(TupleDataChunkState &chunk_state, idx_t count, PrefixRangeFilter::BuildState &state);

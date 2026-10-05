@@ -29,6 +29,18 @@
         "id": 204,
         "name": "bound_cols_apply",
         "type": "vector<idx_t>"
+      },
+      {
+        "id": 205,
+        "name": "build_key_multiplicity",
+        "type": "double",
+        "default": "1.0"
+      },
+      {
+        "id": 206,
+        "name": "reverse_transfer",
+        "type": "bool",
+        "default": "false"
       }
     ],
     "constructor": []

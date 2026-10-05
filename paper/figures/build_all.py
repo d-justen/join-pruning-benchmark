@@ -53,6 +53,7 @@ from paper.figures.data import (
     summarize_end_to_end,
     summarize_section,
     write_summary,
+    write_filter_phase_report,
 )
 
 PAGE_SIZES = {
@@ -89,9 +90,11 @@ PROBE_CARDINALITY_OUTLIER_THRESHOLD = 10.0
 PROBE_FILTERED_HATCH = "...."
 PROBE_SKIPPED_HATCH = "////"
 ROWS_SCANNED_HATCH = "////"
-PRF_BUILD_HATCH = "\\\\\\\\"
+FILTER_BUILD_HATCH = "\\\\\\\\"
 PRF_ANALYSIS_HATCH = "xxxx"
 PRF_ANALYSIS_COLOR = "#7c3aed"
+PRF_COMPRESSION_HATCH = "...."
+PRF_COMPRESSION_COLOR = "#0f766e"
 BENCHMARK_RUNTIME_BOXPLOT_GROUPS = (
     (
         "join-pruning-workload",
@@ -208,17 +211,32 @@ def _variant_bar_geometry(
     ]
 
 
-def _prf_phase_legend_handles() -> list[Patch]:
-    return [
-        Patch(facecolor="none", edgecolor="#111827", hatch=PRF_BUILD_HATCH, label="PRF build"),
-        Patch(
-            facecolor="none", edgecolor=PRF_ANALYSIS_COLOR,
-            hatch=PRF_ANALYSIS_HATCH, label="PRF analysis/compression",
-        ),
-    ]
+FILTER_PHASE_STYLES = (
+    ("join_finalize_build_ms", "Join/filter build", FILTER_BUILD_HATCH, "#111827"),
+    ("prf_analysis_ms", "PRF analysis", PRF_ANALYSIS_HATCH, PRF_ANALYSIS_COLOR),
+    ("prf_compression_ms", "PRF compression", PRF_COMPRESSION_HATCH, PRF_COMPRESSION_COLOR),
+)
 
 
-def _draw_prf_phase_overlays(
+def _filter_phase_legend_handles() -> list[Patch]:
+    return [Patch(facecolor="none", edgecolor=color, hatch=hatch, label=label)
+            for _, label, hatch, color in FILTER_PHASE_STYLES]
+
+
+def _annotate_filter_phases(fig, legend, font_size: float) -> float:
+    fig.canvas.draw()
+    legend_bottom = legend.get_window_extent().transformed(fig.transFigure.inverted()).y0
+    separator = "\n" if fig.get_figwidth() < 4 else " "
+    note = fig.text(
+        0.5, legend_bottom - 0.025,
+        "Join/filter phases: one profile; hatches at bar tops." + separator + "Bar heights: timed medians.",
+        ha="center", va="top", fontsize=font_size, color="#4b5563",
+    )
+    fig.canvas.draw()
+    return note.get_window_extent().transformed(fig.transFigure.inverted()).y0 - 0.04
+
+
+def _draw_filter_phase_overlays(
     ax,
     entries: list[dict[str, object]],
     present_variants: tuple[str, ...],
@@ -226,51 +244,38 @@ def _draw_prf_phase_overlays(
     bar_width: float,
     runtime_floor: float,
 ) -> dict[str, int]:
-    """Place profiled phase durations at the top of median runtime bars."""
+    """Annotate median bars with comparable elapsed phases from one profile.
+
+    Includes Bloom-only and uncompressed PRF variants. Missing telemetry is
+    unknown; explicit zero analysis/compression is valid. Overlapping join
+    spans can exceed query latency, in which case no decomposition is drawn.
+    """
     marked = overflow = 0
     for variant_index, variant_label in enumerate(present_variants):
         for query_index, entry in enumerate(entries):
-            item = next(
-                (part for part in entry["series"] if part["variant_label"] == variant_label),
-                None,
-            )
-            if item is None or item.get("prf_build_phase_ms") is None:
+            item = next((part for part in entry["series"] if part["variant_label"] == variant_label), None)
+            if item is None or any(item.get(name) is None for name, *_ in FILTER_PHASE_STYLES):
                 continue
             runtime = float(item["median_ms"])
-            build = float(item["prf_build_phase_ms"])
-            analysis = float(item.get("prf_analysis_phase_ms") or 0.0)
-            if build + analysis > runtime:
+            durations = [float(item[name]) for name, *_ in FILTER_PHASE_STYLES]
+            if sum(durations) > runtime:
                 overflow += 1
                 continue
             position = query_index + offsets[variant_index]
-            build_bottom = max(runtime - build - analysis, runtime_floor)
-            build_top = max(runtime - analysis, runtime_floor)
-            if build_top > build_bottom:
-                ax.bar(
-                    position, build_top - build_bottom, bottom=build_bottom,
-                    width=bar_width, facecolor="none", edgecolor="#111827",
-                    hatch=PRF_BUILD_HATCH, linewidth=0.45, zorder=4,
-                )
-            if build > 0:
-                ax.plot(
-                    position - bar_width * 0.2, build_top,
-                    marker="_", markersize=4, color="#111827", zorder=6,
-                )
-            if analysis > 0:
-                analysis_bottom = max(runtime - analysis, runtime_floor)
-                if runtime > analysis_bottom:
-                    ax.bar(
-                        position, runtime - analysis_bottom, bottom=analysis_bottom,
-                        width=bar_width, facecolor="none", edgecolor=PRF_ANALYSIS_COLOR,
-                        hatch=PRF_ANALYSIS_HATCH, linewidth=0.65, zorder=5,
-                    )
-                # Keep very short analysis spans visible on the logarithmic axis.
-                ax.plot(
-                    position + bar_width * 0.2, runtime, marker="_", markersize=4,
-                    color=PRF_ANALYSIS_COLOR, zorder=6,
-                )
+            bottom = runtime - sum(durations)
+            for index, ((_, _, hatch, color), duration) in enumerate(zip(FILTER_PHASE_STYLES, durations)):
+                top = bottom + duration
+                clipped_bottom, clipped_top = max(bottom, runtime_floor), max(top, runtime_floor)
+                if clipped_top > clipped_bottom:
+                    ax.bar(position, clipped_top - clipped_bottom, bottom=clipped_bottom,
+                           width=bar_width, facecolor="none", edgecolor=color,
+                           hatch=hatch, linewidth=0.5, zorder=4 + index)
+                if duration > 0:
+                    ax.plot(position + (index - 1) * bar_width * 0.25, clipped_top,
+                            marker="_", markersize=4, color=color, zorder=8)
+                bottom = top
             marked += 1
-    return {"prf_phase_bars": marked, "prf_phase_overflows": overflow}
+    return {"filter_phase_bars": marked, "filter_phase_overflows": overflow}
 
 
 def _format_axis_value(metric: str):
@@ -509,7 +514,7 @@ def _draw_runtime_probe_bars(
     runtime_log_axis: bool,
     rows_log_axis: bool,
     split_scan_pruning: bool = False,
-    show_prf_phases: bool = False,
+    show_filter_phases: bool = False,
 ) -> dict[str, bool]:
     width, height = PAGE_SIZES[width_key]
     text_scale = _capped_text_scale(width_key, placement_width_key)
@@ -520,6 +525,8 @@ def _draw_runtime_probe_bars(
     annotation_font_size = _scaled_font_size(ANNOTATION_FONT_SIZE - 0.5, text_scale)
     has_bar_labels = annotate_runtime_values
     height += 0.95 if compressed_column_layout else 1.0
+    if show_filter_phases and width_key == "one-column":
+        height += 1.25
     if has_bar_labels:
         height += 0.12
     mirrored_log_layout = runtime_log_axis or rows_log_axis
@@ -748,15 +755,15 @@ def _draw_runtime_probe_bars(
             )
 
     phase_verification = (
-        _draw_prf_phase_overlays(
+        _draw_filter_phase_overlays(
             runtime_ax, entries, present_variants, offsets, bar_width,
             runtime_floor if runtime_log_axis else 0.0,
         )
-        if show_prf_phases
-        else {"prf_phase_bars": 0, "prf_phase_overflows": 0}
+        if show_filter_phases
+        else {"filter_phase_bars": 0, "filter_phase_overflows": 0}
     )
     runtime_ax.set_ylabel(
-        "Time (ms)" if compressed_column_layout else "Execution time (ms)",
+        "Time (ms)" if compressed_column_layout or width_key == "one-column" else "Execution time (ms)",
         fontsize=label_font_size,
         labelpad=10,
     )
@@ -858,8 +865,8 @@ def _draw_runtime_probe_bars(
                 label="Skipped at scan",
             )
         )
-    if show_prf_phases and phase_verification["prf_phase_bars"]:
-        semantic_handles.extend(_prf_phase_legend_handles())
+    if show_filter_phases and phase_verification["filter_phase_bars"]:
+        semantic_handles.extend(_filter_phase_legend_handles())
     variant_legend = fig.legend(
         handles=variant_handles,
         loc="upper center",
@@ -874,25 +881,21 @@ def _draw_runtime_probe_bars(
         handles=semantic_handles,
         loc="upper center",
         bbox_to_anchor=(0.5, 0.78 if width_key == "one-column" else 0.87),
-        ncol=1 if width_key == "one-column" else (5 if show_prf_phases else 3),
+        ncol=1 if width_key == "one-column" else 3,
         frameon=False,
         fontsize=legend_font_size,
         handlelength=1.5,
         columnspacing=1.0,
     )
-    if show_prf_phases and phase_verification["prf_phase_bars"]:
-        fig.text(
-            0.5, 0.78,
-            "PRF phase spans: one profile; hatched at bar tops. Bar heights: timed medians.",
-            ha="center", va="center", fontsize=annotation_font_size,
-            color="#4b5563",
-        )
+    plot_top = 0.50 if width_key == "one-column" else (0.72 if show_filter_phases else 0.75)
+    if show_filter_phases and phase_verification["filter_phase_bars"]:
+        plot_top = min(plot_top, _annotate_filter_phases(fig, semantic_legend, annotation_font_size))
 
     fig.subplots_adjust(
         left=0.26 if width_key == "one-column" else (0.17 if compressed_column_layout else 0.10),
         right=0.992 if width_key == "one-column" else 0.997,
         bottom=0.08 if not show_query_labels else (0.18 if has_wrapped_xticklabels else (0.12 if compressed_column_layout else 0.11)),
-        top=0.50 if width_key == "one-column" else (0.72 if show_prf_phases else 0.75),
+        top=plot_top,
     )
     runtime_ax.yaxis.set_label_coords(-0.11, 0.5)
     rows_ax.yaxis.set_label_coords(-0.11, 0.5)
@@ -944,7 +947,7 @@ def _draw_runtime_total_rows_bars(
     rows_metric_key: str = "rows_scanned",
     rows_y_label: str = "Rows scanned",
     rows_percent: bool = False,
-    show_prf_phases: bool = False,
+    show_filter_phases: bool = False,
 ) -> dict[str, bool]:
     width, height = PAGE_SIZES[width_key]
     text_scale = _capped_text_scale(width_key, placement_width_key)
@@ -1085,12 +1088,12 @@ def _draw_runtime_total_rows_bars(
             )
 
     phase_verification = (
-        _draw_prf_phase_overlays(
+        _draw_filter_phase_overlays(
             runtime_ax, entries, present_variants, offsets, bar_width,
             runtime_floor if runtime_log_axis else 0.0,
         )
-        if show_prf_phases
-        else {"prf_phase_bars": 0, "prf_phase_overflows": 0}
+        if show_filter_phases
+        else {"filter_phase_bars": 0, "filter_phase_overflows": 0}
     )
     runtime_ax.set_ylabel("Time (ms)", fontsize=label_font_size)
     if runtime_log_axis:
@@ -1175,9 +1178,17 @@ def _draw_runtime_total_rows_bars(
         )
         for label in present_variants
     ]
-    if show_prf_phases and phase_verification["prf_phase_bars"]:
-        total_rows_legend_handles.extend(_prf_phase_legend_handles())
-    if show_runtime_labels:
+    if show_filter_phases and phase_verification["filter_phase_bars"]:
+        total_rows_legend_handles.extend(_filter_phase_legend_handles())
+    plot_top = 0.74 if show_runtime_labels else (0.70 if compressed_column_layout else (0.74 if width_key == "one-column" else 0.83))
+    if show_filter_phases and phase_verification["filter_phase_bars"]:
+        phase_legend = fig.legend(
+            handles=total_rows_legend_handles, loc="upper center", bbox_to_anchor=(0.5, 0.99),
+            ncol=2 if width_key == "one-column" else 3, frameon=False,
+            fontsize=legend_font_size, handlelength=1.5, columnspacing=1.0,
+        )
+        plot_top = min(plot_top, _annotate_filter_phases(fig, phase_legend, annotation_font_size))
+    elif show_runtime_labels:
         fig.legend(
             handles=total_rows_legend_handles,
             loc="upper center",
@@ -1199,19 +1210,11 @@ def _draw_runtime_total_rows_bars(
             handlelength=1.5,
             columnspacing=1.1,
         )
-    if show_prf_phases and phase_verification["prf_phase_bars"]:
-        fig.text(
-            0.5, 0.78 if compressed_column_layout else 0.86,
-            "PRF phase spans: one profile; hatched at bar tops. Bar heights: timed medians.",
-            ha="center", va="center", fontsize=annotation_font_size,
-            color="#4b5563",
-        )
-
     fig.subplots_adjust(
         left=0.24 if width_key == "one-column" else (0.14 if compressed_column_layout else 0.10),
         right=0.992 if width_key == "one-column" else 0.997,
         bottom=0.08 if not show_query_labels else (0.18 if has_wrapped_xticklabels else (0.13 if compressed_column_layout else 0.11)),
-        top=0.74 if show_runtime_labels else (0.70 if compressed_column_layout else (0.74 if width_key == "one-column" else 0.83)),
+        top=plot_top,
     )
     runtime_ax.yaxis.set_label_coords(-0.14 if show_runtime_labels else -0.11, 0.5)
     rows_ax.yaxis.set_label_coords(-0.14 if show_runtime_labels else -0.11, 0.5)
@@ -1743,7 +1746,7 @@ def _format_duration_ms(value: float) -> str:
     return f"{value / 1000.0:,.2f} s"
 
 
-def _format_prf_phase_ms(value: float | None, covered: int, queries: int) -> str:
+def _format_filter_phase_ms(value: float | None, covered: int, queries: int) -> str:
     if value is None:
         return "—"
     return f"{value:,.2f} ms ({covered}/{queries})"
@@ -1782,8 +1785,8 @@ def _write_benchmark_summary_markdown(
         f"- experiment root: `{experiment_root}`",
         f"- system: `{system_name}`",
         "",
-        "| Benchmark | Variant | Queries | Total time | PRF build | PRF analysis/compression | Relative time | Rows scanned | Relative rows | Join-probe tuples | Relative probes |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Benchmark | Variant | Queries | Total time | Join/filter build | PRF analysis | PRF compression | PRF/Bloom builds | Relative time | Rows scanned | Relative rows | Join-probe tuples | Relative probes |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for benchmark in benchmark_summary["benchmarks"]:
         variants = benchmark["variants"]
@@ -1844,19 +1847,16 @@ def _write_benchmark_summary_markdown(
                 values["relative_join_probe_geomean"],
                 best_values["relative_join_probe_geomean"],
             )
-            prf_build = _format_prf_phase_ms(
-                values["prf_build_phase_ms"],
-                values["prf_build_profile_count"],
-                benchmark["query_count"],
-            )
-            prf_analysis = _format_prf_phase_ms(
-                values["prf_analysis_phase_ms"],
-                values["prf_analysis_profile_count"],
-                benchmark["query_count"],
-            )
+            phases = [
+                _format_filter_phase_ms(values[name], values[name.removesuffix("_ms") + "_profile_count"],
+                                        benchmark["query_count"])
+                for name, *_ in FILTER_PHASE_STYLES
+            ]
+            builds = ("—" if values["prf_build_count"] is None or values["bloom_build_count"] is None
+                      else f"{values['prf_build_count']}/{values['bloom_build_count']}")
             lines.append(
                 f"| {benchmark_cell} | {variant_cell} | {benchmark['query_count']} | "
-                f"{total_runtime} | {prf_build} | {prf_analysis} | {relative_runtime} | {total_rows} | "
+                f"{total_runtime} | {phases[0]} | {phases[1]} | {phases[2]} | {builds} | {relative_runtime} | {total_rows} | "
                 f"{relative_rows} | {total_probes} | {relative_probes} |"
             )
     lines.extend(
@@ -1865,8 +1865,11 @@ def _write_benchmark_summary_markdown(
             "## Metric Definitions",
             "",
             "- **Total time:** sum of per-query median execution times.",
-            "- **PRF build / analysis/compression:** sum of wall-clock phase spans from each query's single JSON profile, including each PRF operator. Parentheses give queries with a recorded phase / all queries. A dash means the phase was not recorded; uncompressed PRF has no analysis/compression phase.",
-            "- Profile phase spans are from a separate execution from the timed median. In multi-join queries, filter phase spans can overlap, so their sums are not an additive decomposition of query latency. The uncompressed PRF build span includes hash-table finalization; the compressed build span excludes initial filter initialization.",
+            "- **Join/filter build:** elapsed hash-join finalization, including hash-table work and PRF/Bloom construction, excluding the separately measured PRF postprocessing. This is not an isolated filter-build cost.",
+            "- **PRF analysis / compression:** separate elapsed phases. Uncompressed PRF can require analysis to choose a fallback; its compression time is zero. Compression includes its own bitmap analysis. Bloom-only builds record zero for both PRF phases.",
+            "- Phase values sum operator spans from one JSON profile per query. Parentheses give queries with recorded phases / all queries. A dash means unavailable, including legacy PRF telemetry and RPT+ profiles; explicit zero means no work in that phase.",
+            "- **PRF/Bloom builds:** actual build counts. A PRF followed by Bloom fallback increments both counts; its build time is included only once. Baseline hash joins also record finalization even when both counts are zero.",
+            "- Profile phases come from a separate execution from the timed median. Multi-join phase spans can overlap, so their sums are not an additive decomposition of query latency. External joins report initial finalization only, excluding later source-side rounds. Worker times are not used.",
             "- **Relative time:** geometric mean of each query runtime divided by the best variant runtime for that query.",
             "- **Rows scanned:** sum of profile-level `cumulative_rows_scanned` across all queries.",
             "- **Relative rows:** geometric mean of each query's cumulative rows scanned divided by the best variant for that query.",
@@ -1946,6 +1949,8 @@ def _parameter_sweep_series(
                     "query_type": query_type,
                     "sweep_value": sweep_value,
                     "median_ms": row.median_ms,
+                    "query_parameters": parameters,
+                    **row.filter_phases.to_dict(),
                 }
             )
         for points in grouped.values():
@@ -2147,6 +2152,8 @@ def build_figures(experiment_root: Path, system_name: str | None) -> Path:
     plan_metric_rows = load_plan_metric_rows(experiment_root, resolved_system_names)
     probe_scan_rows = load_probe_scan_rows(experiment_root, resolved_system_names)
     output_dir = experiment_root / "paper"
+    phase_report = output_dir / "filter_phases.csv"
+    write_filter_phase_report(phase_report, rows)
     figures_dir = output_dir / "figures"
     available_workloads = _available_workload_names(rows)
     summary: dict[str, object] = {
@@ -2156,6 +2163,7 @@ def build_figures(experiment_root: Path, system_name: str | None) -> Path:
         "sections": {},
         "verification": {},
         "skipped_figures": [],
+        "filter_phases_csv": str(phase_report),
     }
     for figure in FIGURES:
         if not _figure_is_available(figure, available_workloads):
@@ -2322,7 +2330,7 @@ def build_figures(experiment_root: Path, system_name: str | None) -> Path:
                 split_scan_pruning=(
                     figure.workloads == ("join-pruning-workload",)
                 ),
-                show_prf_phases=figure.workloads[0].startswith("join-pruning-workload"),
+                show_filter_phases=figure.workloads[0].startswith("join-pruning-workload"),
             )
         elif figure.metric == "runtime_and_files_read":
             verification = _draw_runtime_total_rows_bars(
@@ -2338,7 +2346,7 @@ def build_figures(experiment_root: Path, system_name: str | None) -> Path:
                 rows_metric_key="files_read_fraction",
                 rows_y_label="Fact files opened",
                 rows_percent=True,
-                show_prf_phases=figure.workloads[0].startswith("join-pruning-workload"),
+                show_filter_phases=figure.workloads[0].startswith("join-pruning-workload"),
             )
         elif figure.metric == "runtime_and_total_rows":
             verification = _draw_runtime_total_rows_bars(

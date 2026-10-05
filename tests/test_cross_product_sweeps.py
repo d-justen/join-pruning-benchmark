@@ -26,6 +26,7 @@ from benchmarking.manifests import load_manifest, write_manifest
 from benchmarking.query_inventory import load_queries
 from benchmarking.results_analysis import _profile_sql
 from benchmarking.workloads.cross_product import (
+    _resolve_sweep_cases,
     _shoulder_preserving_key_expr,
     _spread_key_expr,
     prepare_cross_product_workload,
@@ -94,6 +95,133 @@ def make_spec(
 
 
 class CrossProductSweepTest(unittest.TestCase):
+    def test_paper_standardized_contract(self) -> None:
+        config = load_experiment_config(Path(__file__).resolve().parents[1] / "paper/configs/local_paper_sweeps.json")
+        self.assertFalse(config.overwrite_output)
+        for workload in config.workloads:
+            definition = workload.experiment_definition
+            self.assertEqual(definition.fixed.dimension_cardinality, 100_000_000)
+            self.assertEqual(definition.fixed.key_domain_size, 100_000_000)
+            self.assertEqual(definition.fixed.selectivity, .01)
+            cases = _resolve_sweep_cases(definition, storage_kind="duckdb")
+            for case in cases:
+                if definition.sweep.kind == "key_domain_size":
+                    self.assertEqual(case.selected_build_rows, 1_000_000)
+                    self.assertEqual(case.dimension_cardinality, case.key_domain_size)
+                    self.assertEqual(case.probe_selectivity, .01)
+                else:
+                    self.assertEqual(case.key_domain_size, 100_000_000)
+        for system in config.systems:
+            for variant in system.variants:
+                self.assertIn("SET disabled_optimizers='compressed_materialization';", variant.setup_sql)
+
+    def test_fixed_density_preserves_matching_rows_and_reference_values(self) -> None:
+        query_types = tuple(CrossProductQueryTypeConfig(kind, None, ("uniform",))
+                            for kind in ("shoulder", "scattered"))
+        base = make_spec("join_count", (1,), dimension_cardinality=1000,
+                         key_domain_size=1000, selectivity=.1, query_types=query_types)
+        density = replace(base, name="density", experiment_definition=replace(
+            base.experiment_definition,
+            sweep=CrossProductSweepConfig("key_domain_size", (200, 1000, 2000), "fixed_selected_build_and_probe")))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline = prepare_cross_product_workload(base, root / "baseline")
+            varied = prepare_cross_product_workload(density, root / "density")
+            con = duckdb.connect(str(varied.db_path), read_only=True)
+            try:
+                # ASOF complement lookups must not physically cluster the fact
+                # table by a density FK; restore the reference row order.
+                self.assertEqual(con.execute("SELECT fact_id FROM fact ORDER BY rowid").fetchall(),
+                                 [(i,) for i in range(1, 2001)])
+                con.execute(f"ATTACH '{baseline.db_path}' AS baseline (READ_ONLY)")
+                anchor = con.execute("SELECT fact_id, fk_joins_j01_uniform FROM baseline.fact ORDER BY fact_id").fetchall()
+                for kind in ("shoulder", "scattered"):
+                    actual = con.execute(f"SELECT fact_id, fk_d1000_j01_uniform_{kind} FROM fact ORDER BY fact_id").fetchall()
+                    self.assertEqual(actual, anchor)
+                    expected = con.execute(f"""SELECT f.fact_id FROM baseline.fact f
+                        JOIN baseline.dim_joins_j01 d ON f.fk_joins_j01_uniform=d.d_key
+                        WHERE d.mask_s0100_{kind} ORDER BY f.fact_id""").fetchall()
+                    for domain, mask in ((200, "s0500"), (1000, "s0100"), (2000, "s0050")):
+                        self.assertEqual(con.execute(f"SELECT count(*) FROM dim_d{domain}_j01 WHERE mask_{mask}_{kind}").fetchone()[0], 100)
+                        actual = con.execute(f"""SELECT f.fact_id FROM fact f
+                            JOIN dim_d{domain}_j01 d ON f.fk_d{domain}_j01_uniform_{kind}=d.d_key
+                            WHERE d.mask_{mask}_{kind} ORDER BY f.fact_id""").fetchall()
+                        self.assertEqual(actual, expected)
+                        self.assertEqual(con.execute(f"SELECT count(*) FROM fact WHERE fk_d{domain}_j01_uniform_{kind} IS NULL OR fk_d{domain}_j01_uniform_{kind} NOT BETWEEN 1 AND {domain}").fetchone()[0], 0)
+                    self.assertEqual(con.execute(f"SELECT d_key,dummy_s1 FROM dim_d1000_j01 WHERE mask_s0100_{kind} ORDER BY d_key").fetchall(),
+                                     con.execute(f"SELECT d_key,dummy_s1 FROM baseline.dim_joins_j01 WHERE mask_s0100_{kind} ORDER BY d_key").fetchall())
+            finally:
+                con.close()
+            metadata = json.loads(varied.query_catalog_path.read_text())["queries"]
+            self.assertTrue(all(q["probe_selectivity"] == .1 for q in metadata.values()))
+            self.assertTrue(all(q["individual_join_selectivity"] == .1 for q in metadata.values()))
+            self.assertTrue(all(q["expected_join_output_rows"] == 200 for q in metadata.values()))
+
+    def test_fixed_domain_multiplicity_keeps_shoulders_and_independent_scattered_layout(self) -> None:
+        queries = tuple(CrossProductQueryTypeConfig(kind, None, ("uniform",))
+                        for kind in ("shoulder", "scattered"))
+        spec = make_spec("build_key_multiplicity", (1, 2, 4), dimension_cardinality=1000,
+                         key_domain_size=1000, selectivity=.1, query_types=queries)
+        only_scattered = replace(spec, experiment_definition=replace(spec.experiment_definition, query_types=queries[1:]))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = prepare_cross_product_workload(spec, root / "both")
+            other = prepare_cross_product_workload(only_scattered, root / "scattered")
+            con = duckdb.connect(str(manifest.db_path), read_only=True)
+            try:
+                con.execute(f"ATTACH '{other.db_path}' AS other (READ_ONLY)")
+                for multiplicity in (2, 4):
+                    selected = round(1000 / multiplicity * .1)
+                    lo, hi = selected // 2, selected - selected // 2
+                    keys = con.execute(f"SELECT DISTINCT d_key FROM dim_m{multiplicity}_j01_shoulder WHERE mask_s0100_shoulder ORDER BY d_key").fetchall()
+                    self.assertEqual([x[0] for x in keys], list(range(1, lo + 1)) + list(range(1001 - hi, 1001)))
+                    for layout in ("shoulder", "spread"):
+                        self.assertEqual(con.execute(f"SELECT count(*),count(DISTINCT d_key),min(d_key),max(d_key) FROM dim_m{multiplicity}_j01_{layout}").fetchone(),
+                                         (1000, 1000 // multiplicity, 1, 1000))
+                    table = f"dim_m{multiplicity}_j01_spread"
+                    self.assertEqual(con.execute(f"SELECT DISTINCT d_key FROM {table} WHERE mask_s0100_scattered ORDER BY d_key").fetchall(),
+                                     con.execute(f"SELECT DISTINCT d_key FROM other.{table} WHERE mask_s0100_scattered ORDER BY d_key").fetchall())
+                    self.assertEqual(con.execute(f"SELECT fact_id,fk_m{multiplicity}_j01_uniform_spread FROM fact ORDER BY fact_id").fetchall(),
+                                     con.execute(f"SELECT fact_id,fk_m{multiplicity}_j01_uniform_spread FROM other.fact ORDER BY fact_id").fetchall())
+            finally:
+                con.close()
+
+    def test_common_sweep_points_reuse_keys_payloads_and_foreign_keys(self) -> None:
+        queries = tuple(CrossProductQueryTypeConfig(kind, None, ("uniform",))
+                        for kind in ("shoulder", "scattered"))
+        reference = {}
+        with tempfile.TemporaryDirectory() as directory:
+            for sweep, value in (("join_count", 1), ("build_key_multiplicity", 1),
+                                 ("selectivity", .1), ("row_group_size", 122880),
+                                 ("cluster_count", 2)):
+                spec = make_spec(sweep, (value,), dimension_cardinality=1000,
+                                 key_domain_size=1000, selectivity=.1,
+                                 query_types=None if sweep == "cluster_count" else queries)
+                manifest = prepare_cross_product_workload(spec, Path(directory) / sweep)
+                catalog = json.loads(manifest.query_catalog_path.read_text())["queries"]
+                with duckdb.connect(str(manifest.db_path), read_only=True) as con:
+                    for path in manifest.setup_sql_paths:
+                        con.execute(path.read_text())
+                    for query_name, parameters in catalog.items():
+                        table = parameters["dimension_tables"][0]
+                        kind = parameters["query_type"]
+                        mask = "mask_s0100_seasonal_c00002" if kind == "seasonal" else f"mask_s0100_{kind}"
+                        keys = con.execute(f"SELECT d_key,dummy_s1 FROM {table} WHERE {mask} ORDER BY d_key").fetchall()
+                        # Execute the rendered join too, including attached row-group databases.
+                        answer = con.execute((manifest.queries_dir / query_name).read_text()).fetchall()
+                        fact_relation = "fact"
+                        if sweep == "row_group_size":
+                            fact_relation = "fact_rg122880.fact"
+                        columns = con.execute(f"DESCRIBE {fact_relation}").fetchall()
+                        fk = next(column[0] for column in columns if column[0].startswith("fk_"))
+                        facts = con.execute(f"SELECT fact_id,{fk},measure FROM {fact_relation} ORDER BY fact_id").fetchall()
+                        shape = "shoulder" if kind == "seasonal" else kind
+                        actual = keys, facts, answer
+                        if shape in reference:
+                            self.assertEqual(actual, reference[shape], (sweep, shape))
+                        else:
+                            reference[shape] = actual
+
     def test_join_sweep_fixes_join_order_after_variant_setup(self) -> None:
         config_path = Path(__file__).resolve().parents[1] / "paper/configs/local_paper_sweeps.json"
         config = load_experiment_config(config_path)
@@ -414,15 +542,15 @@ class CrossProductSweepTest(unittest.TestCase):
             con = duckdb.connect(str(manifest.db_path), read_only=True)
             try:
                 self.assertEqual(
-                    con.execute("SELECT max(d_key) FROM dim_d200_j01").fetchone()[0],
+                    con.execute("SELECT max(d_key) FROM dim_d200_j01_spread").fetchone()[0],
                     200,
                 )
                 missing = con.execute(
                     """
                     SELECT count(*)
                     FROM fact f
-                    ANTI JOIN dim_d200_j01 d
-                      ON f.fk_d200_j01_uniform = d.d_key
+                    ANTI JOIN dim_d200_j01_spread d
+                      ON f.fk_d200_j01_uniform_spread = d.d_key
                     """
                 ).fetchone()[0]
                 self.assertEqual(missing, 0)
@@ -450,7 +578,7 @@ class CrossProductSweepTest(unittest.TestCase):
                 selected_keys = con.execute(
                     """
                     SELECT d_key
-                    FROM dim_d1000_j01
+                    FROM dim_d1000_j01_shoulder
                     WHERE mask_s0100_shoulder
                     ORDER BY d_key
                     """
@@ -465,7 +593,7 @@ class CrossProductSweepTest(unittest.TestCase):
                         SELECT
                             d_key,
                             d_key - row_number() OVER (ORDER BY d_key) AS island
-                        FROM dim_d1000_j01
+                        FROM dim_d1000_j01_shoulder
                         WHERE mask_s0100_shoulder
                     )
                     SELECT count(DISTINCT island) FROM selected
@@ -476,7 +604,7 @@ class CrossProductSweepTest(unittest.TestCase):
                 dimension_counts = con.execute(
                     """
                     SELECT count(*), count(DISTINCT d_key)
-                    FROM dim_d1000_j01
+                    FROM dim_d1000_j01_shoulder
                     """
                 ).fetchone()
                 self.assertEqual(dimension_counts, (100, 100))
@@ -486,7 +614,7 @@ class CrossProductSweepTest(unittest.TestCase):
                         SELECT
                             d_key,
                             d_key - row_number() OVER (ORDER BY d_key) AS island
-                        FROM dim_d1000_j01
+                        FROM dim_d1000_j01_spread
                         WHERE mask_s0100_scattered
                     )
                     SELECT count(*), count(DISTINCT island) FROM selected
@@ -499,8 +627,8 @@ class CrossProductSweepTest(unittest.TestCase):
                     """
                     SELECT count(*)
                     FROM fact f
-                    JOIN dim_d1000_j01 d
-                      ON f.fk_d1000_j01_ordered = d.d_key
+                    JOIN dim_d1000_j01_shoulder d
+                      ON f.fk_d1000_j01_ordered_shoulder = d.d_key
                     WHERE d.mask_s0100_shoulder
                     """
                 ).fetchone()[0]
@@ -522,14 +650,14 @@ class CrossProductSweepTest(unittest.TestCase):
                 rows = con.execute(
                     """
                     SELECT count(*), count(DISTINCT d_key)
-                    FROM dim_m4_j01
+                    FROM dim_m4_j01_spread
                     """
                 ).fetchone()
                 self.assertEqual(rows, (20, 5))
                 selected = con.execute(
                     """
                     SELECT count(*), count(DISTINCT d_key)
-                    FROM dim_m4_j01
+                    FROM dim_m4_j01_spread
                     WHERE mask_s0500_range
                     """
                 ).fetchone()

@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import csv
 import json
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import duckdb
 
 from benchmarking import load_experiment_config
 from benchmarking.manifests import load_manifest
+from benchmarking.filter_profiles import (
+    COUNT_FIELDS, PHASE_FIELDS, JoinFilterMetrics, extract_join_filter_metrics,
+)
 from paper.figure_specs import FIGURES, QUERY_LABELS, VARIANT_ORDER, WORKLOAD_LABELS
 
 
@@ -21,9 +25,7 @@ class MetricRow:
     probe_rows_scanned: int | None
     total_rows_scanned: int | None
     query_parameters: dict[str, object] | None = None
-    prf_build_phase_ms: float | None = None
-    prf_analysis_phase_ms: float | None = None
-    prf_filter_count: int = 0
+    filter_phases: JoinFilterMetrics = field(default_factory=JoinFilterMetrics)
 
 
 @dataclass(frozen=True)
@@ -127,37 +129,6 @@ def _runtime_ms_with_profile_fallback(
     return 0.5
 
 
-def _prf_phase_metrics(profile_data: dict) -> tuple[float | None, float | None, int]:
-    """Sum per-filter wall-clock spans from one query profile, never worker time."""
-    filters = []
-    stack = [profile_data]
-    while stack:
-        node = stack.pop()
-        stack.extend(node.get("children", []))
-        if "prefix_range_filter" in node:
-            filters.append(node["prefix_range_filter"])
-    if not filters:
-        return None, None, 0
-
-    def total_ms(field: str) -> float | None:
-        values = [item.get(field) for item in filters]
-        if any(
-            not isinstance(value, (int, float))
-            or isinstance(value, bool)
-            or not math.isfinite(value)
-            or value < 0
-            for value in values
-        ):
-            return None
-        return sum(values) * 1000.0
-
-    return (
-        total_ms("build_phase_elapsed_seconds"),
-        total_ms("compression_phase_elapsed_seconds"),
-        len(filters),
-    )
-
-
 def load_metric_rows(experiment_root: Path, system_names: tuple[str, ...]) -> list[MetricRow]:
     config = load_experiment_config(experiment_root / "config.json")
     placeholders, system_parameters = _system_predicate(system_names)
@@ -190,13 +161,16 @@ def load_metric_rows(experiment_root: Path, system_names: tuple[str, ...]) -> li
                     workload_name,
                     query_name,
                     variant_label,
-                    max(probe_rows_scanned) AS probe_rows_scanned,
-                    max(total_rows_scanned) AS total_rows_scanned,
-                    max(profile_path) AS profile_path
+                    probe_rows_scanned,
+                    total_rows_scanned,
+                    profile_path
                 FROM profile_runs
                 WHERE experiment_name = ?
                   AND system_name IN ({placeholders})
-                GROUP BY 1, 2, 3
+                QUALIFY row_number() OVER (
+                    PARTITION BY workload_name, query_name, variant_label
+                    ORDER BY profiled_at DESC, run_id DESC
+                ) = 1
             )
             SELECT
                 timing.workload_name,
@@ -226,11 +200,10 @@ def load_metric_rows(experiment_root: Path, system_names: tuple[str, ...]) -> li
     result: list[MetricRow] = []
     for row in rows:
         profile_path = row[7]
-        prf_build_ms = prf_analysis_ms = None
-        prf_filter_count = 0
+        phases = JoinFilterMetrics()
         if profile_path:
             profile_data = json.loads(Path(profile_path).read_text(encoding="utf-8"))
-            prf_build_ms, prf_analysis_ms, prf_filter_count = _prf_phase_metrics(profile_data)
+            phases = extract_join_filter_metrics(profile_data)
         result.append(
             MetricRow(
                 workload_name=row[0],
@@ -243,12 +216,23 @@ def load_metric_rows(experiment_root: Path, system_names: tuple[str, ...]) -> li
                 probe_rows_scanned=row[5],
                 total_rows_scanned=row[6],
                 query_parameters=None if row[4] is None else json.loads(row[4]),
-                prf_build_phase_ms=prf_build_ms,
-                prf_analysis_phase_ms=prf_analysis_ms,
-                prf_filter_count=prf_filter_count,
+                filter_phases=phases,
             )
         )
     return result
+
+
+def write_filter_phase_report(path: Path, rows: list[MetricRow]) -> None:
+    """Include every workload, also sweeps without benchmark-summary panels."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    columns = ["workload_name", "query_name", "variant_label", "median_ms", *PHASE_FIELDS, *COUNT_FIELDS]
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=columns)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({"workload_name": row.workload_name, "query_name": row.query_name,
+                             "variant_label": row.variant_label, "median_ms": row.median_ms,
+                             **row.filter_phases.to_dict()})
 
 
 def _normalize_dynamic_filters(raw: object) -> str:
@@ -634,8 +618,7 @@ def build_runtime_probe_table(
                 {
                     "variant_label": variant_label,
                     "median_ms": metric_row.median_ms,
-                    "prf_build_phase_ms": metric_row.prf_build_phase_ms,
-                    "prf_analysis_phase_ms": metric_row.prf_analysis_phase_ms,
+                    **metric_row.filter_phases.to_dict(),
                     "logical_probe_rows": base_probe_rows,
                     "physical_rows_scanned": probe_rows_scanned,
                     "join_probe_rows": join_probe_rows,
@@ -704,8 +687,7 @@ def build_runtime_plan_work_table(
                 {
                     "variant_label": variant_label,
                     "median_ms": metric_row.median_ms,
-                    "prf_build_phase_ms": metric_row.prf_build_phase_ms,
-                    "prf_analysis_phase_ms": metric_row.prf_analysis_phase_ms,
+                    **metric_row.filter_phases.to_dict(),
                     "rows_scanned": plan_row.cumulative_rows_scanned,
                     "join_probe_tuples": plan_row.cumulative_join_probe_tuples,
                     "join_operator_count": plan_row.join_operator_count,
@@ -910,14 +892,13 @@ def summarize_benchmark_metrics(
                 and row.query_name in query_names
                 and row.variant_label == variant_label
             ]
-            build_values = [
-                row.prf_build_phase_ms for row in phase_rows
-                if row.prf_build_phase_ms is not None
-            ]
-            analysis_values = [
-                row.prf_analysis_phase_ms for row in phase_rows
-                if row.prf_analysis_phase_ms is not None
-            ]
+            phase_summary = {}
+            for name in (*PHASE_FIELDS, *COUNT_FIELDS):
+                values = [value for row in phase_rows
+                          if (value := getattr(row.filter_phases, name)) is not None]
+                phase_summary[name] = sum(values) if values else None
+                if name in PHASE_FIELDS:
+                    phase_summary[name.removesuffix("_ms") + "_profile_count"] = len(values)
             variants[variant_label] = {
                 "total_runtime_ms": sum(
                     metric_values["runtime_ms"][variant_label]
@@ -937,10 +918,7 @@ def summarize_benchmark_metrics(
                 "relative_join_probe_geomean": geometric_mean(
                     relative_values["join_probe_tuples"][variant_label]
                 ),
-                "prf_build_phase_ms": sum(build_values) if build_values else None,
-                "prf_analysis_phase_ms": sum(analysis_values) if analysis_values else None,
-                "prf_build_profile_count": len(build_values),
-                "prf_analysis_profile_count": len(analysis_values),
+                **phase_summary,
             }
         benchmarks.append(
             {

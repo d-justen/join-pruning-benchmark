@@ -12,6 +12,7 @@
 #include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/common/enums/expression_type.hpp"
 #include "duckdb/common/enums/filter_propagate_result.hpp"
+#include "duckdb/common/chrono.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/function/scalar/tablefilter_functions.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -90,6 +91,9 @@ public:
 
 	void InsertHashes(const Vector &hashes_v, idx_t count) const;
 	idx_t LookupHashes(const Vector &hashes_v, SelectionVector &result_sel, idx_t count) const;
+	//! result_sel contains source row ids from sel.
+	idx_t LookupHashes(const Vector &hashes_v, const SelectionVector &sel, SelectionVector &result_sel,
+	                   idx_t count) const;
 
 	void InsertOne(hash_t hash) const;
 	bool LookupOne(hash_t hash) const;
@@ -141,6 +145,33 @@ struct PerfectHashJoinFunctionData : public FunctionData {
 
 enum class CompressionMode : uint8_t { BITMAP, DIRECT_RANGES };
 
+//! Profiling-only counters shared by a PRF's build and probe pipelines.
+struct PrefixRangeFilterTelemetry {
+	//! Worker/probe instrumentation is only enabled by profiling_mode='detailed'.
+	bool detailed = false;
+	atomic<idx_t> build_worker_ns {0};
+	atomic<idx_t> build_initialization_ns {0};
+	atomic<idx_t> build_insertion_ns {0};
+	atomic<idx_t> build_merge_ns {0};
+	atomic<idx_t> build_chunk_count {0};
+	atomic<idx_t> build_task_count {0};
+	atomic<idx_t> local_bitmap_count {0};
+	atomic<idx_t> local_bitmap_bytes_allocated {0};
+	atomic<idx_t> local_bitmap_peak_bytes {0};
+	atomic<idx_t> compression_worker_ns {0};
+	atomic<idx_t> probe_worker_ns {0};
+	atomic<idx_t> prune_worker_ns {0};
+	atomic<idx_t> probe_vectors {0};
+	atomic<idx_t> probe_tuples {0};
+	atomic<idx_t> prune_calls {0};
+	atomic<idx_t> final_mode {0};
+	atomic<idx_t> final_bitmap_allocation_bytes {0};
+	atomic<double> final_false_positive_rate {0};
+	atomic<bool> final_prf_enabled {false};
+	atomic<bool> bloom_fallback_selected {false};
+	atomic<bool> final_state_recorded {false};
+};
+
 //! Runtime prefix-range filter state used by join pushdown and internal tablefilter functions.
 class PrefixRangeFilter {
 public:
@@ -159,12 +190,20 @@ public:
 		idx_t shift = 0;
 		idx_t range_count = 0;
 		idx_t active_buckets = 0;
+		idx_t run_count = 0;
 		idx_t logical_bucket_count = 0;
+		idx_t bitmap_allocation_bytes = 0;
+		idx_t range_index_count = 0;
+		idx_t range_index_bytes = 0;
 		double false_positive_rate = 0;
 	};
 
 	struct BuildState {
 		virtual ~BuildState() = default;
+		idx_t profiling_initialization_ns = 0;
+		idx_t profiling_insertion_ns = 0;
+		idx_t bitmap_allocation_bytes = 0;
+
 		template <class TARGET>
 
 		TARGET &Cast() {
@@ -178,23 +217,42 @@ public:
 		}
 	};
 
+	//! A compression pass may be executed by several tasks. FinishPass is called only after all tasks complete.
+	struct ParallelCompressionState {
+		virtual ~ParallelCompressionState() = default;
+		virtual idx_t TaskCount() const = 0;
+		virtual void ExecuteTask(idx_t task_idx) = 0;
+		//! Returns true if another reduction pass is required.
+		virtual bool FinishPass() = 0;
+		virtual Analysis GetAnalysis() const = 0;
+	};
+
 	virtual ~PrefixRangeFilter() = default;
-	virtual void Initialize(ClientContext &context, idx_t number_of_rows, Value min, Value max,
-	                        const Sizing &sizing) = 0;
+	virtual void Initialize(ClientContext &context, idx_t number_of_rows, Value min, Value max, const Sizing &sizing,
+	                        double estimated_multiplicity = 1.0) = 0;
 	virtual unique_ptr<BuildState> InitializeBuildState(ClientContext &context) const = 0;
 	virtual void InsertKeys(Vector &keys, idx_t count, BuildState &state) const = 0;
 	virtual void MergeBuildState(BuildState &state) = 0;
 	virtual idx_t LookupKeys(Vector &keys, SelectionVector &result_sel, idx_t count) const = 0;
+	//! result_sel contains source row ids from sel.
+	virtual idx_t LookupKeys(Vector &keys, const SelectionVector &sel, SelectionVector &result_sel,
+	                         idx_t count) const = 0;
 	virtual FilterPropagateResult LookupRange(const Value &lower_bound, const Value &upper_bound) const = 0;
 	virtual FilterPropagateResult LookupStatistics(const BaseStatistics &stats) const = 0;
 	virtual bool IsInitialized() const = 0;
 	virtual Analysis Analyze() const = 0;
-	virtual void Compress(ClientContext &context, double max_false_positive_rate) = 0;
-	virtual CompressionInfo GetCompressionInfo() const = 0;
+	virtual Analysis Compress(ClientContext &context, double max_false_positive_rate) = 0;
+	//! Returns nullptr when the serial compression path is preferable.
+	virtual unique_ptr<ParallelCompressionState> InitializeParallelCompression(ClientContext &context,
+	                                                                           double max_false_positive_rate,
+	                                                                           idx_t max_tasks) = 0;
+	//! With collect_statistics=false, only return metadata; never scan the bitmap.
+	virtual CompressionInfo GetCompressionInfo(bool collect_statistics = true) const = 0;
 	static bool SupportedType(const LogicalType &type);
 	static unique_ptr<PrefixRangeFilter> CreatePrefixRangeFilter(const LogicalType &key_type);
 	static bool TryComputeSpan(const Value &lower_bound, const Value &upper_bound, uhugeint_t &result);
-	static bool TryComputeSizing(const Value &min, const Value &max, idx_t count, Sizing &sizing, double fpr = 0.001);
+	static bool TryComputeSizing(const Value &min, const Value &max, idx_t count, Sizing &sizing,
+	                             double false_positive_rate = 0.001);
 	static bool TryComputeFixedSizeSizing(const Value &min, const Value &max, idx_t bucket_count_limit, Sizing &sizing);
 	static bool TryComputeBucketCount(const uhugeint_t &span, idx_t shift, idx_t &bucket_count);
 	static double ComputeFalsePositiveRateUpperBound(const uhugeint_t &span, idx_t count, idx_t shift);
@@ -208,8 +266,21 @@ public:
 		return allows_tuple_filtering;
 	}
 
+	void SetTelemetry(shared_ptr<PrefixRangeFilterTelemetry> telemetry_p) {
+		telemetry = std::move(telemetry_p);
+	}
+
+	optional_ptr<PrefixRangeFilterTelemetry> GetTelemetry() const {
+		return telemetry.get();
+	}
+
+	optional_ptr<PrefixRangeFilterTelemetry> GetDetailedTelemetry() const {
+		return telemetry && telemetry->detailed ? telemetry.get() : nullptr;
+	}
+
 protected:
 	bool allows_tuple_filtering = true;
+	shared_ptr<PrefixRangeFilterTelemetry> telemetry;
 };
 
 //! FunctionData for prefix range internal function

@@ -1,7 +1,7 @@
 {
-  "experiment_name": "paper-sweeps-local",
+  "experiment_name": "paper-sweeps-standardized-local",
   "output_root": "../../out/experiments",
-  "overwrite_output": true,
+  "overwrite_output": false,
   "workloads": [
     {
       "name": "jpb-sweep-joins",
@@ -13,8 +13,8 @@
         "fixed": {
           "fact_rows": 500000000,
           "dimension_cardinality": 100000000,
-          "key_domain_size": "dimension_cardinality",
-          "selectivity": 0.1,
+          "key_domain_size": 100000000,
+          "selectivity": 0.01,
           "join_count": 1,
           "build_key_multiplicity": 1,
           "probe_layout": "uniform",
@@ -25,11 +25,27 @@
         },
         "sweep": {
           "kind": "join_count",
-          "values": [1, 2, 3, 4, 5]
+          "values": [
+            1,
+            2,
+            3,
+            4,
+            5
+          ]
         },
         "query_types": [
-          {"kind": "shoulder", "probe_layouts": ["uniform"]},
-          {"kind": "scattered", "probe_layouts": ["uniform"]}
+          {
+            "kind": "shoulder",
+            "probe_layouts": [
+              "uniform"
+            ]
+          },
+          {
+            "kind": "scattered",
+            "probe_layouts": [
+              "uniform"
+            ]
+          }
         ]
       }
     },
@@ -40,7 +56,7 @@
         "fixed": {
           "fact_rows": 500000000,
           "dimension_cardinality": 100000000,
-          "key_domain_size": "dimension_distinct_keys",
+          "key_domain_size": 100000000,
           "selectivity": 0.01,
           "join_count": 1,
           "build_key_multiplicity": 1,
@@ -53,11 +69,30 @@
         "sweep": {
           "kind": "build_key_multiplicity",
           "cardinality_mode": "fixed_dimension_cardinality",
-          "values": [1, 2, 4, 8, 16, 32, 64, 128]
+          "values": [
+            1,
+            2,
+            4,
+            8,
+            16,
+            32,
+            64,
+            128
+          ]
         },
         "query_types": [
-          {"kind": "shoulder", "probe_layouts": ["uniform"]},
-          {"kind": "scattered", "probe_layouts": ["uniform"]}
+          {
+            "kind": "shoulder",
+            "probe_layouts": [
+              "uniform"
+            ]
+          },
+          {
+            "kind": "scattered",
+            "probe_layouts": [
+              "uniform"
+            ]
+          }
         ]
       }
     },
@@ -68,7 +103,7 @@
         "fixed": {
           "fact_rows": 500000000,
           "dimension_cardinality": 100000000,
-          "key_domain_size": "dimension_cardinality",
+          "key_domain_size": 100000000,
           "selectivity": 0.01,
           "join_count": 1,
           "build_key_multiplicity": 1,
@@ -80,11 +115,33 @@
         },
         "sweep": {
           "kind": "selectivity",
-          "values": [0.0001, 0.0003, 0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 0.5, 0.7, 0.9]
+          "values": [
+            0.0001,
+            0.0003,
+            0.001,
+            0.003,
+            0.01,
+            0.03,
+            0.1,
+            0.3,
+            0.5,
+            0.7,
+            0.9
+          ]
         },
         "query_types": [
-          {"kind": "shoulder", "probe_layouts": ["uniform"]},
-          {"kind": "scattered", "probe_layouts": ["uniform"]}
+          {
+            "kind": "shoulder",
+            "probe_layouts": [
+              "uniform"
+            ]
+          },
+          {
+            "kind": "scattered",
+            "probe_layouts": [
+              "uniform"
+            ]
+          }
         ]
       }
     },
@@ -94,9 +151,9 @@
       "params": {
         "fixed": {
           "fact_rows": 500000000,
-          "dimension_cardinality": 1000000,
-          "key_domain_size": 1000000,
-          "selectivity": 0.1,
+          "dimension_cardinality": 100000000,
+          "key_domain_size": 100000000,
+          "selectivity": 0.01,
           "join_count": 1,
           "build_key_multiplicity": 1,
           "probe_layout": "uniform",
@@ -107,11 +164,29 @@
         },
         "sweep": {
           "kind": "key_domain_size",
-          "values": [1000000, 3000000, 10000000, 30000000, 100000000, 300000000, 1000000000]
+          "values": [
+            5000000,
+            10000000,
+            30000000,
+            100000000,
+            300000000,
+            1000000000
+          ],
+          "cardinality_mode": "fixed_selected_build_and_probe"
         },
         "query_types": [
-          {"kind": "shoulder", "probe_layouts": ["uniform"]},
-          {"kind": "scattered", "probe_layouts": ["uniform"]}
+          {
+            "kind": "shoulder",
+            "probe_layouts": [
+              "uniform"
+            ]
+          },
+          {
+            "kind": "scattered",
+            "probe_layouts": [
+              "uniform"
+            ]
+          }
         ]
       }
     },
@@ -122,7 +197,7 @@
         "fixed": {
           "fact_rows": 500000000,
           "dimension_cardinality": 100000000,
-          "key_domain_size": "dimension_cardinality",
+          "key_domain_size": 100000000,
           "selectivity": 0.01,
           "join_count": 1,
           "build_key_multiplicity": 1,
@@ -134,7 +209,25 @@
         },
         "sweep": {
           "kind": "cluster_count",
-          "values": [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 100000]
+          "values": [
+            2,
+            4,
+            8,
+            16,
+            32,
+            64,
+            128,
+            256,
+            512,
+            1024,
+            2048,
+            4096,
+            8192,
+            16384,
+            32768,
+            65536,
+            100000
+          ]
         }
       }
     },
@@ -145,7 +238,7 @@
         "fixed": {
           "fact_rows": 500000000,
           "dimension_cardinality": 100000000,
-          "key_domain_size": "dimension_cardinality",
+          "key_domain_size": 100000000,
           "selectivity": 0.01,
           "join_count": 1,
           "build_key_multiplicity": 1,
@@ -157,11 +250,28 @@
         },
         "sweep": {
           "kind": "row_group_size",
-          "values": [2048, 8192, 32768, 122880, 524288, 2097152]
+          "values": [
+            2048,
+            8192,
+            32768,
+            122880,
+            524288,
+            2097152
+          ]
         },
         "query_types": [
-          {"kind": "shoulder", "probe_layouts": ["uniform"]},
-          {"kind": "scattered", "probe_layouts": ["uniform"]}
+          {
+            "kind": "shoulder",
+            "probe_layouts": [
+              "uniform"
+            ]
+          },
+          {
+            "kind": "scattered",
+            "probe_layouts": [
+              "uniform"
+            ]
+          }
         ]
       }
     }
@@ -249,17 +359,27 @@
       "variants": [
         {
           "label": "rpt none",
-          "setup_sql": ["SET rpt_filter = 'none';"]
+          "setup_sql": [
+            "SET rpt_filter = 'none';",
+            "SET disabled_optimizers='compressed_materialization';",
+            "SET dynamic_or_filter_threshold=0;"
+          ]
         },
         {
           "label": "rpt cascade",
-          "setup_sql": ["SET rpt_filter = 'cascade';"]
+          "setup_sql": [
+            "SET rpt_filter = 'cascade';",
+            "SET disabled_optimizers='compressed_materialization';",
+            "SET dynamic_or_filter_threshold=0;"
+          ]
         },
         {
           "label": "rpt prf",
           "setup_sql": [
             "SET rpt_filter = 'prf';",
-            "SET rpt_prf_scan_pushdown = true;"
+            "SET rpt_prf_scan_pushdown = true;",
+            "SET disabled_optimizers='compressed_materialization';",
+            "SET dynamic_or_filter_threshold=0;"
           ]
         }
       ]

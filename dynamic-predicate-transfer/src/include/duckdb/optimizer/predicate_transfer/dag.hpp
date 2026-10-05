@@ -14,6 +14,8 @@
 namespace duckdb {
 
 struct FilterPlan {
+	double build_key_multiplicity = 1.0;
+	bool reverse_transfer = false;
 	vector<ColumnBinding> build;
 	vector<ColumnBinding> apply;
 	vector<LogicalType> return_types;

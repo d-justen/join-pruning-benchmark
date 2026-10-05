@@ -8,5 +8,7 @@ tests/
 !tests/
 tests/*
 !tests/test_cross_product_sweeps.py
+!tests/test_filter_profiles.py
+!tests/test_paper_ssb.py
 /external_benchmarks/**/*.duckdb
 /dynamic-predicate-transfer/job-*.csv

@@ -222,7 +222,7 @@ PARAMETER_SWEEP_PANELS = (
         x_label="Key-domain size",
         x_scale="log",
         log_base=10,
-        x_ticks=(1_000_000, 10_000_000, 100_000_000, 1_000_000_000),
+        x_ticks=(5_000_000, 30_000_000, 100_000_000, 1_000_000_000),
     ),
     SweepPanelSpec(
         workload="jpb-sweep-clusters",

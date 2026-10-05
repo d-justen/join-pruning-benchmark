@@ -5,6 +5,7 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from benchmarking import load_experiment_config
+from benchmarking.filter_profiles import JoinFilterMetrics, extract_join_filter_metrics
 from benchmarking.experiment_runner import run_experiment
 from paper.figure_specs import PARAMETER_SWEEP_PANELS, VARIANT_ORDER
 from paper.figures.build_all import (
@@ -19,7 +20,6 @@ from paper.figures.data import (
     ProbeScanRow,
     _extract_join_probe_metrics,
     _extract_probe_scan_rows,
-    _prf_phase_metrics,
     _runtime_ms_with_profile_fallback,
     build_relative_probe_cardinality_values,
     build_runtime_probe_table,
@@ -192,11 +192,11 @@ class PaperSsbTest(unittest.TestCase):
         multiplicity = workloads["jpb-sweep-multiplicity"].experiment_definition
         self.assertEqual(
             multiplicity.fixed.key_domain_size,
-            "dimension_distinct_keys",
+            100_000_000,
         )
         joins = workloads["jpb-sweep-joins"].experiment_definition
         self.assertEqual(joins.sweep.values, (1, 2, 3, 4, 5))
-        self.assertEqual(joins.fixed.selectivity, 0.1)
+        self.assertEqual(joins.fixed.selectivity, 0.01)
         rpt = next(system for system in config.systems if system.name == "rpt-plus")
         self.assertEqual(set(rpt.workload_names), set(workloads))
 
@@ -246,32 +246,17 @@ class PaperSsbTest(unittest.TestCase):
 
             self.assertEqual(runtime_ms, 0.125)
 
-    def test_prf_phase_totals_use_elapsed_profile_fields(self) -> None:
-        profile = {
-            "children": [
-                {"prefix_range_filter": {
-                    "build_phase_elapsed_seconds": 0.003,
-                    "compression_phase_elapsed_seconds": 0.001,
-                    "build_worker_seconds": 0.2,
-                }},
-                {"prefix_range_filter": {
-                    "build_phase_elapsed_seconds": 0.004,
-                    "compression_phase_elapsed_seconds": 0.002,
-                    "build_worker_seconds": 0.3,
-                }},
-            ]
-        }
-        self.assertEqual(_prf_phase_metrics(profile), (7.0, 3.0, 2))
-        self.assertEqual(
-            _prf_phase_metrics({"children": [{"prefix_range_filter": {
-                "build_phase_elapsed_seconds": 0.003,
-            }}]}),
-            (3.0, None, 1),
-        )
-
+    def test_filter_phase_summary_preserves_partial_profile_coverage(self) -> None:
+        # Old PRF spans cannot stand in for the newly scoped elapsed timings.
+        legacy = {"children": [{"prefix_range_filter": {
+            "build_phase_elapsed_seconds": 0.003,
+            "compression_phase_elapsed_seconds": 0.001,
+        }}]}
+        self.assertEqual(extract_join_filter_metrics(legacy), JoinFilterMetrics())
         rows = [
             MetricRow("workload", "q1.sql", "prf with fallback", 10, 5, 5,
-                      prf_build_phase_ms=7.0, prf_analysis_phase_ms=3.0, prf_filter_count=2),
+                      filter_phases=JoinFilterMetrics(join_finalize_build_ms=7.0,
+                                                     prf_analysis_ms=0.0, prf_compression_ms=3.0)),
             MetricRow("workload", "q2.sql", "prf with fallback", 20, 5, 5),
         ]
         plan_rows = [
@@ -282,10 +267,10 @@ class PaperSsbTest(unittest.TestCase):
             rows, plan_rows, (("workload", "Workload", ("q1.sql", "q2.sql")),),
         )
         variant = summary["benchmarks"][0]["variants"]["prf with fallback"]
-        self.assertEqual(variant["prf_build_phase_ms"], 7.0)
-        self.assertEqual(variant["prf_analysis_phase_ms"], 3.0)
-        self.assertEqual(variant["prf_build_profile_count"], 1)
-        self.assertEqual(variant["prf_analysis_profile_count"], 1)
+        self.assertEqual(variant["join_finalize_build_ms"], 7.0)
+        self.assertEqual(variant["prf_compression_ms"], 3.0)
+        self.assertEqual(variant["join_finalize_build_profile_count"], 1)
+        self.assertEqual(variant["prf_compression_profile_count"], 1)
 
     def test_rpt_use_bf_metadata_is_attached_to_scan(self) -> None:
         profile = {

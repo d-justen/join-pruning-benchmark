@@ -13,6 +13,10 @@ using namespace duckdb;
 #include "grafite_benchmark_adapter.hpp"
 #endif
 
+#if defined(DUCKDB_FILTER_BENCHMARK_HAS_DIVA)
+#include "diva_benchmark_adapter.hpp"
+#endif
+
 namespace {
 
 void FillVector(Vector &vector, const std::vector<uint64_t> &values) {
@@ -95,8 +99,8 @@ bool TestPRF(DuckDB &db) {
 		std::cerr << "PRF sizing failed\n";
 		return false;
 	}
-	filter->Initialize(context, build_keys.size(), Value::UBIGINT(build_keys.front()), Value::UBIGINT(build_keys.back()),
-	                   sizing);
+	filter->Initialize(context, build_keys.size(), Value::UBIGINT(build_keys.front()),
+	                   Value::UBIGINT(build_keys.back()), sizing);
 
 	Vector build_vec(LogicalType::UBIGINT, build_keys.size());
 	Vector probe_vec(LogicalType::UBIGINT, probes.size());
@@ -136,8 +140,8 @@ bool TestPRFDirectRanges(DuckDB &db) {
 		std::cerr << "PRF direct-range fixed-size sizing failed\n";
 		return false;
 	}
-	filter->Initialize(context, build_keys.size(), Value::UBIGINT(build_keys.front()), Value::UBIGINT(build_keys.back()),
-	                   sizing);
+	filter->Initialize(context, build_keys.size(), Value::UBIGINT(build_keys.front()),
+	                   Value::UBIGINT(build_keys.back()), sizing);
 
 	Vector build_vec(LogicalType::UBIGINT, build_keys.size());
 	Vector probe_vec(LogicalType::UBIGINT, probes.size());
@@ -159,6 +163,29 @@ bool TestPRFDirectRanges(DuckDB &db) {
 	const auto match_count = filter->LookupKeys(probe_vec, result_sel, probes.size());
 	if (match_count != 4) {
 		std::cerr << "PRF direct-range sanity check failed: expected 4 matches, got " << match_count << '\n';
+		return false;
+	}
+	return true;
+}
+
+bool TestPRFRangeNoOverlap(DuckDB &db) {
+	Connection con(db);
+	auto &context = *con.context;
+	std::vector<uint64_t> build_keys = {0, 1, 2, 97, 98, 99};
+	auto filter = PrefixRangeFilter::CreatePrefixRangeFilter(LogicalType::UBIGINT);
+	PrefixRangeFilter::Sizing sizing;
+	if (!PrefixRangeFilter::TryComputeFixedSizeSizing(Value::UBIGINT(0), Value::UBIGINT(99), 100, sizing)) {
+		return false;
+	}
+	filter->Initialize(context, build_keys.size(), Value::UBIGINT(0), Value::UBIGINT(99), sizing);
+	Vector build_vec(LogicalType::UBIGINT, build_keys.size());
+	FillVector(build_vec, build_keys);
+	auto state = filter->InitializeBuildState(context);
+	filter->InsertKeys(build_vec, build_keys.size(), *state);
+	filter->MergeBuildState(*state);
+	filter->Compress(context, 0.01);
+	if (filter->LookupRange(Value::UBIGINT(40), Value::UBIGINT(59)) != FilterPropagateResult::FILTER_ALWAYS_FALSE) {
+		std::cerr << "PRF range sanity check failed: empty middle range was not pruned\n";
 		return false;
 	}
 	return true;
@@ -188,6 +215,23 @@ bool TestGrafite() {
 		std::cerr << "Grafite sanity check failed: size should be > 0\n";
 		return false;
 	}
+	if (!filter.RangeProbe(0, 2)) {
+		std::cerr << "Grafite range sanity check failed: overlapping range was rejected\n";
+		return false;
+	}
+	return true;
+}
+#endif
+
+#if defined(DUCKDB_FILTER_BENCHMARK_HAS_DIVA)
+bool TestDiva() {
+	std::vector<uint64_t> build_keys = {0, 1, 2, 97, 98, 99};
+	DivaBenchmarkFilter filter;
+	filter.Build(build_keys, 16.0);
+	if (!filter.RangeProbe(0, 2)) {
+		std::cerr << "Diva range sanity check failed: overlapping range was rejected\n";
+		return false;
+	}
 	return true;
 }
 #endif
@@ -196,11 +240,17 @@ bool TestGrafite() {
 
 int main() {
 	DuckDB db(nullptr);
-	if (!TestBloom(db) || !TestPRF(db) || !TestPRFDirectRanges(db) || !TestClusteredKeySpan()) {
+	if (!TestBloom(db) || !TestPRF(db) || !TestPRFDirectRanges(db) || !TestPRFRangeNoOverlap(db) ||
+	    !TestClusteredKeySpan()) {
 		return 1;
 	}
 #if defined(DUCKDB_FILTER_BENCHMARK_HAS_GRAFITE)
 	if (!TestGrafite()) {
+		return 1;
+	}
+#endif
+#if defined(DUCKDB_FILTER_BENCHMARK_HAS_DIVA)
+	if (!TestDiva()) {
 		return 1;
 	}
 #endif

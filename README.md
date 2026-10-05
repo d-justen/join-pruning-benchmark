@@ -55,8 +55,8 @@ Supported sweeps are `dimension_cardinality`, `selectivity`,
 and `row_group_size`. A cluster-count sweep defines its query layout and does
 not accept `query_types`; cluster counts start at two. Join-count sweeps use
 distinct dimension keys and independent uniform fact keys. Multiplicity
-sweeps keep total dimension cardinality fixed. Density sweeps draw fact keys
-only from keys present in the dimension. Row-group sweeps create native
+sweeps keep total dimension cardinality fixed. The default density mode draws
+fact keys only from keys present in the dimension. Row-group sweeps create native
 DuckDB fact databases, leaving dimension storage fixed.
 
 `key_domain_size` accepts an integer, `"dimension_cardinality"`, or
@@ -80,11 +80,123 @@ python3 paper/run_paper_experiments.py \
   --config paper/configs/local_paper_sweeps.json
 ```
 
+The standardized sweep writes to `out/experiments/paper-sweeps-standardized-local`
+and refuses to overwrite an existing run. Its common baseline is 500 million fact
+rows, 100 million dimension rows and key-domain size, 1% selected keys, one join,
+one row per key, uniform probes, 122,880 rows per group, and seed 7. All variants
+disable `compressed_materialization`; the run uses eight threads and ten repeats.
+The one-join, one-row-per-key, 1% selectivity, 100-million density-domain, and
+default-row-group points share the same logical keys, payloads, and FK mapping.
+The two-cluster point has the shoulder selection. Physical table widths and
+storage layouts can still differ between sweeps.
+
+For multiplicity, both the 100-million total dimension rows and whole key domain
+stay fixed. Scattered keys spread over the domain as their count decreases.
+Shoulder keys form two contiguous ranges anchored at the domain boundaries;
+their widths shrink with multiplicity. Separate dimension layouts and fact FK
+columns prevent the shoulder layout from changing scattered key spacing.
+
+The density sweep uses `"cardinality_mode": "fixed_selected_build_and_probe"`.
+It fixes the **selected** build side at one million unique keys while varying
+the domain through 5M, 10M, 30M, 100M, 300M, and 1B. The unfiltered dimension has
+one row per domain key, so its predicate selectivity is `1M / domain size`.
+Each domain and query shape has its own fact FK column. Every fact row retains
+its matching/nonmatching status from the 100M baseline; it samples uniformly
+within the corresponding selected set or complement. Consequently, output
+cardinality stays exactly constant across domains **within each query shape**.
+The number is the realized baseline count (approximately five million), not a
+newly rounded target. Away from 100M these probes are conditionally uniform,
+not uniform over the whole numeric domain. At 100M the original FK values are
+reused exactly. This mode currently requires one join, unique build keys,
+shoulder/scattered uniform queries, and default native DuckDB row groups.
+
+`query_catalog.json` distinguishes dimension predicate selectivity, probe
+selectivity, selected build cardinality, key density, reference domain, and
+expected output cardinality. Figure summaries retain these parameters for each
+point. For the density panel, the caption should state: “One million selected
+unique build keys; matching fact rows fixed to the 100M-domain baseline per query
+shape; conditional uniform FK distribution.” For multiplicity: “100M total
+dimension rows and whole key domain; contiguous boundary shoulders or scattered
+keys with increasing spacing.” Existing results use their original contracts
+and should not be mixed with the standardized run.
+
 The paper configuration also includes the local `dynamic-predicate-transfer/`
 checkout as the `rpt-plus` system. Its three variants select `rpt_filter=none`,
 `cascade`, and `prf`; the PRF variant explicitly enables
 `rpt_prf_scan_pushdown`. The RPT+ system currently runs the Join Pruning, JOB,
 TPC-H Skew, and SSB Ordered workloads. String joins and DuckLake are excluded.
+
+The vendored regular PRF is the reference implementation. RPT+/PRF uses its fixed
+bitmap sizing, source-statistics multiplicity estimate, 0.1% false-positive
+budget, at-most-four direct ranges, and 16 KiB compression cache target. It also
+uses the same sector Bloom construction as the fallback when the initial PRF
+estimate exceeds the budget. Both engines' JSON profiles expose representation,
+FPR, fallback choice, and compression time. RPT+ additionally reports build rows,
+estimated multiplicity/distinct keys, shifts, and transfer direction. The two engines still
+differ in version, propagation direction, scheduling, and probe batch handling.
+Their source distinct-count estimates can differ when they materialize data
+separately. The parity check tests compression with identical supplied statistics
+and executes SQL against a single shared database, including its persisted
+statistics. The SQL fixtures mix selected and rejected rows to avoid RPT's early
+selectivity-sampling cutoff.
+Source identity is intentionally omitted from experiment metadata.
+
+Focused validation (without generating or running the paper sweep):
+
+The parity script compiles a small fixture against each built library using `c++`
+(or `--cxx`) and runs both explicit-statistics and SQL checks at one and four threads.
+
+```bash
+python3 -m unittest discover -s tests -p test_cross_product_sweeps.py
+dynamic-predicate-transfer/build/paper-native-release/test/unittest '[rpt_prf]'
+python3 paper/validate_prf_parity.py --prf duckdb/build/paper-native-release/duckdb \
+  --rpt dynamic-predicate-transfer/build/paper-native-release/duckdb
+```
+
+## Filter Build Profiling
+
+Standard JSON profiling records comparable elapsed timings in each hash join's
+`join_filter` object. The benchmark imports them into `profile_runs` and reports
+them for compressed PRF, uncompressed PRF, Bloom-only, and disabled-filter variants:
+
+| Result field (milliseconds) | DuckDB profile field (seconds) | Meaning |
+|---|---|---|
+| `join_finalize_build_ms` | `join_finalize_build_elapsed_seconds` | Hash-table finalization and filter construction, excluding PRF postprocessing |
+| `prf_analysis_ms` | `prf_analysis_elapsed_seconds` | Standalone PRF analysis, including the uncompressed fallback decision |
+| `prf_compression_ms` | `prf_compression_elapsed_seconds` | PRF compression, including its bitmap analysis |
+| `join_finalize_ms` | `join_finalize_elapsed_seconds` | Total of the three phases above |
+
+The build column is labeled **Join/filter build** because it includes hash-table
+work. It is not an isolated PRF or Bloom construction cost. A PRF followed by Bloom
+fallback counts as one elapsed build interval; `prf_build_count` and
+`bloom_build_count` both increase. Bloom-only runs have zero PRF analysis and
+compression; uncompressed PRF can have nonzero analysis but zero compression.
+Finalization, perfect-hash, and external-finalization counts are retained too.
+
+`paper/run_paper_experiments.py` and `paper/figures/build_all.py` write
+`paper/filter_phases.csv` for every query and variant, including all sweep points.
+The paper summary table has separate build, analysis, and compression columns;
+JPB runtime figures annotate the three phases. `analyze_results.py` includes
+per-query `filter_phases` in each workload/system's `analysis/summary.json` entry.
+Existing result databases acquire the new columns when metrics are imported.
+
+These timings come from one separate profiled execution, while runtime bars use
+repetition medians. Spans from concurrent joins can overlap and must not be
+interpreted as an additive decomposition of query latency. External joins report
+initial finalization only. Worker timings are not substituted for elapsed time.
+Old `prefix_range_filter.build_phase_elapsed_seconds` and
+`compression_phase_elapsed_seconds` have different boundaries; older profiles,
+including RPT+ profiles without `join_filter`, therefore show blank CSV cells or
+dashes for the new timings. Explicit zero remains zero. Missing phases cannot be
+recovered from old timings; a fresh profile is needed.
+
+The profiling pipeline selects `profiling_mode='standard'`, which provides these
+elapsed metrics without detailed worker/probe instrumentation. Focused parser,
+reporting, migration, and small engine checks can be run with:
+
+```bash
+python3 -m unittest discover -s tests -p test_filter_profiles.py
+```
 
 Git systems may set `checkout_dir` to use a source tree other than the shared
 `duckdb/` checkout. Systems may set `workload_names` to run only a subset of the
