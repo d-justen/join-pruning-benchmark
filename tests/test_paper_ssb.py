@@ -15,12 +15,15 @@ from paper.figures.build_all import (
 )
 from paper.figures.data import (
     MetricRow,
+    PlanMetricRow,
     ProbeScanRow,
     _extract_join_probe_metrics,
     _extract_probe_scan_rows,
+    _prf_phase_metrics,
     _runtime_ms_with_profile_fallback,
     build_relative_probe_cardinality_values,
     build_runtime_probe_table,
+    summarize_benchmark_metrics,
 )
 
 
@@ -242,6 +245,47 @@ class PaperSsbTest(unittest.TestCase):
             runtime_ms = _runtime_ms_with_profile_fallback(0.0, str(profile_path))
 
             self.assertEqual(runtime_ms, 0.125)
+
+    def test_prf_phase_totals_use_elapsed_profile_fields(self) -> None:
+        profile = {
+            "children": [
+                {"prefix_range_filter": {
+                    "build_phase_elapsed_seconds": 0.003,
+                    "compression_phase_elapsed_seconds": 0.001,
+                    "build_worker_seconds": 0.2,
+                }},
+                {"prefix_range_filter": {
+                    "build_phase_elapsed_seconds": 0.004,
+                    "compression_phase_elapsed_seconds": 0.002,
+                    "build_worker_seconds": 0.3,
+                }},
+            ]
+        }
+        self.assertEqual(_prf_phase_metrics(profile), (7.0, 3.0, 2))
+        self.assertEqual(
+            _prf_phase_metrics({"children": [{"prefix_range_filter": {
+                "build_phase_elapsed_seconds": 0.003,
+            }}]}),
+            (3.0, None, 1),
+        )
+
+        rows = [
+            MetricRow("workload", "q1.sql", "prf with fallback", 10, 5, 5,
+                      prf_build_phase_ms=7.0, prf_analysis_phase_ms=3.0, prf_filter_count=2),
+            MetricRow("workload", "q2.sql", "prf with fallback", 20, 5, 5),
+        ]
+        plan_rows = [
+            PlanMetricRow("workload", query, "prf with fallback", 5, 5, 1)
+            for query in ("q1.sql", "q2.sql")
+        ]
+        summary = summarize_benchmark_metrics(
+            rows, plan_rows, (("workload", "Workload", ("q1.sql", "q2.sql")),),
+        )
+        variant = summary["benchmarks"][0]["variants"]["prf with fallback"]
+        self.assertEqual(variant["prf_build_phase_ms"], 7.0)
+        self.assertEqual(variant["prf_analysis_phase_ms"], 3.0)
+        self.assertEqual(variant["prf_build_profile_count"], 1)
+        self.assertEqual(variant["prf_analysis_profile_count"], 1)
 
     def test_rpt_use_bf_metadata_is_attached_to_scan(self) -> None:
         profile = {

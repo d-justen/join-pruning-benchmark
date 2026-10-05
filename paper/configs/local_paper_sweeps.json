@@ -44,7 +44,7 @@
           "selectivity": 0.01,
           "join_count": 1,
           "build_key_multiplicity": 1,
-          "probe_layout": "ordered",
+          "probe_layout": "uniform",
           "row_group_size": 122880,
           "dummy_string_cols": 2,
           "dummy_string_len": 8,
@@ -56,8 +56,8 @@
           "values": [1, 2, 4, 8, 16, 32, 64, 128]
         },
         "query_types": [
-          {"kind": "shoulder", "probe_layouts": ["ordered"]},
-          {"kind": "scattered", "probe_layouts": ["ordered"]}
+          {"kind": "shoulder", "probe_layouts": ["uniform"]},
+          {"kind": "scattered", "probe_layouts": ["uniform"]}
         ]
       }
     },
@@ -72,7 +72,7 @@
           "selectivity": 0.01,
           "join_count": 1,
           "build_key_multiplicity": 1,
-          "probe_layout": "ordered",
+          "probe_layout": "uniform",
           "row_group_size": 122880,
           "dummy_string_cols": 2,
           "dummy_string_len": 8,
@@ -83,8 +83,8 @@
           "values": [0.0001, 0.0003, 0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 0.5, 0.7, 0.9]
         },
         "query_types": [
-          {"kind": "shoulder", "probe_layouts": ["ordered"]},
-          {"kind": "scattered", "probe_layouts": ["ordered"]}
+          {"kind": "shoulder", "probe_layouts": ["uniform"]},
+          {"kind": "scattered", "probe_layouts": ["uniform"]}
         ]
       }
     },
@@ -99,7 +99,7 @@
           "selectivity": 0.1,
           "join_count": 1,
           "build_key_multiplicity": 1,
-          "probe_layout": "ordered",
+          "probe_layout": "uniform",
           "row_group_size": 122880,
           "dummy_string_cols": 2,
           "dummy_string_len": 8,
@@ -110,8 +110,8 @@
           "values": [1000000, 3000000, 10000000, 30000000, 100000000, 300000000, 1000000000]
         },
         "query_types": [
-          {"kind": "shoulder", "probe_layouts": ["ordered"]},
-          {"kind": "scattered", "probe_layouts": ["ordered"]}
+          {"kind": "shoulder", "probe_layouts": ["uniform"]},
+          {"kind": "scattered", "probe_layouts": ["uniform"]}
         ]
       }
     },
@@ -126,7 +126,7 @@
           "selectivity": 0.01,
           "join_count": 1,
           "build_key_multiplicity": 1,
-          "probe_layout": "ordered",
+          "probe_layout": "uniform",
           "row_group_size": 122880,
           "dummy_string_cols": 2,
           "dummy_string_len": 8,
@@ -149,7 +149,7 @@
           "selectivity": 0.01,
           "join_count": 1,
           "build_key_multiplicity": 1,
-          "probe_layout": "ordered",
+          "probe_layout": "uniform",
           "row_group_size": 122880,
           "dummy_string_cols": 2,
           "dummy_string_len": 8,
@@ -160,8 +160,8 @@
           "values": [2048, 8192, 32768, 122880, 524288, 2097152]
         },
         "query_types": [
-          {"kind": "shoulder", "probe_layouts": ["ordered"]},
-          {"kind": "scattered", "probe_layouts": ["ordered"]}
+          {"kind": "shoulder", "probe_layouts": ["uniform"]},
+          {"kind": "scattered", "probe_layouts": ["uniform"]}
         ]
       }
     }

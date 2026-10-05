@@ -21,6 +21,9 @@ class MetricRow:
     probe_rows_scanned: int | None
     total_rows_scanned: int | None
     query_parameters: dict[str, object] | None = None
+    prf_build_phase_ms: float | None = None
+    prf_analysis_phase_ms: float | None = None
+    prf_filter_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -124,6 +127,37 @@ def _runtime_ms_with_profile_fallback(
     return 0.5
 
 
+def _prf_phase_metrics(profile_data: dict) -> tuple[float | None, float | None, int]:
+    """Sum per-filter wall-clock spans from one query profile, never worker time."""
+    filters = []
+    stack = [profile_data]
+    while stack:
+        node = stack.pop()
+        stack.extend(node.get("children", []))
+        if "prefix_range_filter" in node:
+            filters.append(node["prefix_range_filter"])
+    if not filters:
+        return None, None, 0
+
+    def total_ms(field: str) -> float | None:
+        values = [item.get(field) for item in filters]
+        if any(
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+            or value < 0
+            for value in values
+        ):
+            return None
+        return sum(values) * 1000.0
+
+    return (
+        total_ms("build_phase_elapsed_seconds"),
+        total_ms("compression_phase_elapsed_seconds"),
+        len(filters),
+    )
+
+
 def load_metric_rows(experiment_root: Path, system_names: tuple[str, ...]) -> list[MetricRow]:
     config = load_experiment_config(experiment_root / "config.json")
     placeholders, system_parameters = _system_predicate(system_names)
@@ -189,23 +223,32 @@ def load_metric_rows(experiment_root: Path, system_names: tuple[str, ...]) -> li
         ).fetchall()
     finally:
         con.close()
-    return [
-        MetricRow(
-            workload_name=row[0],
-            query_name=row[1],
-            variant_label=row[2],
-            # Older DuckDB builds expose CURRENT_TIMESTAMP at millisecond
-            # precision. Use the high-resolution profile latency when their
-            # repetition median is zero.
-            median_ms=_runtime_ms_with_profile_fallback(float(row[3]), row[7]),
-            probe_rows_scanned=row[5],
-            total_rows_scanned=row[6],
-            query_parameters=(
-                None if row[4] is None else json.loads(row[4])
-            ),
+    result: list[MetricRow] = []
+    for row in rows:
+        profile_path = row[7]
+        prf_build_ms = prf_analysis_ms = None
+        prf_filter_count = 0
+        if profile_path:
+            profile_data = json.loads(Path(profile_path).read_text(encoding="utf-8"))
+            prf_build_ms, prf_analysis_ms, prf_filter_count = _prf_phase_metrics(profile_data)
+        result.append(
+            MetricRow(
+                workload_name=row[0],
+                query_name=row[1],
+                variant_label=row[2],
+                # Older DuckDB builds expose CURRENT_TIMESTAMP at millisecond
+                # precision. Use the high-resolution profile latency when their
+                # repetition median is zero.
+                median_ms=_runtime_ms_with_profile_fallback(float(row[3]), profile_path),
+                probe_rows_scanned=row[5],
+                total_rows_scanned=row[6],
+                query_parameters=None if row[4] is None else json.loads(row[4]),
+                prf_build_phase_ms=prf_build_ms,
+                prf_analysis_phase_ms=prf_analysis_ms,
+                prf_filter_count=prf_filter_count,
+            )
         )
-        for row in rows
-    ]
+    return result
 
 
 def _normalize_dynamic_filters(raw: object) -> str:
@@ -591,6 +634,8 @@ def build_runtime_probe_table(
                 {
                     "variant_label": variant_label,
                     "median_ms": metric_row.median_ms,
+                    "prf_build_phase_ms": metric_row.prf_build_phase_ms,
+                    "prf_analysis_phase_ms": metric_row.prf_analysis_phase_ms,
                     "logical_probe_rows": base_probe_rows,
                     "physical_rows_scanned": probe_rows_scanned,
                     "join_probe_rows": join_probe_rows,
@@ -659,6 +704,8 @@ def build_runtime_plan_work_table(
                 {
                     "variant_label": variant_label,
                     "median_ms": metric_row.median_ms,
+                    "prf_build_phase_ms": metric_row.prf_build_phase_ms,
+                    "prf_analysis_phase_ms": metric_row.prf_analysis_phase_ms,
                     "rows_scanned": plan_row.cumulative_rows_scanned,
                     "join_probe_tuples": plan_row.cumulative_join_probe_tuples,
                     "join_operator_count": plan_row.join_operator_count,
@@ -857,6 +904,20 @@ def summarize_benchmark_metrics(
 
         variants: dict[str, object] = {}
         for variant_label in active_variants:
+            phase_rows = [
+                row for row in rows
+                if row.workload_name == workload_name
+                and row.query_name in query_names
+                and row.variant_label == variant_label
+            ]
+            build_values = [
+                row.prf_build_phase_ms for row in phase_rows
+                if row.prf_build_phase_ms is not None
+            ]
+            analysis_values = [
+                row.prf_analysis_phase_ms for row in phase_rows
+                if row.prf_analysis_phase_ms is not None
+            ]
             variants[variant_label] = {
                 "total_runtime_ms": sum(
                     metric_values["runtime_ms"][variant_label]
@@ -876,6 +937,10 @@ def summarize_benchmark_metrics(
                 "relative_join_probe_geomean": geometric_mean(
                     relative_values["join_probe_tuples"][variant_label]
                 ),
+                "prf_build_phase_ms": sum(build_values) if build_values else None,
+                "prf_analysis_phase_ms": sum(analysis_values) if analysis_values else None,
+                "prf_build_profile_count": len(build_values),
+                "prf_analysis_profile_count": len(analysis_values),
             }
         benchmarks.append(
             {
