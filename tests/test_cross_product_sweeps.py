@@ -4,6 +4,7 @@ import json
 import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
 from dataclasses import replace
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from benchmarking.duckdb_build import ResolvedSystem
 from benchmarking.duckdb_runner import render_workload_sql
 from benchmarking.experiment_config import (
     BenchmarkOptions,
+    DensityPreparationOptions,
     CrossProductExperimentDefinition,
     CrossProductFixedParameters,
     CrossProductQueryTypeConfig,
@@ -21,12 +23,14 @@ from benchmarking.experiment_config import (
     VariantConfig,
     load_experiment_config,
 )
-from benchmarking.experiment_runner import run_experiment
+from benchmarking.experiment_runner import run_experiment, prepare_workloads, _validate_preparation_resume
+from benchmarking.artifact_layout import ExperimentPaths
 from benchmarking.manifests import load_manifest, write_manifest
 from benchmarking.query_inventory import load_queries
 from benchmarking.results_analysis import _profile_sql
 from benchmarking.workloads.cross_product import (
     _resolve_sweep_cases,
+    _insert_density_fact_batches,
     _shoulder_preserving_key_expr,
     _spread_key_expr,
     prepare_cross_product_workload,
@@ -95,6 +99,197 @@ def make_spec(
 
 
 class CrossProductSweepTest(unittest.TestCase):
+    def density_spec(self, fact_rows=245_777, batch_rows=122_880):
+        spec = make_spec("key_domain_size", (200, 1000, 2000),
+                         dimension_cardinality=1000, key_domain_size=1000, selectivity=.1,
+                         query_types=tuple(CrossProductQueryTypeConfig(kind, None, ("uniform",))
+                                           for kind in ("shoulder", "scattered")))
+        return replace(spec, preparation=DensityPreparationOptions(batch_rows=batch_rows, threads=2),
+                       experiment_definition=replace(
+                           spec.experiment_definition,
+                           fixed=replace(spec.experiment_definition.fixed, fact_rows=fact_rows),
+                           sweep=replace(spec.experiment_definition.sweep,
+                                         cardinality_mode="fixed_selected_build_and_probe")))
+
+    def test_density_batches_match_single_batch_and_reference_membership(self):
+        spec = self.density_spec()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            batched = prepare_cross_product_workload(spec, root / "batched")
+            single = prepare_cross_product_workload(
+                replace(spec, preparation=replace(spec.preparation, batch_rows=983_040)), root / "single")
+            con = duckdb.connect(str(batched.db_path), read_only=True)
+            try:
+                con.execute(f"ATTACH '{single.db_path}' AS single (READ_ONLY)")
+                self.assertEqual(con.execute("SELECT count(*) FROM fact").fetchone()[0], 245_777)
+                self.assertEqual(con.execute("SELECT count(*) FROM fact WHERE fact_id != rowid + 1").fetchone()[0], 0)
+                self.assertEqual(con.execute("""SELECT count(*) FROM (
+                    (SELECT * FROM fact EXCEPT ALL SELECT * FROM single.fact)
+                    UNION ALL (SELECT * FROM single.fact EXCEPT ALL SELECT * FROM fact))""").fetchone()[0], 0)
+                for kind in ("shoulder", "scattered"):
+                    self.assertEqual(con.execute(f"""SELECT count(*) FROM fact
+                        WHERE fk_d1000_j01_uniform_{kind} != hash(fact_id + 104736) % 1000 + 1""").fetchone()[0], 0)
+                    for domain, mask in ((200, "s0500"), (2000, "s0050")):
+                        self.assertEqual(con.execute(f"""SELECT count(*) FROM fact f
+                            LEFT JOIN dim_d1000_j01 r ON f.fk_d1000_j01_uniform_{kind} = r.d_key
+                            LEFT JOIN dim_d{domain}_j01 d ON f.fk_d{domain}_j01_uniform_{kind} = d.d_key
+                            WHERE d.d_key IS NULL OR r.mask_s0100_{kind} IS DISTINCT FROM d.mask_{mask}_{kind}
+                            """).fetchone()[0], 0)
+            finally:
+                con.close()
+
+    def test_density_resume_rolls_back_failed_batch_and_reuses_dimensions(self):
+        spec = self.density_spec()
+        module = "benchmarking.workloads.cross_product"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "density"
+
+            class FailProgress:
+                def __init__(self, con):
+                    self.con = con
+
+                def execute(self, sql, parameters=None):
+                    if sql.startswith("UPDATE _density_generation_state") and parameters[0] > 122_881:
+                        raise RuntimeError("interrupted after inserting second batch")
+                    return self.con.execute(sql, parameters) if parameters is not None else self.con.execute(sql)
+
+            def interrupted(con, *args):
+                return _insert_density_fact_batches(FailProgress(con), *args)
+
+            with patch(module + "._insert_density_fact_batches", side_effect=interrupted):
+                with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                    prepare_cross_product_workload(spec, artifact)
+            con = duckdb.connect(str(artifact / "benchmark.duckdb"))
+            self.assertEqual(con.execute("SELECT count(*) FROM fact").fetchone()[0], 122_880)
+            self.assertEqual(con.execute("SELECT next_fact_id FROM _density_generation_state").fetchone()[0], 122_881)
+            con.close()
+            # A changed definition must fail before modifying any data.
+            changed = replace(spec, experiment_definition=replace(spec.experiment_definition,
+                              fixed=replace(spec.experiment_definition.fixed, seed=8)))
+            with self.assertRaisesRegex(ValueError, "definition differs"):
+                prepare_cross_product_workload(changed, artifact, resume_density=True)
+
+            real_connect = duckdb.connect
+            statements = []
+
+            class TracedConnection:
+                def __init__(self, *args, **kwargs):
+                    self.con = real_connect(*args, **kwargs)
+
+                def execute(self, sql, *args):
+                    statements.append(sql)
+                    return self.con.execute(sql, *args)
+
+                def close(self):
+                    self.con.close()
+
+            # Resources can change without changing the data contract.
+            resumed = replace(spec, preparation=replace(spec.preparation, batch_rows=245_760, threads=1))
+            with patch(module + ".duckdb.connect", side_effect=TracedConnection):
+                manifest = prepare_cross_product_workload(resumed, artifact, resume_density=True)
+            self.assertFalse(any("CREATE TABLE dim_" in sql for sql in statements))
+            self.assertFalse(any("ORDER BY hash(r +" in sql for sql in statements))
+            con = duckdb.connect(str(manifest.db_path), read_only=True)
+            self.assertEqual(con.execute("SELECT count(*), count(DISTINCT fact_id) FROM fact").fetchone(), (245_777, 245_777))
+            self.assertEqual(con.execute("SELECT count(*) FROM fact WHERE fact_id != rowid + 1").fetchone()[0], 0)
+            con.close()
+
+    def test_density_recovers_legacy_dimensions_before_fact_creation(self):
+        spec = self.density_spec(fact_rows=2000)
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory)
+            with patch("benchmarking.workloads.cross_product._insert_density_fact_batches", side_effect=RuntimeError("stop")):
+                with self.assertRaises(RuntimeError):
+                    prepare_cross_product_workload(spec, artifact)
+            con = duckdb.connect(str(artifact / "benchmark.duckdb"))
+            con.execute("DROP TABLE _density_generation_state")
+            original = con.execute("SELECT * FROM dim_d2000_j01 ORDER BY d_key").fetchall()
+            con.close()
+            manifest = prepare_cross_product_workload(spec, artifact, resume_density=True)
+            con = duckdb.connect(str(manifest.db_path), read_only=True)
+            self.assertEqual(original, con.execute("SELECT * FROM dim_d2000_j01 ORDER BY d_key").fetchall())
+            self.assertEqual(con.execute("SELECT count(*) FROM fact").fetchone()[0], 2000)
+            con.close()
+
+    def test_density_generation_with_limited_spill_space(self):
+        spec = self.density_spec(fact_rows=2_000_000)
+        definition = replace(spec.experiment_definition,
+                             fixed=replace(spec.experiment_definition.fixed, dimension_cardinality=100_000,
+                                           key_domain_size=100_000, selectivity=.01),
+                             sweep=replace(spec.experiment_definition.sweep,
+                                           values=(5000, 10000, 30000, 100000, 300000, 1000000)))
+        spec = replace(spec, experiment_definition=definition,
+                       preparation=replace(spec.preparation, memory_limit="128MiB",
+                                           max_temp_directory_size="256MiB", temp_directory="spill"))
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = prepare_cross_product_workload(spec, Path(directory))
+            con = duckdb.connect(str(manifest.db_path), read_only=True)
+            self.assertEqual(con.execute("SELECT count(*), max(fact_id) FROM fact").fetchone(), (2_000_000, 2_000_000))
+            self.assertEqual(con.execute("SELECT count(*) FROM fact WHERE fact_id != rowid + 1").fetchone()[0], 0)
+            con.close()
+
+    def test_preparation_resume_checks_config_and_reuses_manifests(self):
+        source = Path(__file__).resolve().parents[1] / "paper/configs/local_paper_sweeps.json"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw = json.loads(source.read_text())
+            raw.update(output_root=str(root), experiment_name="resume-test")
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(raw))
+            config = load_experiment_config(config_path)
+            paths = ExperimentPaths(config.experiment_root)
+            paths.root.mkdir()
+            paths.copied_config_path.write_text(json.dumps(raw))
+            with patch("benchmarking.experiment_runner.resolve_system", side_effect=AssertionError("must not build")):
+                with self.assertRaisesRegex(FileExistsError, "resume-preparation"):
+                    run_experiment(config)
+            raw["workloads"][3]["params"]["preparation"]["threads"] = 1
+            config_path.write_text(json.dumps(raw))
+            _validate_preparation_resume(load_experiment_config(config_path))
+            paths.results_db.touch()
+            with self.assertRaisesRegex(ValueError, "before benchmarking"):
+                _validate_preparation_resume(config)
+            paths.results_db.unlink()
+            raw["workloads"][3]["params"]["fixed"]["seed"] = 9
+            config_path.write_text(json.dumps(raw))
+            with self.assertRaisesRegex(ValueError, "config differs"):
+                _validate_preparation_resume(load_experiment_config(config_path))
+            spec = self.density_spec(fact_rows=2000)
+            manifest = prepare_cross_product_workload(spec, paths.workload_dir(spec.name))
+            config = replace(config, workloads=(spec,))
+            with patch("benchmarking.experiment_runner.prepare_cross_product_workload", side_effect=AssertionError("must reuse")):
+                self.assertEqual(prepare_workloads(config, paths, resume_preparation=True), [manifest])
+                # These backends create their runtime database during execution.
+                catalog = manifest.artifact_dir / "parquet_catalog.json"
+                catalog.write_text("{}")
+                for storage_mode in ("remote_http_parquet", "ducklake"):
+                    exported = replace(manifest, storage_mode=storage_mode,
+                                       db_path=manifest.artifact_dir / "not-created-yet.duckdb",
+                                       remote_parquet_catalog_path=catalog, parquet_catalog_path=catalog)
+                    write_manifest(manifest.artifact_dir / "manifest.json", exported)
+                    self.assertEqual(prepare_workloads(config, paths, resume_preparation=True), [exported])
+
+    def test_density_preparation_options_are_validated(self):
+        source = Path(__file__).resolve().parents[1] / "paper/configs/local_paper_sweeps.json"
+        invalid = (
+            ({"batch_rows": 0}, "positive multiple"),
+            ({"batch_rows": 122_881}, "positive multiple"),
+            ({"threads": 0}, "threads must be positive"),
+            ({"memory_limit": ""}, "memory_limit"),
+            ({"max_temp_directory_size": 64}, "max_temp_directory_size"),
+            ({"batch_size": 122_880}, "unknown preparation options"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            for options, message in invalid:
+                with self.subTest(options=options):
+                    raw = json.loads(source.read_text())
+                    raw["workloads"][3]["params"]["preparation"] = options
+                    path.write_text(json.dumps(raw))
+                    with self.assertRaisesRegex(ValueError, message):
+                        load_experiment_config(path)
+
     def test_paper_standardized_contract(self) -> None:
         config = load_experiment_config(Path(__file__).resolve().parents[1] / "paper/configs/local_paper_sweeps.json")
         self.assertFalse(config.overwrite_output)

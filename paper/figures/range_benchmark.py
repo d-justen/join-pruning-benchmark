@@ -60,6 +60,7 @@ class RangeBenchmarkRow:
     mode: str
     cluster_count: int
     queries_per_sec: float
+    query_kind: str = "empty"
 
     @property
     def series_name(self) -> str:
@@ -90,12 +91,15 @@ def load_range_benchmark_rows(csv_path: Path) -> list[RangeBenchmarkRow]:
         fieldnames = set(reader.fieldnames or [])
         if "cluster_count" not in fieldnames:
             raise ValueError("missing required CSV column: cluster_count")
+        if "query_kind" not in fieldnames and not {"gap_selection", "gap_count"} <= fieldnames:
+            raise ValueError("missing range query_kind (or legacy gap-only schema)")
         rows = [
             RangeBenchmarkRow(
                 summary=row["summary"],
                 mode=row["mode"],
                 cluster_count=int(row["cluster_count"]),
                 queries_per_sec=float(row["queries_per_sec"]),
+                query_kind=row.get("query_kind", "empty"),
             )
             for row in reader
         ]
@@ -105,14 +109,16 @@ def load_range_benchmark_rows(csv_path: Path) -> list[RangeBenchmarkRow]:
 
 
 def build_latency_series(
-    rows: list[RangeBenchmarkRow], *, aggregate: str
+    rows: list[RangeBenchmarkRow], *, aggregate: str, query_kind: str = "empty"
 ) -> dict[str, list[tuple[float, float]]]:
     """Aggregate individual query latency by cluster count, expressed in microseconds."""
     grouped: dict[str, dict[int, list[float]]] = {}
     for row in rows:
+        if row.query_kind != query_kind:
+            continue
         if row.cluster_count <= 0:
             raise ValueError(f"cluster_count must be positive, got {row.cluster_count}")
-        if row.queries_per_sec <= 0:
+        if not math.isfinite(row.queries_per_sec) or row.queries_per_sec <= 0:
             raise ValueError(f"queries_per_sec must be positive, got {row.queries_per_sec}")
         grouped.setdefault(row.series_name, {}).setdefault(row.cluster_count, []).append(
             1_000_000.0 / row.queries_per_sec
@@ -120,6 +126,8 @@ def build_latency_series(
     unknown_series = sorted(set(grouped).difference(RANGE_SERIES_ORDER))
     if unknown_series:
         raise ValueError(f"unsupported range benchmark summaries: {', '.join(unknown_series)}")
+    if not grouped:
+        raise ValueError(f"no range measurements for query_kind={query_kind!r}")
     return {
         series_name: [
             (cluster_count, _aggregate(latencies_us, aggregate))
@@ -127,6 +135,24 @@ def build_latency_series(
         ]
         for series_name, points in grouped.items()
     }
+
+
+def build_range_throughput_series(
+    rows: list[RangeBenchmarkRow], *, aggregate: str, query_kind: str = "empty"
+) -> dict[str, list[tuple[int, float]]]:
+    grouped: dict[str, dict[int, list[float]]] = {}
+    for row in rows:
+        if row.query_kind != query_kind:
+            continue
+        if row.cluster_count <= 0 or not math.isfinite(row.queries_per_sec) or row.queries_per_sec <= 0:
+            raise ValueError("range cluster counts and throughput must be finite and positive")
+        if row.series_name not in RANGE_SERIES_ORDER:
+            raise ValueError(f"unsupported range benchmark summary: {row.series_name}")
+        grouped.setdefault(row.series_name, {}).setdefault(row.cluster_count, []).append(row.queries_per_sec)
+    if not grouped:
+        raise ValueError(f"no range measurements for query_kind={query_kind!r}")
+    return {name: [(cluster, _aggregate(values, aggregate)) for cluster, values in sorted(points.items())]
+            for name, points in grouped.items()}
 
 
 def _format_cluster_count(value: float, _: object) -> str:
@@ -216,6 +242,7 @@ def build_range_benchmark_artifacts(
         "csv_path": str(csv_path.resolve()),
         "figure_path": str(figure_path.resolve()),
         "aggregate": aggregate,
+        "query_kind": "empty",
         "verification": verification,
     }
     output_dir.mkdir(parents=True, exist_ok=True)

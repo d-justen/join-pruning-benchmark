@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -121,6 +122,16 @@ class CrossProductExperimentDefinition:
 
 
 @dataclass(frozen=True)
+class DensityPreparationOptions:
+    # Eight native row groups; bounds fact-side ASOF sorts independently of N.
+    batch_rows: int = 983_040
+    threads: int = 4
+    memory_limit: str | None = None
+    max_temp_directory_size: str | None = None
+    temp_directory: str | None = None
+
+
+@dataclass(frozen=True)
 class CrossProductWorkloadConfig:
     kind: str
     name: str
@@ -138,6 +149,7 @@ class CrossProductWorkloadConfig:
     ducklake_http_latency_ms: int | None = None
     experiment_definition: CrossProductExperimentDefinition | None = None
     post_variant_setup_sql: tuple[str, ...] = ()
+    preparation: DensityPreparationOptions = DensityPreparationOptions()
 
 
 @dataclass(frozen=True)
@@ -185,6 +197,72 @@ class BenchmarkOptions:
 
 
 @dataclass(frozen=True)
+class MicrobenchmarkConfig:
+    system_name: str
+    domain_size: int = 100_000_000
+    total_keys: int = 1_000_000
+    min_clusters: int = 2
+    max_clusters: int = 524_288
+    probe_count: int = 1_000_000
+    queries_per_cluster_count: int = 100_000
+    repetitions: int = 5
+    seed: int = 42
+    grafite_bpk: float = 12.0
+    diva_bpk: float = 16.0
+    max_fpr: float = 0.001
+    required_filters: tuple[str, ...] = ("bloom", "prf_uncompressed", "prf")
+    aggregate: str = "median"
+    range_query_kind: str = "empty"
+
+
+def parse_microbenchmark_config(raw: object) -> MicrobenchmarkConfig | None:
+    if raw is None:
+        return None
+    obj = _require_dict(raw, "microbenchmarks")
+    defaults = MicrobenchmarkConfig(system_name="")
+    unknown = set(obj) - set(defaults.__dataclass_fields__)
+    if unknown:
+        raise ValueError(f"unknown microbenchmarks options: {', '.join(sorted(unknown))}")
+    values = {"system_name": _require_string(obj.get("system_name"), "microbenchmarks.system_name")}
+    for key in ("domain_size", "total_keys", "min_clusters", "max_clusters", "probe_count",
+                "queries_per_cluster_count", "repetitions", "seed"):
+        values[key] = _require_int(obj.get(key, getattr(defaults, key)), f"microbenchmarks.{key}")
+        if values[key] < (0 if key == "seed" else 1) or values[key] >= 2**64:
+            raise ValueError(f"microbenchmarks.{key} is outside the supported unsigned integer range")
+    for key in ("grafite_bpk", "diva_bpk", "max_fpr"):
+        values[key] = _as_float(obj.get(key, getattr(defaults, key)), f"microbenchmarks.{key}")
+        if not math.isfinite(values[key]):
+            raise ValueError(f"microbenchmarks.{key} must be finite")
+    values["required_filters"] = tuple(
+        _require_string(item, "microbenchmarks.required_filters entry")
+        for item in _require_list(obj.get("required_filters", list(defaults.required_filters)),
+                                  "microbenchmarks.required_filters")
+    )
+    for key in ("aggregate", "range_query_kind"):
+        values[key] = _require_string(obj.get(key, getattr(defaults, key)), f"microbenchmarks.{key}")
+    config = MicrobenchmarkConfig(**values)
+    if config.total_keys >= config.domain_size:
+        raise ValueError("microbenchmarks.total_keys must be less than domain_size")
+    if (config.min_clusters < 2 or config.max_clusters < config.min_clusters
+            or any(n & (n - 1) for n in (config.min_clusters, config.max_clusters))
+            or config.max_clusters > config.total_keys
+            or config.max_clusters - 1 > config.domain_size - config.total_keys):
+        raise ValueError("microbenchmarks cluster bounds must be feasible powers of two, starting at 2 or higher")
+    if config.grafite_bpk <= 2 or config.diva_bpk <= 1 or not 0 <= config.max_fpr <= 1:
+        raise ValueError("invalid microbenchmarks bits-per-key or max_fpr")
+    if config.seed + config.repetitions - 1 >= 2**64:
+        raise ValueError("microbenchmarks repetition seeds overflow uint64")
+    if (len(set(config.required_filters)) != len(config.required_filters)
+            or set(config.required_filters) - {"bloom", "grafite", "diva", "prf_uncompressed", "prf"}):
+        raise ValueError("microbenchmarks.required_filters contains unknown or duplicate filters")
+    if config.aggregate not in {"mean", "median"}:
+        raise ValueError("microbenchmarks.aggregate must be mean or median")
+    if config.range_query_kind != "empty":
+        raise ValueError("the comparison panel requires range_query_kind='empty'; other kinds remain in the artifacts")
+    return config
+
+
+@dataclass(frozen=True)
 class ExperimentConfig:
     config_path: Path
     experiment_name: str
@@ -193,6 +271,7 @@ class ExperimentConfig:
     workloads: tuple[WorkloadConfig, ...]
     systems: tuple[SystemConfig, ...]
     benchmark: BenchmarkOptions
+    microbenchmarks: MicrobenchmarkConfig | None = None
 
     @property
     def experiment_root(self) -> Path:
@@ -470,6 +549,27 @@ def _parse_cross_product(raw: dict, name: str) -> CrossProductWorkloadConfig:
         if "fixed" in params or "sweep" in params
         else None
     )
+    preparation_raw = _require_dict(params.get("preparation", {}), "preparation")
+    if preparation_raw and (
+        experiment_definition is None
+        or experiment_definition.sweep.cardinality_mode != "fixed_selected_build_and_probe"
+    ):
+        raise ValueError("preparation options currently require fixed_selected_build_and_probe density")
+    unknown = set(preparation_raw) - set(DensityPreparationOptions.__dataclass_fields__)
+    if unknown:
+        raise ValueError("unknown preparation options: " + ", ".join(sorted(unknown)))
+    batch_rows = _require_int(preparation_raw.get("batch_rows", 983_040), "preparation.batch_rows")
+    threads = _require_int(preparation_raw.get("threads", 4), "preparation.threads")
+    if batch_rows <= 0 or batch_rows % 122_880:
+        raise ValueError("preparation.batch_rows must be a positive multiple of 122880")
+    if threads <= 0:
+        raise ValueError("preparation.threads must be positive")
+    preparation = DensityPreparationOptions(
+        batch_rows=batch_rows, threads=threads,
+        **{key: _require_string(preparation_raw[key], f"preparation.{key}")
+           for key in ("memory_limit", "max_temp_directory_size", "temp_directory")
+           if key in preparation_raw},
+    )
     if experiment_definition is None:
         build_sizes = tuple(_require_int(item, "build_sizes entry") for item in _require_list(params.get("build_sizes"), "build_sizes"))
         selectivities = tuple(_as_float(item, "selectivities entry") for item in _require_list(params.get("selectivities"), "selectivities"))
@@ -504,6 +604,7 @@ def _parse_cross_product(raw: dict, name: str) -> CrossProductWorkloadConfig:
         parquet_file_size_mb=parquet_file_size_mb,
         ducklake_http_latency_ms=ducklake_http_latency_ms,
         experiment_definition=experiment_definition,
+        preparation=preparation,
         post_variant_setup_sql=tuple(
             _normalize_sql_statement(_require_string(statement, "post_variant_setup_sql entry"))
             for statement in _require_list(
@@ -606,8 +707,6 @@ def _parse_external(raw: dict, name: str, base_dir: Path) -> ExternalWorkloadCon
 
 def _parse_workloads(raw: object, base_dir: Path) -> tuple[WorkloadConfig, ...]:
     workloads_raw = _require_list(raw, "workloads")
-    if not workloads_raw:
-        raise ValueError("workloads must not be empty")
     workloads: list[WorkloadConfig] = []
     seen_names: set[str] = set()
     for index, item in enumerate(workloads_raw, start=1):
@@ -747,7 +846,12 @@ def load_experiment_config(path: Path) -> ExperimentConfig:
         workloads=_parse_workloads(raw.get("workloads"), base_dir),
         systems=_parse_systems(raw.get("systems"), base_dir),
         benchmark=_parse_benchmark(raw.get("benchmark", {})),
+        microbenchmarks=parse_microbenchmark_config(raw.get("microbenchmarks")),
     )
+    if not config.workloads and config.microbenchmarks is None:
+        raise ValueError("workloads must not be empty unless microbenchmarks are configured")
+    if config.microbenchmarks and config.microbenchmarks.system_name not in {s.name for s in config.systems}:
+        raise ValueError("microbenchmarks.system_name must reference a configured system")
     if config.benchmark.repetitions <= 0:
         raise ValueError("repetitions must be positive")
     if config.benchmark.threads is not None and config.benchmark.threads <= 0:

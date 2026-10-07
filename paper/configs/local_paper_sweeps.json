@@ -149,6 +149,12 @@
       "name": "jpb-sweep-density",
       "kind": "cross_product",
       "params": {
+        "preparation": {
+          "batch_rows": 983040,
+          "threads": 4,
+          "memory_limit": "8GiB",
+          "max_temp_directory_size": "64GiB"
+        },
         "fixed": {
           "fact_rows": 500000000,
           "dimension_cardinality": 100000000,

@@ -10,5 +10,8 @@ tests/*
 !tests/test_cross_product_sweeps.py
 !tests/test_filter_profiles.py
 !tests/test_paper_ssb.py
+!tests/test_microbenchmarks.py
+!tests/test_filter_benchmark.py
+!tests/test_range_benchmark.py
 /external_benchmarks/**/*.duckdb
 /dynamic-predicate-transfer/job-*.csv

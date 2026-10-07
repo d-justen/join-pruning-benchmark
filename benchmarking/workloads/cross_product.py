@@ -10,6 +10,7 @@ from benchmarking.experiment_config import (
     CrossProductExperimentDefinition,
     CrossProductQueryTypeConfig,
     CrossProductWorkloadConfig,
+    DensityPreparationOptions,
 )
 from benchmarking.manifests import (
     DUCKLAKE_HTTP_BASE_URL_PLACEHOLDER,
@@ -840,17 +841,97 @@ def _case_probe_layouts(
     )
 
 
+def _density_generation_start(
+    con: duckdb.DuckDBPyConnection,
+    definition: CrossProductExperimentDefinition,
+    cases: list[ResolvedSweepCase],
+) -> int:
+    """Validate resumable input before changing it, including pre-batching databases."""
+    tables = {row[0] for row in con.execute(
+        "SELECT table_name FROM duckdb_tables() WHERE NOT temporary "
+        "AND database_name = current_database() AND schema_name = 'main'"
+    ).fetchall()}
+    dimensions = {_sweep_dimension_table_name(case, 1): case for case in cases}
+    unexpected = tables - dimensions.keys() - {"fact", "_density_generation_state"}
+    if unexpected:
+        raise ValueError(f"unexpected tables in density database: {sorted(unexpected)}")
+    signature = json.dumps(asdict(definition), sort_keys=True)
+    next_id = 1
+    if "_density_generation_state" in tables:
+        state = con.execute("SELECT definition_json, next_fact_id FROM _density_generation_state").fetchall()
+        if len(state) != 1 or state[0][0] != signature:
+            raise ValueError("density generation definition differs from the saved progress")
+        next_id = state[0][1]
+        if not 1 <= next_id <= definition.fixed.fact_rows + 1:
+            raise ValueError("invalid saved density fact position")
+    elif "fact" in tables:
+        raise ValueError("cannot resume an existing fact table without density generation progress")
+    for table, case in dimensions.items():
+        if table not in tables:
+            continue
+        expected = [("d_key", "BIGINT")]
+        expected += [(f"dummy_s{j}", "VARCHAR") for j in range(1, definition.fixed.dummy_string_cols + 1)]
+        expected += [(_sweep_mask_column(case, q), "BOOLEAN") for q in definition.query_types]
+        actual = [(row[0], row[1]) for row in con.execute(f"DESCRIBE {table}").fetchall()]
+        if actual != expected or con.execute(f"SELECT count(*) FROM {table}").fetchone()[0] != case.key_domain_size:
+            raise ValueError(f"incomplete or incompatible density dimension: {table}")
+    if "fact" in tables:
+        count, low, high = con.execute("SELECT count(*), min(fact_id), max(fact_id) FROM fact").fetchone()
+        if count != next_id - 1 or (count and (low != 1 or high != count)):
+            raise ValueError("density fact rows do not match saved progress")
+    elif next_id != 1:
+        raise ValueError("density fact table missing despite saved progress")
+    if "_density_generation_state" not in tables:
+        con.execute("CREATE TABLE _density_generation_state AS "
+                    "SELECT ?::VARCHAR AS definition_json, 1::BIGINT AS next_fact_id", [signature])
+    return next_id
+
+
+def _insert_density_fact_batches(
+    con: duckdb.DuckDBPyConnection,
+    select_sql: str,
+    fact_rows: int,
+    batch_rows: int,
+    next_id: int,
+) -> None:
+    """Commit rows and their restart position together; never sort all fact rows."""
+    empty_select = select_sql.format(start=1, stop=1)
+    con.execute("CREATE TABLE IF NOT EXISTS fact AS " + empty_select)
+    expected = [(r[0], r[1]) for r in con.execute("DESCRIBE " + empty_select).fetchall()]
+    actual = [(r[0], r[1]) for r in con.execute("DESCRIBE fact").fetchall()]
+    if actual != expected:
+        raise ValueError("density fact schema differs from the requested definition")
+    for start in range(next_id, fact_rows + 1, batch_rows):
+        stop = min(start + batch_rows, fact_rows + 1)
+        con.execute("BEGIN TRANSACTION")
+        try:
+            con.execute("INSERT INTO fact " + select_sql.format(start=start, stop=stop))
+            con.execute("UPDATE _density_generation_state SET next_fact_id = ?", [stop])
+            con.execute("COMMIT")
+        except BaseException:
+            con.execute("ROLLBACK")
+            raise
+
+
 def _create_fixed_density_tables(
     con: duckdb.DuckDBPyConnection,
     definition: CrossProductExperimentDefinition,
     cases: list[ResolvedSweepCase],
+    preparation: DensityPreparationOptions = DensityPreparationOptions(),
 ) -> dict[tuple[str, int], dict]:
-    """Preserve each reference fact row's membership, using O(selected keys) maps.
+    """Preserve reference membership with small maps and bounded fact-side sorts.
 
     The complement map stores gaps between selected keys, not every rejected
     key. An ASOF lookup maps a uniform complement ordinal to its actual key.
-    Thus large numeric domains do not require equally large FK lookup tables.
+    Fact generation batches consecutive IDs so ASOF and order-restoration sorts
+    buffer at most one batch. Completed dimensions and committed batches can be
+    reused, including dimensions left by the original monolithic generator.
     """
+    if preparation.batch_rows <= 0 or preparation.batch_rows % 122_880:
+        raise ValueError("preparation.batch_rows must be a positive multiple of 122880")
+    next_id = _density_generation_start(con, definition, cases)
+    existing = {row[0] for row in con.execute("SHOW TABLES").fetchall()}
+    cases_by_domain = {case.key_domain_size: case for case in cases}
     fixed = definition.fixed
     reference = fixed.dimension_cardinality
     selected = int(round(reference * fixed.selectivity))
@@ -861,13 +942,22 @@ def _create_fixed_density_tables(
     if scattered:
         for domain in domains:
             # Keep the same exact, hash-ranked selection as the ordinary sweeps.
+            case = cases_by_domain.get(domain)
+            table = _sweep_dimension_table_name(case, 1) if case is not None else None
+            if table in existing:
+                q = next(q for q in definition.query_types if q.kind == "scattered")
+                chosen = f"SELECT d_key - 1 AS key_rank FROM {table} WHERE {_sweep_mask_column(case, q)}"
+            else:
+                chosen = (f"SELECT r AS key_rank FROM range({domain}) keys(r) "
+                          f"ORDER BY hash(r + {salt}), r LIMIT {selected}")
             con.execute(f"""
                 CREATE TEMP TABLE density_selected_{domain} AS
                 SELECT key_rank, row_number() OVER (ORDER BY hash(key_rank + {salt}), key_rank) - 1
                        AS selection_rank
-                FROM (SELECT r AS key_rank FROM range({domain}) keys(r)
-                      ORDER BY hash(r + {salt}), r LIMIT {selected}) chosen
+                FROM ({chosen}) chosen
             """)
+            if con.execute(f"SELECT count(*) FROM density_selected_{domain}").fetchone()[0] != selected:
+                raise ValueError(f"incorrect selected-key count in density dimension {domain}")
             con.execute(f"""
                 CREATE TEMP TABLE density_gaps_{domain} AS
                 SELECT gap_start, max(skipped) AS skipped FROM (
@@ -900,44 +990,46 @@ def _create_fixed_density_tables(
                 expression = "anchor_rank + 1"
             elif q.kind == "shoulder":
                 positive = f"(anchor_rank < {leading} OR anchor_rank >= {reference - trailing})"
-                rank = f"(pick_positive % {selected})"
+                rank = f"CAST(pick_positive % {selected} AS BIGINT)"
                 selected_key = f"CASE WHEN {rank} < {leading} THEN {rank} + 1 ELSE {domain - selected} + {rank} + 1 END"
-                rejected_key = f"{leading + 1} + pick_negative % {domain - selected}"
+                rejected_key = f"{leading + 1} + CAST(pick_negative % {domain - selected} AS BIGINT)"
                 expression = f"CASE WHEN {positive} THEN {selected_key} ELSE {rejected_key} END"
             else:
                 joins.append(f"LEFT JOIN density_selected_{domain} sel_{domain} "
-                             f"ON pick_positive % {selected} = sel_{domain}.selection_rank")
+                             f"ON CAST(pick_positive % {selected} AS BIGINT) = sel_{domain}.selection_rank")
                 gap_joins.append(f"ASOF LEFT JOIN density_gaps_{domain} gap_{domain} "
-                                 f"ON pick_negative % {domain - selected} >= gap_{domain}.gap_start")
+                                 f"ON CAST(pick_negative % {domain - selected} AS BIGINT) >= gap_{domain}.gap_start")
                 expression = (f"CASE WHEN ref.key_rank IS NOT NULL THEN sel_{domain}.key_rank + 1 "
-                              f"ELSE pick_negative % {domain - selected} + gap_{domain}.skipped + 1 END")
+                              f"ELSE CAST(pick_negative % {domain - selected} AS BIGINT) + gap_{domain}.skipped + 1 END")
             columns.append(f"CAST({expression} AS BIGINT) AS {column}")
         payload = [f"substr(md5('dummy_{j}:' || CAST(d_key AS VARCHAR) || ':dup:0:seed:{fixed.seed}'), "
                    f"1, {fixed.dummy_string_len}) AS dummy_s{j}"
                    for j in range(1, fixed.dummy_string_cols + 1)]
         selected_join = (f"LEFT JOIN density_selected_{domain} selected_keys "
                          "ON b.key_rank = selected_keys.key_rank" if scattered else "")
-        con.execute(f"""
-            CREATE TABLE {table} AS SELECT {', '.join(['d_key'] + payload + masks)}
-            FROM (SELECT r AS key_rank, r + 1 AS d_key FROM range({domain}) keys(r)) b
-            {selected_join}
-        """)
+        if table not in existing:
+            con.execute(f"""
+                CREATE TABLE {table} AS SELECT {', '.join(['d_key'] + payload + masks)}
+                FROM (SELECT r AS key_rank, r + 1 AS d_key FROM range({domain}) keys(r)) b
+                {selected_join}
+            """)
         dimensions[(table, 1)] = {"table_name": table, "join_index": 1,
                                   "row_count": domain, "distinct_keys": domain,
                                   "key_domain_size": domain, "key_multiplicity": 1,
                                   "masks": mask_metadata}
     columns.append("i * 17 AS measure")
-    # ASOF joins may reorder by complement rank. Restore the reference fact
-    # order so these uniform probes do not become physically clustered.
-    con.execute(f"""
-        CREATE TABLE fact AS SELECT {', '.join(columns)}
+    # Restore order inside each consecutive batch, preserving uniform probes
+    # without a final sort over the entire fact table.
+    select_sql = f"""
+        SELECT {', '.join(columns)}
         FROM (SELECT i, CAST(hash(i + {salt}) % {reference} AS BIGINT) AS anchor_rank,
                      hash(i + {salt + 1_000_003}) AS pick_positive,
                      hash(i + {salt + 2_000_033}) AS pick_negative
-              FROM range(1, {fixed.fact_rows + 1}) rows(i)) f
+              FROM range({{start}}, {{stop}}) rows(i)) f
         {' '.join(joins + gap_joins)}
         ORDER BY i
-    """)
+    """
+    _insert_density_fact_batches(con, select_sql, fixed.fact_rows, preparation.batch_rows, next_id)
     return dimensions
 
 
@@ -1305,15 +1397,29 @@ def _write_sweep_workload(
     db_path: Path,
     queries_dir: Path,
     artifact_dir: Path,
+    *,
+    resume_density: bool = False,
 ) -> tuple[dict, tuple[Path, ...], Path, Path, Path]:
     definition = spec.experiment_definition
     assert definition is not None
     cases = _resolve_sweep_cases(definition, storage_kind=spec.storage_kind)
-    if db_path.exists():
+    if resume_density and not _fixed_density(definition):
+        raise ValueError("partial database recovery is only supported for fixed density")
+    if db_path.exists() and not resume_density:
         db_path.unlink()
     db_path.parent.mkdir(parents=True, exist_ok=True)
     queries_dir.mkdir(parents=True, exist_ok=True)
-    con = duckdb.connect(str(db_path))
+    connection_options = {}
+    if _fixed_density(definition):
+        preparation = spec.preparation
+        connection_options = {"threads": preparation.threads, "preserve_insertion_order": True}
+        for name in ("memory_limit", "max_temp_directory_size"):
+            value = getattr(preparation, name)
+            if value is not None:
+                connection_options[name] = value
+        if preparation.temp_directory is not None:
+            connection_options["temp_directory"] = str((artifact_dir / preparation.temp_directory).resolve())
+    con = duckdb.connect(str(db_path), config=connection_options)
     dimensions: dict[str, list[dict]] = {}
     try:
         seed_value = ((definition.fixed.seed % 10_000_000) + 0.5) / 10_000_001
@@ -1329,7 +1435,7 @@ def _write_sweep_workload(
                         group_cases.append(case)
                     key_queries[group_key] = query_type
         if _fixed_density(definition):
-            physical_dimensions = _create_fixed_density_tables(con, definition, cases)
+            physical_dimensions = _create_fixed_density_tables(con, definition, cases, spec.preparation)
         else:
             physical_dimensions = {
                 group_key: _create_sweep_dimension_table(con, definition, group_cases,
@@ -1614,6 +1720,8 @@ def _write_ducklake_sql(
 def prepare_cross_product_workload(
     spec: CrossProductWorkloadConfig,
     artifact_dir: Path,
+    *,
+    resume_density: bool = False,
 ) -> PreparedWorkload:
     _validate(spec)
     queries_dir = artifact_dir / "queries"
@@ -1632,7 +1740,8 @@ def prepare_cross_product_workload(
             definition_path,
             cases_path,
             query_catalog_path,
-        ) = _write_sweep_workload(spec, db_path, queries_dir, artifact_dir)
+        ) = _write_sweep_workload(spec, db_path, queries_dir, artifact_dir,
+                                 resume_density=resume_density)
     metadata_path = queries_dir / "metadata.json"
     runtime_db_path = db_path.resolve()
     remote_parquet_catalog_path: Path | None = None

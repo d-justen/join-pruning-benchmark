@@ -20,6 +20,8 @@ class ResolvedSystem:
     git_commit: str | None
     repo: str | None
     ref: str | None
+    build_dir: Path | None = None
+    checkout_dir: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -351,6 +353,8 @@ def _resolve_git_system(
         git_commit=None,
         repo=None,
         ref=None,
+        build_dir=build_dir.resolve(),
+        checkout_dir=checkout_dir.resolve(),
     )
 
 

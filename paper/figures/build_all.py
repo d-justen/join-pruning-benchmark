@@ -6,6 +6,7 @@ import math
 import os
 import sys
 import tempfile
+from dataclasses import asdict
 from pathlib import Path
 
 MPLCONFIGDIR = Path(tempfile.gettempdir()) / "matplotlib-cache"
@@ -24,6 +25,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from benchmarking import load_experiment_config
+from benchmarking.microbenchmarks import ARTIFACT_SUBDIR, load_microbenchmark_manifest
+from paper.figures.filter_benchmark import build_filter_benchmark_artifacts
 from paper.figure_specs import (
     FIGURES,
     JPB_ALL_QUERIES,
@@ -2148,9 +2151,18 @@ def build_figures(experiment_root: Path, system_name: str | None) -> Path:
     experiment_root = experiment_root.resolve()
     experiment_config = load_experiment_config(experiment_root / "config.json")
     resolved_system_names = load_system_names(experiment_root, system_name)
-    rows = load_metric_rows(experiment_root, resolved_system_names)
-    plan_metric_rows = load_plan_metric_rows(experiment_root, resolved_system_names)
-    probe_scan_rows = load_probe_scan_rows(experiment_root, resolved_system_names)
+    micro_manifest = None
+    if (experiment_config.microbenchmarks is not None
+            and experiment_config.microbenchmarks.system_name in resolved_system_names):
+        micro_manifest = load_microbenchmark_manifest(experiment_root)
+        if micro_manifest["config"] != json.loads(json.dumps(asdict(experiment_config.microbenchmarks))):
+            raise ValueError("saved microbenchmark measurements do not match config.json; rerun the microbenchmarks")
+    has_sql_results = (experiment_root / "results.duckdb").is_file()
+    if not has_sql_results and micro_manifest is None:
+        raise FileNotFoundError("no SQL results or selected completed microbenchmarks in the experiment")
+    rows = load_metric_rows(experiment_root, resolved_system_names) if has_sql_results else []
+    plan_metric_rows = load_plan_metric_rows(experiment_root, resolved_system_names) if has_sql_results else []
+    probe_scan_rows = load_probe_scan_rows(experiment_root, resolved_system_names) if has_sql_results else []
     output_dir = experiment_root / "paper"
     phase_report = output_dir / "filter_phases.csv"
     write_filter_phase_report(phase_report, rows)
@@ -2165,6 +2177,19 @@ def build_figures(experiment_root: Path, system_name: str | None) -> Path:
         "skipped_figures": [],
         "filter_phases_csv": str(phase_report),
     }
+    if micro_manifest is not None:
+        micro_dir = experiment_root / ARTIFACT_SUBDIR
+        artifacts = build_filter_benchmark_artifacts(
+            csv_path=micro_dir / "point.csv", range_csv_path=micro_dir / "range.csv",
+            output_dir=output_dir, figures_dir=figures_dir,
+            aggregate=micro_manifest["config"]["aggregate"],
+        )
+        summary["figures"]["filter_benchmark_overview"] = artifacts["figure_path"]
+        summary["verification"]["filter_benchmark_overview"] = artifacts["verification"]
+        summary["sections"]["filter_microbenchmarks"] = {
+            **artifacts, "manifest_path": str(micro_dir / "manifest.json"),
+            "unavailable_filters": micro_manifest["unavailable_filters"],
+        }
     for figure in FIGURES:
         if not _figure_is_available(figure, available_workloads):
             summary["skipped_figures"].append(figure.slug)

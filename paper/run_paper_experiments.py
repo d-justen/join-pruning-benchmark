@@ -23,10 +23,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("paper/configs/local_paper_experiments.json"),
         help="path to the paper experiment config",
     )
-    parser.add_argument(
+    execution = parser.add_mutually_exclusive_group()
+    execution.add_argument(
         "--skip-benchmarks",
         action="store_true",
         help="reuse an existing experiment root and only regenerate figures",
+    )
+    execution.add_argument(
+        "--only-microbenchmarks",
+        action="store_true",
+        help="run point/range probes and regenerate figures, preserving existing SQL results",
+    )
+    execution.add_argument(
+        "--resume-preparation",
+        action="store_true",
+        help="continue failed preparation, reusing completed workloads and density dimensions/batches",
     )
     parser.add_argument(
         "--system-name",
@@ -40,7 +51,8 @@ def main() -> None:
     config = load_experiment_config(args.config)
     experiment_root = config.experiment_root
     if not args.skip_benchmarks:
-        experiment_root = run_experiment(config).root
+        experiment_root = run_experiment(config, resume_preparation=args.resume_preparation,
+                                         only_microbenchmarks=args.only_microbenchmarks).root
     output_dir = build_figures(experiment_root, args.system_name)
     print(output_dir)
 

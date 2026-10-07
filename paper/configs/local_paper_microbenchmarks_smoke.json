@@ -1,0 +1,36 @@
+{
+  "experiment_name": "paper-microbenchmarks-smoke",
+  "output_root": "../../out/experiments",
+  "overwrite_output": true,
+  "workloads": [],
+  "systems": [
+    {
+      "name": "duckdb-paper",
+      "kind": "git",
+      "c_compiler": "clang",
+      "cxx_compiler": "clang++",
+      "variants": [
+        {
+          "label": "prf with fallback",
+          "setup_sql": []
+        }
+      ]
+    }
+  ],
+  "microbenchmarks": {
+    "system_name": "duckdb-paper",
+    "domain_size": 10000,
+    "total_keys": 256,
+    "min_clusters": 2,
+    "max_clusters": 16,
+    "probe_count": 10000,
+    "queries_per_cluster_count": 10000,
+    "repetitions": 2,
+    "seed": 42,
+    "required_filters": [
+      "bloom",
+      "prf_uncompressed",
+      "prf"
+    ]
+  }
+}

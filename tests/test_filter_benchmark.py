@@ -12,29 +12,18 @@ from paper.figures.filter_benchmark import (
     build_build_time_series,
     build_false_positive_rate_series,
     build_throughput_series,
-    derive_actual_negatives_by_cluster,
     load_filter_benchmark_rows,
     summarize_filter_benchmark,
 )
 
 
 class FilterBenchmarkTest(unittest.TestCase):
-    def test_derive_actual_negatives_by_cluster(self) -> None:
-        rows = [
-            type("Row", (), {"cluster_count": 2})(),
-            type("Row", (), {"cluster_count": 10})(),
-        ]
-        negatives = derive_actual_negatives_by_cluster(
-            rows,
-            generation_config=BenchmarkGenerationConfig(
-                domain_size=100,
-                total_keys=10,
-                probe_count=20,
-                seed=42,
-            ),
-        )
-        self.assertEqual(negatives[2], 16)
-        self.assertIn(10, negatives)
+    def test_missing_measured_fpr_is_rejected(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "old.csv"
+            path.write_text("filter,cluster_count,build_time_ns,post_processing_time_ns,summary_bytes,probe_throughput_per_sec,false_positives\nbloom,2,100,0,16,100,1\n")
+            with self.assertRaisesRegex(ValueError, "actual_fpr"):
+                load_filter_benchmark_rows(path)
 
     def test_throughput_aggregation_and_summary(self) -> None:
         with TemporaryDirectory() as temporary_dir:
@@ -50,6 +39,8 @@ class FilterBenchmarkTest(unittest.TestCase):
                         "summary_bytes",
                         "probe_throughput_per_sec",
                         "false_positives",
+                        "actual_fpr",
+                        "actual_negatives",
                     ],
                 )
                 writer.writeheader()
@@ -63,6 +54,8 @@ class FilterBenchmarkTest(unittest.TestCase):
                             "summary_bytes": 16,
                             "probe_throughput_per_sec": 100.0,
                             "false_positives": 10,
+                            "actual_fpr": 10 / 900,
+                            "actual_negatives": 900,
                         },
                         {
                             "filter": "bloom",
@@ -72,6 +65,8 @@ class FilterBenchmarkTest(unittest.TestCase):
                             "summary_bytes": 16,
                             "probe_throughput_per_sec": 140.0,
                             "false_positives": 30,
+                            "actual_fpr": 30 / 900,
+                            "actual_negatives": 900,
                         },
                         {
                             "filter": "prf",
@@ -81,6 +76,8 @@ class FilterBenchmarkTest(unittest.TestCase):
                             "summary_bytes": 32,
                             "probe_throughput_per_sec": 200.0,
                             "false_positives": 0,
+                            "actual_fpr": 0,
+                            "actual_negatives": 900,
                         },
                         {
                             "filter": "prf",
@@ -90,6 +87,8 @@ class FilterBenchmarkTest(unittest.TestCase):
                             "summary_bytes": 48,
                             "probe_throughput_per_sec": 220.0,
                             "false_positives": 5,
+                            "actual_fpr": 5 / 880,
+                            "actual_negatives": 880,
                         },
                     ]
                 )
@@ -99,19 +98,17 @@ class FilterBenchmarkTest(unittest.TestCase):
             build_time_series = build_build_time_series(rows, aggregate="median")
             false_positive_rate_series = build_false_positive_rate_series(
                 rows,
-                actual_negatives_by_cluster={2: 900, 102: 880},
                 aggregate="median",
             )
             summary = summarize_filter_benchmark(
                 rows,
-                actual_negatives_by_cluster={2: 900, 102: 880},
             )
 
             self.assertEqual(series["bloom"], [(2, 120.0)])
             self.assertEqual(series["prf"], [(2, 200.0), (102, 220.0)])
             self.assertEqual(build_time_series["bloom"], [(2, 6.0)])
             self.assertEqual(build_time_series["prf"], [(2, 8.0), (102, 12.0)])
-            self.assertEqual(false_positive_rate_series["bloom"], [(2, 20 / 900)])
+            self.assertAlmostEqual(false_positive_rate_series["bloom"][0][1], 20 / 900)
             self.assertEqual(false_positive_rate_series["prf"], [(2, 0.0), (102, 5 / 880)])
             bloom_summary = next(system for system in summary["systems"] if system["filter"] == "bloom")
             self.assertAlmostEqual(bloom_summary["build_time_ms"]["min"], 5.0)
@@ -134,6 +131,8 @@ class FilterBenchmarkTest(unittest.TestCase):
                         "summary_bytes",
                         "probe_throughput_per_sec",
                         "false_positives",
+                        "actual_fpr",
+                        "actual_negatives",
                     ],
                 )
                 writer.writeheader()
@@ -147,6 +146,8 @@ class FilterBenchmarkTest(unittest.TestCase):
                             "summary_bytes": 16,
                             "probe_throughput_per_sec": 100.0,
                             "false_positives": 10,
+                            "actual_fpr": 10 / 900,
+                            "actual_negatives": 900,
                         },
                         {
                             "filter": "prf",
@@ -156,6 +157,8 @@ class FilterBenchmarkTest(unittest.TestCase):
                             "summary_bytes": 32,
                             "probe_throughput_per_sec": 200.0,
                             "false_positives": 0,
+                            "actual_fpr": 0,
+                            "actual_negatives": 900,
                         },
                     ]
                 )
@@ -180,6 +183,7 @@ class FilterBenchmarkTest(unittest.TestCase):
             self.assertTrue(markdown_path.exists())
             self.assertTrue(json_path.exists())
             loaded_payload = json.loads(json_path.read_text(encoding="utf-8"))
+            self.assertEqual(loaded_payload["aggregate"], "median")
             self.assertEqual(loaded_payload["generation_config"]["probe_count"], 20)
             self.assertEqual(loaded_payload["verification"]["build_time_aggregate"], "median")
             self.assertEqual(loaded_payload["verification"]["false_positive_rate_aggregate"], "median")

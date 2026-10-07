@@ -208,5 +208,28 @@
     "threads": 8,
     "prepare_duckdb_binary": "duckdb",
     "collect_profiles": true
+  },
+  "microbenchmarks": {
+    "system_name": "duckdb-paper",
+    "domain_size": 100000000,
+    "total_keys": 1000000,
+    "min_clusters": 2,
+    "max_clusters": 524288,
+    "probe_count": 1000000,
+    "queries_per_cluster_count": 100000,
+    "repetitions": 5,
+    "seed": 42,
+    "grafite_bpk": 12.0,
+    "diva_bpk": 16.0,
+    "max_fpr": 0.001,
+    "required_filters": [
+      "bloom",
+      "grafite",
+      "diva",
+      "prf_uncompressed",
+      "prf"
+    ],
+    "aggregate": "median",
+    "range_query_kind": "empty"
   }
 }
