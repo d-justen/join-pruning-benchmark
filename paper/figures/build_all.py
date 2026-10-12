@@ -26,7 +26,9 @@ if str(ROOT) not in sys.path:
 
 from benchmarking import load_experiment_config
 from benchmarking.microbenchmarks import ARTIFACT_SUBDIR, load_microbenchmark_manifest
+from benchmarking.jpb_microbenchmarks import ARTIFACT_SUBDIR as JPB_ARTIFACT_SUBDIR, load_jpb_manifest
 from paper.figures.filter_benchmark import build_filter_benchmark_artifacts
+from paper.figures.jpb_microbenchmark import build_jpb_artifacts
 from paper.figure_specs import (
     FIGURES,
     JPB_ALL_QUERIES,
@@ -2152,13 +2154,17 @@ def build_figures(experiment_root: Path, system_name: str | None) -> Path:
     experiment_config = load_experiment_config(experiment_root / "config.json")
     resolved_system_names = load_system_names(experiment_root, system_name)
     micro_manifest = None
+    jpb_manifest = None
     if (experiment_config.microbenchmarks is not None
             and experiment_config.microbenchmarks.system_name in resolved_system_names):
         micro_manifest = load_microbenchmark_manifest(experiment_root)
         if micro_manifest["config"] != json.loads(json.dumps(asdict(experiment_config.microbenchmarks))):
             raise ValueError("saved microbenchmark measurements do not match config.json; rerun the microbenchmarks")
+    if (experiment_config.jpb_microbenchmarks is not None
+            and experiment_config.jpb_microbenchmarks.system_name in resolved_system_names):
+        jpb_manifest = load_jpb_manifest(experiment_root, experiment_config)
     has_sql_results = (experiment_root / "results.duckdb").is_file()
-    if not has_sql_results and micro_manifest is None:
+    if not has_sql_results and micro_manifest is None and jpb_manifest is None:
         raise FileNotFoundError("no SQL results or selected completed microbenchmarks in the experiment")
     rows = load_metric_rows(experiment_root, resolved_system_names) if has_sql_results else []
     plan_metric_rows = load_plan_metric_rows(experiment_root, resolved_system_names) if has_sql_results else []
@@ -2190,6 +2196,13 @@ def build_figures(experiment_root: Path, system_name: str | None) -> Path:
             **artifacts, "manifest_path": str(micro_dir / "manifest.json"),
             "unavailable_filters": micro_manifest["unavailable_filters"],
         }
+    if jpb_manifest is not None:
+        jpb_dir = experiment_root / JPB_ARTIFACT_SUBDIR
+        artifacts = build_jpb_artifacts(jpb_dir / "measurements.csv", output_dir, figures_dir,
+                                        jpb_manifest["unavailable_filters"])
+        summary["figures"]["jpb_simulated_filtering"] = artifacts["figure_path"]
+        summary["verification"]["jpb_simulated_filtering"] = artifacts["verification"]
+        summary["sections"]["jpb_microbenchmarks"] = {**artifacts, "manifest_path": str(jpb_dir / "manifest.json")}
     for figure in FIGURES:
         if not _figure_is_available(figure, available_workloads):
             summary["skipped_figures"].append(figure.slug)

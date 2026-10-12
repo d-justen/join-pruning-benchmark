@@ -209,6 +209,17 @@
     "prepare_duckdb_binary": "duckdb",
     "collect_profiles": true
   },
+  "jpb_microbenchmarks": {
+    "system_name": "duckdb-paper",
+    "workload_name": "join-pruning-workload",
+    "repetitions": 5,
+    "warmups": 1,
+    "order_seed": 42,
+    "grafite_bpk": 12.0,
+    "diva_bpk": 16.0,
+    "max_fpr": 0.001,
+    "required_filters": ["prf_uncompressed", "prf", "grafite", "diva"]
+  },
   "microbenchmarks": {
     "system_name": "duckdb-paper",
     "domain_size": 100000000,

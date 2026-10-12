@@ -13,5 +13,6 @@ tests/*
 !tests/test_microbenchmarks.py
 !tests/test_filter_benchmark.py
 !tests/test_range_benchmark.py
+!tests/test_jpb_microbenchmarks.py
 /external_benchmarks/**/*.duckdb
 /dynamic-predicate-transfer/job-*.csv

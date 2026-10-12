@@ -32,7 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
     execution.add_argument(
         "--only-microbenchmarks",
         action="store_true",
-        help="run point/range probes and regenerate figures, preserving existing SQL results",
+        help="run configured filter/JPB microbenchmarks and regenerate figures, preserving existing SQL results",
     )
     execution.add_argument(
         "--resume-preparation",

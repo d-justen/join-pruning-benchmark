@@ -263,6 +263,50 @@ def parse_microbenchmark_config(raw: object) -> MicrobenchmarkConfig | None:
 
 
 @dataclass(frozen=True)
+class JPBMicrobenchmarkConfig:
+    system_name: str
+    workload_name: str
+    repetitions: int = 5
+    warmups: int = 1
+    order_seed: int = 42
+    grafite_bpk: float = 12.0
+    diva_bpk: float = 16.0
+    max_fpr: float = 0.001
+    required_filters: tuple[str, ...] = ("prf_uncompressed", "prf", "grafite", "diva")
+
+
+def parse_jpb_microbenchmark_config(raw: object) -> JPBMicrobenchmarkConfig | None:
+    if raw is None:
+        return None
+    obj = _require_dict(raw, "jpb_microbenchmarks")
+    defaults = JPBMicrobenchmarkConfig(system_name="", workload_name="")
+    unknown = set(obj) - set(defaults.__dataclass_fields__)
+    if unknown:
+        raise ValueError(f"unknown jpb_microbenchmarks options: {', '.join(sorted(unknown))}")
+    values = {key: _require_string(obj.get(key), f"jpb_microbenchmarks.{key}")
+              for key in ("system_name", "workload_name")}
+    for key in ("repetitions", "warmups", "order_seed"):
+        value = _require_int(obj.get(key, getattr(defaults, key)), f"jpb_microbenchmarks.{key}")
+        if not (1 if key == "repetitions" else 0) <= value < 2**32:
+            raise ValueError(f"jpb_microbenchmarks.{key} is outside the supported range")
+        values[key] = value
+    for key in ("grafite_bpk", "diva_bpk", "max_fpr"):
+        value = _as_float(obj.get(key, getattr(defaults, key)), f"jpb_microbenchmarks.{key}")
+        if not math.isfinite(value):
+            raise ValueError(f"jpb_microbenchmarks.{key} must be finite")
+        values[key] = value
+    names = tuple(_require_string(name, "required_filters entry") for name in
+                  _require_list(obj.get("required_filters", list(defaults.required_filters)), "required_filters"))
+    if len(set(names)) != len(names) or set(names) - {"prf", "prf_uncompressed", "grafite", "diva"}:
+        raise ValueError("invalid jpb_microbenchmarks.required_filters")
+    values["required_filters"] = names
+    config = JPBMicrobenchmarkConfig(**values)
+    if config.grafite_bpk <= 2 or config.diva_bpk <= 1 or not 0 <= config.max_fpr <= 1:
+        raise ValueError("invalid jpb_microbenchmarks filter parameters")
+    return config
+
+
+@dataclass(frozen=True)
 class ExperimentConfig:
     config_path: Path
     experiment_name: str
@@ -272,6 +316,7 @@ class ExperimentConfig:
     systems: tuple[SystemConfig, ...]
     benchmark: BenchmarkOptions
     microbenchmarks: MicrobenchmarkConfig | None = None
+    jpb_microbenchmarks: JPBMicrobenchmarkConfig | None = None
 
     @property
     def experiment_root(self) -> Path:
@@ -847,11 +892,17 @@ def load_experiment_config(path: Path) -> ExperimentConfig:
         systems=_parse_systems(raw.get("systems"), base_dir),
         benchmark=_parse_benchmark(raw.get("benchmark", {})),
         microbenchmarks=parse_microbenchmark_config(raw.get("microbenchmarks")),
+        jpb_microbenchmarks=parse_jpb_microbenchmark_config(raw.get("jpb_microbenchmarks")),
     )
     if not config.workloads and config.microbenchmarks is None:
         raise ValueError("workloads must not be empty unless microbenchmarks are configured")
     if config.microbenchmarks and config.microbenchmarks.system_name not in {s.name for s in config.systems}:
         raise ValueError("microbenchmarks.system_name must reference a configured system")
+    if config.jpb_microbenchmarks:
+        if config.jpb_microbenchmarks.system_name not in {s.name for s in config.systems}:
+            raise ValueError("jpb_microbenchmarks.system_name must reference a configured system")
+        from benchmarking.jpb_microbenchmarks import resolve_jpb_cases
+        resolve_jpb_cases(config)
     if config.benchmark.repetitions <= 0:
         raise ValueError("repetitions must be positive")
     if config.benchmark.threads is not None and config.benchmark.threads <= 0:

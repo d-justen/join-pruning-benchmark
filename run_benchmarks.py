@@ -31,6 +31,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--duckdb-github-repo",
         help="runtime-only GitHub repo used only when creating or updating the shared DuckDB checkout",
     )
+    execution = parser.add_mutually_exclusive_group()
+    execution.add_argument(
+        "--resume-preparation",
+        action="store_true",
+        help="continue failed preparation, reusing completed workloads and density dimensions/batches",
+    )
+    execution.add_argument(
+        "--only-microbenchmarks", action="store_true",
+        help="run configured filter/JPB microbenchmarks while preserving existing SQL results",
+    )
     return parser
 
 
@@ -44,6 +54,8 @@ def main() -> None:
             github_branch=args.duckdb_github_branch,
             github_repo=args.duckdb_github_repo,
         ),
+        resume_preparation=args.resume_preparation,
+        only_microbenchmarks=args.only_microbenchmarks,
     )
     print(paths.root)
 

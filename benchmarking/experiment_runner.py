@@ -17,6 +17,7 @@ from benchmarking.duckdb_runner import (
 from benchmarking.experiment_config import ExperimentConfig
 from benchmarking.manifests import PreparedWorkload, load_manifest
 from benchmarking.microbenchmarks import run_microbenchmarks
+from benchmarking.jpb_microbenchmarks import run_jpb_microbenchmarks
 from benchmarking.workloads import (
     prepare_cross_product_workload,
     prepare_external_workload,
@@ -74,7 +75,7 @@ def run_experiment(config: ExperimentConfig, *, resume_preparation: bool = False
 
 
 def _validate_microbenchmark_only(config: ExperimentConfig) -> None:
-    if config.microbenchmarks is None:
+    if config.microbenchmarks is None and config.jpb_microbenchmarks is None:
         raise ValueError("--only-microbenchmarks requires a microbenchmarks configuration")
     saved = ExperimentPaths(config.experiment_root).copied_config_path
     if not saved.exists():
@@ -84,6 +85,7 @@ def _validate_microbenchmark_only(config: ExperimentConfig) -> None:
     def sql_config(path: Path) -> dict:
         data = json.loads(path.read_text(encoding="utf-8"))
         data.pop("microbenchmarks", None)
+        data.pop("jpb_microbenchmarks", None)
         data.pop("overwrite_output", None)
         return data
     if sql_config(saved) != sql_config(config.config_path):
@@ -137,8 +139,10 @@ def run_experiment_with_options(
         return tuple(workload for workload in config.workloads if workload.name in selected)
 
     resolved_systems = []
+    micro_system_names = {suite.system_name for suite in (config.microbenchmarks, config.jpb_microbenchmarks)
+                          if suite is not None}
     for system_config in config.systems:
-        if only_microbenchmarks and system_config.name != config.microbenchmarks.system_name:
+        if only_microbenchmarks and system_config.name not in micro_system_names:
             continue
         selected = selected_workload_configs(system_config)
         if only_microbenchmarks:
@@ -163,6 +167,9 @@ def run_experiment_with_options(
     if config.microbenchmarks is not None:
         micro_system = next(system for system in resolved_systems if system.name == config.microbenchmarks.system_name)
         run_microbenchmarks(config.microbenchmarks, micro_system, paths.root, reuse_completed=resume_preparation)
+    if config.jpb_microbenchmarks is not None:
+        micro_system = next(system for system in resolved_systems if system.name == config.jpb_microbenchmarks.system_name)
+        run_jpb_microbenchmarks(config, micro_system, paths.root, reuse_completed=resume_preparation)
     if only_microbenchmarks or not config.workloads:
         return paths
     workloads = prepare_workloads(

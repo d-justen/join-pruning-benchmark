@@ -1,0 +1,48 @@
+{
+  "experiment_name": "paper-jpb-microbenchmarks-smoke",
+  "output_root": "../../out/experiments",
+  "overwrite_output": true,
+  "workloads": [
+    {
+      "name": "join-pruning-workload",
+      "kind": "cross_product",
+      "params": {
+        "fixed": {
+          "fact_rows": 1000003,
+          "dimension_cardinality": 1000,
+          "key_domain_size": "dimension_cardinality",
+          "selectivity": 0.01,
+          "join_count": 1,
+          "build_key_multiplicity": 1,
+          "probe_layout": "uniform",
+          "row_group_size": 2048,
+          "dummy_string_cols": 0,
+          "dummy_string_len": 8,
+          "seed": 7
+        },
+        "sweep": {"kind": "dimension_cardinality", "values": [1000, 100000]},
+        "query_types": [
+          {"kind": "range", "probe_layouts": ["ordered", "uniform"]},
+          {"kind": "shoulder", "probe_layouts": ["ordered", "uniform"]},
+          {"kind": "seasonal", "cluster_count": 10, "probe_layouts": ["ordered", "uniform"]},
+          {"kind": "scattered", "probe_layouts": ["ordered", "uniform"]}
+        ]
+      }
+    }
+  ],
+  "systems": [
+    {
+      "name": "duckdb-paper",
+      "kind": "binary",
+      "binary_path": "duckdb/build/paper-native-release/duckdb",
+      "variants": [{"label": "prf with fallback", "setup_sql": []}]
+    }
+  ],
+  "jpb_microbenchmarks": {
+    "system_name": "duckdb-paper",
+    "workload_name": "join-pruning-workload",
+    "repetitions": 3,
+    "warmups": 1,
+    "required_filters": ["prf_uncompressed", "prf"]
+  }
+}
