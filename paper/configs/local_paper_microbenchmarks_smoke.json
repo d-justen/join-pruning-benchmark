@@ -18,6 +18,7 @@
     }
   ],
   "microbenchmarks": {
+    "construction_seed": 42,
     "system_name": "duckdb-paper",
     "domain_size": 10000,
     "total_keys": 256,

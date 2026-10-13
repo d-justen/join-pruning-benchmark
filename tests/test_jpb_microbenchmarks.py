@@ -26,6 +26,7 @@ from benchmarking.workloads.cross_product import (
 )
 from paper.figures.build_all import build_figures
 from paper.figures.jpb_microbenchmark import aggregate_rows, build_jpb_artifacts
+from benchmarking.microbenchmarks import build_seed
 
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = Path(os.environ.get("JPB_BENCHMARK_BINARY", ROOT / "duckdb/build/paper-native-release/tools/join_pruning_benchmark"))
@@ -68,6 +69,11 @@ def fixture_rows(config):
                            empty_ranges=0, range_false_positives=0, summary_bytes=1000, representation="fixture",
                            build_checksum=123, probe_checksum=456, measured_bpk=8)
                 row.update({key: getattr(config.jpb_microbenchmarks, key) for key in ("grafite_bpk", "diva_bpk", "max_fpr")})
+                row.update(construction_seed=42, build_seed=build_seed(42, 123, rep), build_input_order="sorted_distinct",
+                           adapter_representation={"grafite": "approximate_grafite", "diva": "diva"}.get(name, "native"),
+                           requested_bpk=getattr(config.jpb_microbenchmarks, f"{name}_bpk", 0),
+                           hash_a=1 if name == "grafite" else 0, hash_b=2 if name == "grafite" else 0,
+                           reduced_universe=10000 if name == "grafite" else 0)
                 rows.append({key: str(value) for key, value in row.items()})
     return rows
 
@@ -122,7 +128,9 @@ class JPBPipelineTests(unittest.TestCase):
             bad_rows = [rows[:-1], rows + [rows[0]]]
             for changes in ({"total_time_ns": "999"}, {"false_negatives": "1"}, {"probe_checksum": "999"},
                             {"groups_mixed": "0"}, {"point_probes": "0"}, {"max_fpr": "nan"},
-                            {"candidate_rows": "1"}, {"build_time_ns": "-1"}, {"seed": "999"}):
+                            {"candidate_rows": "1"}, {"build_time_ns": "-1"}, {"seed": "999"},
+                            {"build_seed": "123"}, {"build_input_order": "unknown"}, {"requested_bpk": "2"},
+                            {"adapter_representation": "exact_elias_fano", "hash_a": "0", "hash_b": "0", "reduced_universe": "0"}):
                 bad_rows.append([{**rows[0], **changes}, *rows[1:]])
             for bad in bad_rows:
                 write_rows(path, bad)
@@ -155,6 +163,12 @@ class JPBPipelineTests(unittest.TestCase):
             self.assertEqual(artifacts["verification"]["panel_count"], 4)
             self.assertEqual(artifacts["verification"]["phase_order"], ["build", "range", "point"])
             self.assertGreater(Path(artifacts["figure_path"]).stat().st_size, 1000)
+            self.assertEqual(artifacts["verification"]["bar_value"], "total_ms")
+            self.assertEqual(artifacts["verification"]["y_scale"], "log")
+            self.assertFalse(artifacts["verification"]["stacked"])
+            linear = build_jpb_artifacts(root / "measurements.csv", root / "linear", root / "linear/figures", [], y_scale="linear")
+            self.assertTrue(linear["verification"]["zero_baseline"])
+            self.assertEqual(linear["series"], artifacts["series"])
 
     def test_required_competitors_fail_before_execution_and_invalidate_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -221,6 +235,31 @@ class JPBPipelineTests(unittest.TestCase):
 
 @unittest.skipUnless(BINARY.is_file(), "build join_pruning_benchmark or set JPB_BENCHMARK_BINARY")
 class JPBNativeTests(unittest.TestCase):
+    def test_construction_replays_across_order_warmups_and_probe_layout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "keys.sql").write_text("SELECT unnest([1,63,127,255,300]::UBIGINT[])")
+            (root / "cases.tsv").write_text("".join(
+                f"{layout}\trange\t{layout}\t320\t4000\t32\t7\t5\tkeys.sql\n"
+                for layout in ("ordered", "uniform")))
+            outputs = []
+            for warmups, order in ((0, 1), (2, 91)):
+                path = root / f"{warmups}.csv"
+                subprocess.run([str(BINARY), f"--cases={root / 'cases.tsv'}", f"--output={path}",
+                                f"--warmups={warmups}", f"--order-seed={order}", "--repetitions=2",
+                                "--construction-seed=77", "--grafite-bpk=2.5"], check=True, capture_output=True)
+                outputs.append(sorted(({k: v for k, v in row.items() if not k.endswith("_time_ns")}
+                                       for row in read_csv(path)), key=lambda row: (row["query"], row["filter"], row["repetition"])))
+            self.assertEqual(outputs[0], outputs[1])
+            seeds = {}
+            for row in outputs[0]:
+                identity = row["repetition"], row["filter"]
+                metadata = tuple(row[k] for k in ("build_seed", "hash_a", "hash_b", "reduced_universe"))
+                self.assertEqual(seeds.setdefault(identity, metadata), metadata)
+                self.assertEqual(int(row["build_seed"]), build_seed(77, int(row["build_checksum"]), int(row["repetition"])))
+                if row["filter"] == "grafite":
+                    self.assertEqual(row["adapter_representation"], "approximate_grafite")
+
     def test_always_passing_approximate_ranges_count_false_positives(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

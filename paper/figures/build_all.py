@@ -2149,7 +2149,7 @@ def _draw_parameter_sweep_overview(
     return verification, summary
 
 
-def build_figures(experiment_root: Path, system_name: str | None) -> Path:
+def build_figures(experiment_root: Path, system_name: str | None, *, jpb_y_scale: str = "log") -> Path:
     experiment_root = experiment_root.resolve()
     experiment_config = load_experiment_config(experiment_root / "config.json")
     resolved_system_names = load_system_names(experiment_root, system_name)
@@ -2199,7 +2199,7 @@ def build_figures(experiment_root: Path, system_name: str | None) -> Path:
     if jpb_manifest is not None:
         jpb_dir = experiment_root / JPB_ARTIFACT_SUBDIR
         artifacts = build_jpb_artifacts(jpb_dir / "measurements.csv", output_dir, figures_dir,
-                                        jpb_manifest["unavailable_filters"])
+                                        jpb_manifest["unavailable_filters"], y_scale=jpb_y_scale)
         summary["figures"]["jpb_simulated_filtering"] = artifacts["figure_path"]
         summary["verification"]["jpb_simulated_filtering"] = artifacts["verification"]
         summary["sections"]["jpb_microbenchmarks"] = {**artifacts, "manifest_path": str(jpb_dir / "manifest.json")}
@@ -2630,12 +2630,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build paper figures and summaries from one experiment root.")
     parser.add_argument("--experiment-root", required=True, type=Path)
     parser.add_argument("--system-name")
+    parser.add_argument("--jpb-y-scale", choices=("log", "linear"), default="log")
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    output_dir = build_figures(args.experiment_root, args.system_name)
+    output_dir = build_figures(args.experiment_root, args.system_name, jpb_y_scale=args.jpb_y_scale)
     print(output_dir)
 
 

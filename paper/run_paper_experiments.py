@@ -43,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--system-name",
         help="visualize one system instead of combining all configured systems",
     )
+    parser.add_argument("--jpb-y-scale", choices=("log", "linear"), default="log")
     return parser
 
 
@@ -53,7 +54,7 @@ def main() -> None:
     if not args.skip_benchmarks:
         experiment_root = run_experiment(config, resume_preparation=args.resume_preparation,
                                          only_microbenchmarks=args.only_microbenchmarks).root
-    output_dir = build_figures(experiment_root, args.system_name)
+    output_dir = build_figures(experiment_root, args.system_name, jpb_y_scale=args.jpb_y_scale)
     print(output_dir)
 
 

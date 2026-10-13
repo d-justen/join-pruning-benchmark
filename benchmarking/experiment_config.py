@@ -207,6 +207,7 @@ class MicrobenchmarkConfig:
     queries_per_cluster_count: int = 100_000
     repetitions: int = 5
     seed: int = 42
+    construction_seed: int = 42
     grafite_bpk: float = 12.0
     diva_bpk: float = 16.0
     max_fpr: float = 0.001
@@ -225,9 +226,9 @@ def parse_microbenchmark_config(raw: object) -> MicrobenchmarkConfig | None:
         raise ValueError(f"unknown microbenchmarks options: {', '.join(sorted(unknown))}")
     values = {"system_name": _require_string(obj.get("system_name"), "microbenchmarks.system_name")}
     for key in ("domain_size", "total_keys", "min_clusters", "max_clusters", "probe_count",
-                "queries_per_cluster_count", "repetitions", "seed"):
+                "queries_per_cluster_count", "repetitions", "seed", "construction_seed"):
         values[key] = _require_int(obj.get(key, getattr(defaults, key)), f"microbenchmarks.{key}")
-        if values[key] < (0 if key == "seed" else 1) or values[key] >= 2**64:
+        if values[key] < (0 if key in {"seed", "construction_seed"} else 1) or values[key] >= 2**64:
             raise ValueError(f"microbenchmarks.{key} is outside the supported unsigned integer range")
     for key in ("grafite_bpk", "diva_bpk", "max_fpr"):
         values[key] = _as_float(obj.get(key, getattr(defaults, key)), f"microbenchmarks.{key}")
@@ -269,6 +270,7 @@ class JPBMicrobenchmarkConfig:
     repetitions: int = 5
     warmups: int = 1
     order_seed: int = 42
+    construction_seed: int = 42
     grafite_bpk: float = 12.0
     diva_bpk: float = 16.0
     max_fpr: float = 0.001
@@ -285,9 +287,9 @@ def parse_jpb_microbenchmark_config(raw: object) -> JPBMicrobenchmarkConfig | No
         raise ValueError(f"unknown jpb_microbenchmarks options: {', '.join(sorted(unknown))}")
     values = {key: _require_string(obj.get(key), f"jpb_microbenchmarks.{key}")
               for key in ("system_name", "workload_name")}
-    for key in ("repetitions", "warmups", "order_seed"):
+    for key in ("repetitions", "warmups", "order_seed", "construction_seed"):
         value = _require_int(obj.get(key, getattr(defaults, key)), f"jpb_microbenchmarks.{key}")
-        if not (1 if key == "repetitions" else 0) <= value < 2**32:
+        if not (1 if key == "repetitions" else 0) <= value < 2**(64 if key == "construction_seed" else 32):
             raise ValueError(f"jpb_microbenchmarks.{key} is outside the supported range")
         values[key] = value
     for key in ("grafite_bpk", "diva_bpk", "max_fpr"):

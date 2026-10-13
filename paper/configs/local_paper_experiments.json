@@ -210,6 +210,7 @@
     "collect_profiles": true
   },
   "jpb_microbenchmarks": {
+    "construction_seed": 42,
     "system_name": "duckdb-paper",
     "workload_name": "join-pruning-workload",
     "repetitions": 5,
@@ -221,6 +222,7 @@
     "required_filters": ["prf_uncompressed", "prf", "grafite", "diva"]
   },
   "microbenchmarks": {
+    "construction_seed": 42,
     "system_name": "duckdb-paper",
     "domain_size": 100000000,
     "total_keys": 1000000,

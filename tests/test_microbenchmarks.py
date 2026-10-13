@@ -11,7 +11,7 @@ from benchmarking import load_experiment_config
 from benchmarking.experiment_config import MicrobenchmarkConfig, parse_microbenchmark_config
 from benchmarking.experiment_runner import run_experiment
 from benchmarking.microbenchmarks import (
-    ARTIFACT_SUBDIR, load_microbenchmark_manifest, run_microbenchmarks, sha256, validate_results,
+    ARTIFACT_SUBDIR, BUILD_CONTRACT, build_seed, load_microbenchmark_manifest, run_microbenchmarks, sha256, validate_results,
 )
 from paper.figures.build_all import build_figures
 from paper.figures.filter_benchmark import load_filter_benchmark_rows, build_false_positive_rate_series
@@ -54,9 +54,13 @@ def fixture(root):
                                        max_false_positive_rate=0.001, correct_result="true",
                                        summary_bytes=200, post_processing_time_ns=1000,
                                        min_range_width=10, max_range_width=10))
+    for row in points + ranges:
+        row.update(construction_seed=42, build_seed=build_seed(42, row["cluster_count"], row["repetition"]),
+                   build_checksum=row["cluster_count"], build_input_order="sorted_distinct",
+                   adapter_representation="native", requested_bpk=0, hash_a=0, hash_b=0, reduced_universe=0)
     write_csv(directory / "point.csv", points)
     write_csv(directory / "range.csv", ranges)
-    manifest = {"schema_version": 1, "status": "complete", "config": asdict(CONFIG),
+    manifest = {"schema_version": 2, "build_contract": BUILD_CONTRACT, "status": "complete", "config": asdict(CONFIG),
                 "available_filters": AVAILABLE, "unavailable_filters": {"point": ["grafite", "diva"],
                                                                          "range": ["grafite", "diva"]},
                 "outputs": {kind: {"sha256": sha256(directory / f"{kind}.csv")} for kind in ("point", "range")}}

@@ -327,6 +327,8 @@ def write_filter_benchmark_summary_markdown(
             for name, stats in systems.items():
                 lines.append(f"| {_display_label(name)} | {kind} | {stats['min']:.3f} | {stats['max']:.3f} | {stats['avg']:.3f} |")
         lines.append("")
+    if "construction_policy" in summary:
+        lines.extend([summary["construction_policy"], ""] )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines), encoding="utf-8")
 
@@ -340,6 +342,7 @@ def draw_filter_benchmark_plot(
     false_positive_rate_series: dict[str, list[tuple[int, float]]],
     aggregate: str,
     range_throughput_series: dict[str, list[tuple[int, float]]] | None = None,
+    grafite_exact_fallback: bool = False,
 ) -> dict[str, object]:
     width, base_height = PAGE_SIZES["one-column"]
     panel_count = 5 if range_throughput_series is not None else 4
@@ -500,7 +503,8 @@ def draw_filter_benchmark_plot(
 
     fig.legend(
         reordered_handles,
-        [label.replace("Prefix Range Filter (uncompressed)", "PRF (uncompressed)") for label in reordered_labels],
+        [label.replace("Prefix Range Filter (uncompressed)", "PRF (uncompressed)").replace(
+            "Grafite", "Grafite + exact EF" if grafite_exact_fallback else "Grafite") for label in reordered_labels],
         loc="upper center",
         bbox_to_anchor=(0.5, 0.98),
         ncol=legend_columns,
@@ -526,6 +530,7 @@ def draw_filter_benchmark_plot(
         "build_time_aggregate": aggregate,
         "false_positive_rate_aggregate": aggregate,
         "plotted_filters": plotted_filters,
+        "grafite_exact_fallback": grafite_exact_fallback,
         "point_count_per_filter": {
             filter_name: len(throughput_series[filter_name]) for filter_name in plotted_filters
         },
@@ -543,6 +548,17 @@ def build_filter_benchmark_artifacts(
     build_time_series = build_build_time_series(rows, aggregate=aggregate)
     false_positive_rate_series = build_false_positive_rate_series(rows, aggregate=aggregate)
     summary = summarize_filter_benchmark(rows)
+    with csv_path.open(newline="") as handle:
+        raw_rows = list(csv.DictReader(handle))
+    metadata_fields = ("filter", "cluster_count", "repetition", "build_checksum", "construction_seed", "build_seed",
+                       "build_input_order", "adapter_representation", "requested_bpk", "hash_a", "hash_b", "reduced_universe")
+    construction = [{key: row[key] for key in metadata_fields} for row in raw_rows
+                    if all(key in row for key in metadata_fields)]
+    exact_fallback = any(row["adapter_representation"] == "exact_elias_fano" for row in construction)
+    if construction:
+        summary["construction"] = construction
+        summary["construction_policy"] = ("Sorted distinct build keys; Grafite uses exact SUX Elias–Fano when cheaper "
+                                           "than the requested approximate budget. Seeds derive from build inputs and repetition.")
     range_series = None
     range_rows = []
     all_range_series = {}
@@ -572,6 +588,7 @@ def build_filter_benchmark_artifacts(
         figure_path, throughput_series=series, range_throughput_series=range_series,
         summary_size_series=summary_size_series, build_time_series=build_time_series,
         false_positive_rate_series=false_positive_rate_series, aggregate=aggregate,
+        grafite_exact_fallback=exact_fallback,
     )
     with series_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)

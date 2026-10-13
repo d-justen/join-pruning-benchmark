@@ -14,7 +14,8 @@ from benchmarking.experiment_config import (
     CrossProductWorkloadConfig, ExperimentConfig, JPBMicrobenchmarkConfig,
 )
 from benchmarking.manifests import utc_now_iso
-from benchmarking.microbenchmarks import _source_metadata, _write_manifest, read_csv, sha256
+from benchmarking.microbenchmarks import (BUILD_CONTRACT, _source_metadata, _write_manifest, read_csv, sha256,
+                                         validate_build_metadata)
 from benchmarking.workloads.cross_product import _resolve_sweep_cases, _selected_rank_query, _sweep_query_filename
 
 ARTIFACT_SUBDIR = Path("microbenchmarks/jpb-simulation")
@@ -92,6 +93,7 @@ def validate_results(path: Path, spec: JPBMicrobenchmarkConfig, cases: list[dict
         if key not in expected or key in seen:
             raise ValueError(f"unexpected or duplicate JPB measurement: {key}")
         seen.add(key)
+        validate_build_metadata(row, spec, row["filter"])
         case = case_map[key[0]]
         for field in ("dimension_cardinality", "probe_rows", "row_group_size", "seed", "build_keys"):
             if number(field) != case[field]:
@@ -137,8 +139,10 @@ def validate_results(path: Path, spec: JPBMicrobenchmarkConfig, cases: list[dict
 def load_jpb_manifest(root: Path, config: ExperimentConfig) -> dict:
     directory = root / ARTIFACT_SUBDIR
     manifest = json.loads((directory / "manifest.json").read_text())
-    if manifest.get("schema_version") != 1 or manifest.get("status") != "complete":
+    if manifest.get("schema_version") != 2 or manifest.get("status") != "complete":
         raise ValueError("JPB microbenchmarks are incomplete; rerun with --only-microbenchmarks")
+    if manifest.get("build_contract") != BUILD_CONTRACT:
+        raise ValueError("saved construction contract differs; rerun the microbenchmarks")
     if (manifest["config"] != json.loads(json.dumps(asdict(config.jpb_microbenchmarks)))
             or manifest["cases"] != resolve_jpb_cases(config) or manifest["input_version"] != INPUT_VERSION):
         raise ValueError("saved JPB workload/configuration differs; rerun the microbenchmarks")
@@ -161,7 +165,7 @@ def run_jpb_microbenchmarks(config: ExperimentConfig, system, root: Path, *, reu
     directory = root / ARTIFACT_SUBDIR
     directory.mkdir(parents=True, exist_ok=True)
     manifest_path = directory / "manifest.json"
-    manifest = {"schema_version": 1, "status": "running", "started_at": utc_now_iso(),
+    manifest = {"schema_version": 2, "build_contract": BUILD_CONTRACT, "status": "running", "started_at": utc_now_iso(),
                 "config": json.loads(json.dumps(asdict(spec))), "cases": cases, "input_version": INPUT_VERSION,
                 "scope": "single-threaded row-group filtering; dense non-null integer keys; no Bloom fallback",
                 "input_order": "build keys supplied sorted; probes ordered or synthetic uniform",
@@ -200,7 +204,7 @@ def run_jpb_microbenchmarks(config: ExperimentConfig, system, root: Path, *, reu
         temporary = directory / "measurements.csv.tmp"
         command = [str(binary), f"--cases={case_path.resolve()}", f"--output={temporary.resolve()}",
                    *[f"--{key.replace('_', '-')}={getattr(spec, key)}" for key in
-                     ("repetitions", "warmups", "order_seed", "grafite_bpk", "diva_bpk", "max_fpr")]]
+                     ("repetitions", "warmups", "order_seed", "construction_seed", "grafite_bpk", "diva_bpk", "max_fpr")]]
         manifest["command"] = command
         _write_manifest(manifest_path, manifest)
         with (directory / "benchmark.log").open("w") as log:

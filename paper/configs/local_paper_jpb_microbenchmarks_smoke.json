@@ -39,6 +39,7 @@
     }
   ],
   "jpb_microbenchmarks": {
+    "construction_seed": 42,
     "system_name": "duckdb-paper",
     "workload_name": "join-pruning-workload",
     "repetitions": 3,

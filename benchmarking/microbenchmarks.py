@@ -51,6 +51,51 @@ def _number(row: dict[str, str], key: str, *, integer: bool = False, positive: b
     return value
 
 
+# Shared with tools/filter_benchmark_common.hpp. Versioned in every manifest.
+BUILD_CONTRACT = {"version": 1, "input_order": "sorted_distinct", "seed_derivation": "splitmix64-low32-v1",
+                  "grafite_policy": "exact_elias_fano_when_cheaper_else_requested_budget",
+                  "preparation_timed": False, "summary_construction_timed": True}
+
+
+def build_seed(base: int, checksum: int, repetition: int) -> int:
+    mask = 2**64 - 1
+    value = base ^ checksum ^ (((repetition + 1) * 0x9e3779b97f4a7c15) & mask)
+    value = ((value ^ (value >> 30)) * 0xbf58476d1ce4e5b9) & mask
+    value = ((value ^ (value >> 27)) * 0x94d049bb133111eb) & mask
+    return (value ^ (value >> 31)) & (2**32 - 1)
+
+
+def validate_build_metadata(row: dict, config, name: str) -> None:
+    required = {"construction_seed", "build_seed", "build_checksum", "build_input_order",
+                "adapter_representation", "requested_bpk", "hash_a", "hash_b", "reduced_universe"}
+    if required - row.keys():
+        raise ValueError("missing reproducible construction metadata; rebuild DuckDB and rerun microbenchmarks")
+    checksum, rep = int(row["build_checksum"]), int(row["repetition"])
+    if (not 0 <= checksum < 2**64 or row["build_input_order"] != "sorted_distinct"
+            or int(row["construction_seed"]) != config.construction_seed
+            or int(row["build_seed"]) != build_seed(config.construction_seed, checksum, rep)):
+        raise ValueError("build seed or sorted-input contract differs from config")
+    mode = row["adapter_representation"]
+    expected_bpk = getattr(config, f"{name}_bpk") if name in {"grafite", "diva"} else 0
+    if float(row["requested_bpk"]) != expected_bpk:
+        raise ValueError("requested construction budget differs from config")
+    a, b, r = (int(row[field]) for field in ("hash_a", "hash_b", "reduced_universe"))
+    modes = {"exact_elias_fano", "approximate_grafite"} if name == "grafite" else {"diva" if name == "diva" else "native"}
+    if mode not in modes:
+        raise ValueError("unexpected adapter representation")
+    if mode == "approximate_grafite":
+        if not r > 0 or not 0 <= a < r or not 0 <= b < r:
+            raise ValueError("invalid Grafite hash parameters")
+    elif (a, b, r) != (0, 0, 0):
+        raise ValueError("hash parameters recorded for an unhashed representation")
+    if mode == "exact_elias_fano":
+        for field in ("false_positives", "range_false_positives"):
+            if int(row.get(field, 0)):
+                raise ValueError("exact Grafite representation reported false positives")
+        if row.get("query_kind") == "empty" and int(row["possibly_overlapping"]):
+            raise ValueError("exact Grafite representation accepted an empty range")
+
+
 def validate_results(directory: Path, config: MicrobenchmarkConfig,
                      available: dict[str, list[str]]) -> dict[str, int]:
     clusters = set()
@@ -62,6 +107,7 @@ def validate_results(directory: Path, config: MicrobenchmarkConfig,
     ranges = read_csv(directory / "range.csv")
     point_keys = set()
     negative_counts = {}
+    checksums = {}
     for row in point:
         rep = _number(row, "repetition", integer=True)
         cluster = _number(row, "cluster_count", integer=True, positive=True)
@@ -69,6 +115,11 @@ def validate_results(directory: Path, config: MicrobenchmarkConfig,
         if key in point_keys:
             raise ValueError(f"duplicate point measurement: {key}")
         point_keys.add(key)
+        validate_build_metadata(row, config, row["filter"])
+        checksum = int(row["build_checksum"])
+        if cluster in checksums and checksums[cluster] != checksum:
+            raise ValueError("microbenchmarks did not receive identical build keys")
+        checksums[cluster] = checksum
         if int(row["seed"]) != config.seed + rep or int(row["probe_count"]) != config.probe_count:
             raise ValueError("point seed or probe_count does not match the config")
         negatives = _number(row, "actual_negatives", integer=True)
@@ -96,6 +147,9 @@ def validate_results(directory: Path, config: MicrobenchmarkConfig,
         if key in range_keys:
             raise ValueError(f"duplicate range measurement: {key}")
         range_keys.add(key)
+        validate_build_metadata(row, config, key[0])
+        if int(row["build_checksum"]) != checksums.get(cluster):
+            raise ValueError("point and range build keys differ")
         queries = _number(row, "query_count", integer=True, positive=True)
         ns = _number(row, "total_query_time_ns", integer=True, positive=True)
         rate = _number(row, "queries_per_sec", positive=True)
@@ -165,6 +219,18 @@ def _source_metadata(system: ResolvedSystem) -> dict:
             if result.returncode == 0:
                 metadata[name] = (hashlib.sha256(result.stdout).hexdigest() if name.endswith("sha256")
                                   else result.stdout.decode().strip())
+        sources = ["tools/filter_benchmark_common.hpp", "tools/grafite_benchmark_adapter.cpp",
+                   "tools/diva_benchmark_adapter.cpp", "tools/filter_benchmark.cpp", "tools/range_benchmark.cpp",
+                   "tools/join_pruning_benchmark.cpp", "src/execution/join_hashtable.cpp",
+                   "src/planner/filter/table_filter_prefix_range_function.cpp",
+                   "third_party/grafite/include/grafite/grafite.hpp"]
+        metadata["source_sha256"] = {name: sha256(system.checkout_dir / name) for name in sources
+                                     if (system.checkout_dir / name).is_file()}
+        result = subprocess.run(["git", "ls-files", "--others", "--exclude-standard", "-z"],
+                                cwd=system.checkout_dir, capture_output=True, check=True)
+        metadata["untracked_sha256"] = {name: sha256(system.checkout_dir / name)
+                                        for name in result.stdout.decode().split("\0") if name
+                                        and (system.checkout_dir / name).is_file()}
     return metadata
 
 
@@ -177,8 +243,10 @@ def _write_manifest(path: Path, manifest: dict) -> None:
 def load_microbenchmark_manifest(experiment_root: Path) -> dict:
     directory = experiment_root / ARTIFACT_SUBDIR
     manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
-    if manifest.get("schema_version") != 1 or manifest.get("status") != "complete":
+    if manifest.get("schema_version") != 2 or manifest.get("status") != "complete":
         raise ValueError("microbenchmarks are incomplete; rerun with --only-microbenchmarks")
+    if manifest.get("build_contract") != BUILD_CONTRACT:
+        raise ValueError("saved construction contract differs; rerun the microbenchmarks")
     config = parse_microbenchmark_config(manifest["config"])
     for kind in ("point", "range"):
         if sha256(directory / f"{kind}.csv") != manifest["outputs"][kind]["sha256"]:
@@ -197,7 +265,7 @@ def run_microbenchmarks(config: MicrobenchmarkConfig, system: ResolvedSystem,
         binaries = resolve_microbenchmark_binaries(system)
         identities = {kind: {"path": str(path), "sha256": sha256(path)} for kind, path in binaries.items()}
     except Exception as exc:
-        _write_manifest(manifest_path, {"schema_version": 1, "status": "failed", "config": config_dict,
+        _write_manifest(manifest_path, {"schema_version": 2, "build_contract": BUILD_CONTRACT, "status": "failed", "config": config_dict,
                                         "finished_at": utc_now_iso(), "error": str(exc)})
         raise
     if reuse_completed and manifest_path.exists():
@@ -206,7 +274,7 @@ def run_microbenchmarks(config: MicrobenchmarkConfig, system: ResolvedSystem,
             load_microbenchmark_manifest(experiment_root)
             return directory
     manifest = {
-        "schema_version": 1, "status": "running", "started_at": utc_now_iso(),
+        "schema_version": 2, "build_contract": BUILD_CONTRACT, "status": "running", "started_at": utc_now_iso(),
         "config": config_dict, "binaries": identities,
         "commands": {}, "outputs": {},
     }
@@ -229,7 +297,7 @@ def run_microbenchmarks(config: MicrobenchmarkConfig, system: ResolvedSystem,
             if missing:
                 raise ValueError(f"{kind} benchmark lacks required filters: {', '.join(sorted(missing))}")
         common = [f"--{key.replace('_', '-')}={getattr(config, key)}" for key in (
-            "domain_size", "total_keys", "min_clusters", "max_clusters", "repetitions", "seed",
+            "domain_size", "total_keys", "min_clusters", "max_clusters", "repetitions", "seed", "construction_seed",
             "grafite_bpk", "diva_bpk", "max_fpr")]
         for kind, binary in binaries.items():
             output = directory / f"{kind}.csv"

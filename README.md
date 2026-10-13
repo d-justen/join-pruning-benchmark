@@ -66,13 +66,13 @@ python3 paper/run_paper_experiments.py --config paper/configs/local_paper_experi
 
 The optional top-level `microbenchmarks` object selects `system_name`, shared
 `domain_size`, `total_keys`, `min_clusters`, `max_clusters`, `repetitions`, `seed`,
-`grafite_bpk`, `diva_bpk`, and `max_fpr`, plus `probe_count` for points and
+`construction_seed`, `grafite_bpk`, `diva_bpk`, and `max_fpr`, plus `probe_count` for points and
 `queries_per_cluster_count` for ranges. Cluster bounds must be powers of two.
 `aggregate` accepts `median` or `mean`. Each executable runs its filters internally;
 SQL variants and SQL thread settings do not multiply or configure these measurements.
 
 The publication config requires Bloom, Grafite, Diva, and both PRF modes. Diva
-requires Linux x86-64; Grafite requires x86-64. Missing required filters fail the
+requires Linux x86-64; Grafite supports x86-64 and ARM64. Missing required filters fail the
 run before measurements. This smaller config runs on the local platform and
 records unavailable competitors:
 
@@ -121,19 +121,77 @@ Focused pipeline checks:
 python3 -m unittest discover -s tests -p test_microbenchmarks.py
 ```
 
+All three microbenchmarks supply **sorted distinct build keys** to every summary.
+Ordered/uniform labels describe the **probe stream**, not the build input.
+Input generation, sorting, deduplication and shared validation are untimed;
+summary-specific hashing, sorting, allocation and encoding are construction work.
+Point probes produce selection vectors for all implementations; membership-oracle
+checks run outside the timers. PRF allocation and Bloom hash-buffer construction
+are included in build time, and the measured Bloom instance is reused for probing.
+Diva already consumes sorted keys. Grafite's hashed output is checked for a sorted
+run or a cyclic rotation; other hashed outputs are sorted normally.
+
+Grafite no longer silently clamps the requested budget. It uses approximate
+Grafite at that budget when the reduced universe is smaller than the input
+universe; otherwise it stores exact Elias–Fano using the same SUX backend.
+This is an explicit **Grafite + exact fallback** comparison. The adapter records
+`adapter_representation`, `requested_bpk`, hash parameters and reduced universe;
+actual `summary_bytes` and measured FPR remain the basis for comparison. Requested
+bits per key are a model parameter, not a hard cap on storage including metadata.
+Range queries crossing hash blocks are split safely; intervals covering a whole
+reduced universe conservatively pass. Exact mode has zero false positives.
+
+Both randomized adapters use a per-construction seed derived from
+`construction_seed` (default 42), the sorted build checksum and the zero-based
+measured repetition. Equal build sets get equal seeds across tools and probe
+layouts. Warmups and execution order do not affect measured constructions.
+Changing the base seed gives an independent reproducible series. Runtime still
+varies with scheduling and caches; deterministic seeds reproduce the filter and
+its answers, not identical elapsed nanoseconds.
+
+The corresponding DuckDB branch is `d-justen/duckdb:prf-v2`. Commit
+`087b4fb9d9` publishes the previously local PRF optimizations; commit
+`4895e6f2c080601422e5c70882a1ab934600b3f4` adds the adapters and timing contract.
+For a clean existing DuckDB checkout, update and rebuild before rerunning:
+
+```bash
+git -C duckdb switch prf-v2
+git -C duckdb pull --ff-only origin prf-v2
+# Use checkout 4895e6f2c080601422e5c70882a1ab934600b3f4 instead to pin this implementation.
+venv/bin/python paper/run_paper_experiments.py --config paper/configs/local_paper_experiments.json --only-microbenchmarks
+```
+
+The git-system runner rebuilds the tools from the selected source. A full SQL
+rerun is also needed to replace the old intro/string-join/JPB PRF measurements;
+`--only-microbenchmarks` intentionally preserves those historical SQL results.
+
+Version-2 manifests record this contract, source content hashes (including
+untracked source), binary hashes, and build settings. Version-1 measurements must
+be rerun to claim corrected Grafite behavior; replotting does not repair them.
+The adapter-only target can validate both competitors on Linux x86-64:
+
+```bash
+cmake --build duckdb/build/release --target range_filter_adapter_tests -j 4
+duckdb/build/release/tools/range_filter_adapter_tests
+```
+
 ## Simulated JPB Filter Execution
 
 The native paper config also runs `join_pruning_benchmark` and produces
 `paper/figures/jpb_simulated_filtering.pdf` (with a PNG preview). The four panels
 separate ordered/uniform probes and small/large dimensions. Each query has one
-bar per available filter, stacking **Build**, **Range probes**, and **Point probes**.
+bar per available filter, showing **total execution time** (build + range + point).
 Build includes allocation, insertion, analysis/compression, and finalization.
-Stacks use arithmetic means so their heights equal mean repetition totals;
-error bars show one sample standard deviation of those totals. Panel scales are
-linear, start at zero, and are independent.
+Bar heights are arithmetic means of repetition totals; error bars show one
+sample standard deviation of those totals. Panels share a logarithmic y-axis by
+default. `--jpb-y-scale linear` on either `paper/run_paper_experiments.py` or
+`python -m paper.figures.build_all` selects a shared linear axis starting at zero.
+Phase timings remain in the raw CSV, aggregated CSV, and JSON exports. On log axes,
+error bars crossing the lower display limit are clipped and disclosed in the caption.
+Zero total times require the linear option.
 
 The optional `jpb_microbenchmarks` configuration selects `system_name` and
-`workload_name`, plus `repetitions`, `warmups`, `order_seed`, `grafite_bpk`,
+`workload_name`, plus `repetitions`, `warmups`, `order_seed`, `construction_seed`, `grafite_bpk`,
 `diva_bpk`, `max_fpr`, and `required_filters`. The workload reference supplies the
 query definitions, seed, cardinalities, selectivity, and row-group size. The
 first version supports native dimension-cardinality sweeps with one join,
@@ -147,7 +205,8 @@ Probe keys and logical row-group min/max metadata are also prepared outside the
 timers. Ordered keys use `1 + floor(row_index * domain_size / probe_rows)`;
 uniform keys use a fixed `mt19937_64` sequence modulo the domain. Uniform inputs
 match JPB's distribution, not an existing database's exact random sequence.
-Input data stays fixed across repetitions; only filter order is shuffled.
+Input data stays fixed across repetitions; filter order is shuffled and construction
+seeds vary reproducibly by build-key checksum and measured repetition.
 One probe column is reused across predicates, requiring about 4 GB at the
 500-million-row paper scale, plus validation/output bitmaps and filter storage.
 
@@ -188,8 +247,8 @@ selection SQL, the run log, and a checksummed manifest live in
 `paper/jpb_simulated_filtering_summary.json`, and registered in the paper summary.
 The manifest validates both referenced workload definitions and saved artifacts.
 Tests use real available implementations, plus synthetic four-filter plotting
-fixtures; Grafite/Diva compilation and execution require a supported x86-64
-machine (Linux for Diva) and are not validated by a PRF-only smoke run.
+fixtures. Grafite supports x86-64 and ARM64; Diva requires Linux x86-64.
+A PRF-only smoke run does not validate competitors.
 
 ## Generated Join-Pruning Sweeps
 
