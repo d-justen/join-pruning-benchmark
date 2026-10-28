@@ -125,6 +125,72 @@ class FilterProfileTests(unittest.TestCase):
         finally:
             plt.close(fig)
 
+    def test_summary_excludes_non_join_queries_and_floors_only_relative_counts(self):
+        rows, plans = [], []
+        # One variant eliminates a join; another query has zero work in both.
+        fixtures = {
+            "scan_only.sql": ((100, 1000, 0, 0), (200, 2000, 0, 0)),
+            "eliminated_join.sql": ((.25, 100, 10, 1), (.125, 0, 0, 0)),
+            "zero_work.sql": ((.5, 0, 0, 1), (.25, 0, 0, 1)),
+            "positive_work.sql": ((1, 9, 4, 1), (.5, 1, 1, 1)),
+        }
+        for query, variants in fixtures.items():
+            for label, (runtime, scanned, probes, joins) in zip(("sip", "rpt prf"), variants):
+                rows.append(MetricRow(
+                    "fixture", query, label, runtime, None, scanned,
+                    filter_phases=JoinFilterMetrics(
+                        join_finalize_build_ms=999 if query == "scan_only.sql" else 2,
+                        prf_build_count=999 if query == "scan_only.sql" else 1,
+                    ),
+                ))
+                plans.append(PlanMetricRow("fixture", query, label, scanned, probes, joins))
+        summary = summarize_benchmark_metrics(rows, plans, (("fixture", "Fixture", None),))
+        benchmark = summary["benchmarks"][0]
+        self.assertEqual(benchmark["query_count"], 3)
+        self.assertEqual(benchmark["join_free_query_count"], 1)
+        self.assertEqual(benchmark["join_free_query_names"], ["scan_only.sql"])
+        self.assertEqual(benchmark["relative_query_counts"],
+                         {"runtime_ms": 3, "rows_scanned": 3, "join_probe_tuples": 3})
+        self.assertEqual(benchmark["relative_excluded_query_counts"],
+                         {"runtime_ms": 0, "rows_scanned": 0, "join_probe_tuples": 0})
+        sip, rpt = (benchmark["variants"][label] for label in ("sip", "rpt prf"))
+        self.assertEqual((sip["total_runtime_ms"], rpt["total_runtime_ms"]), (1.75, .875))
+        self.assertEqual((sip["total_rows_scanned"], rpt["total_rows_scanned"]), (109, 1))
+        self.assertEqual((sip["total_join_probe_tuples"], rpt["total_join_probe_tuples"]), (14, 1))
+        self.assertAlmostEqual(sip["relative_runtime_geomean"], 2)
+        self.assertAlmostEqual(sip["relative_rows_scanned_geomean"], 900 ** (1 / 3))
+        self.assertAlmostEqual(sip["relative_join_probe_geomean"], 40 ** (1 / 3))
+        for metric in ("relative_runtime_geomean", "relative_rows_scanned_geomean",
+                       "relative_join_probe_geomean"):
+            self.assertAlmostEqual(rpt[metric], 1)
+        for variant in (sip, rpt):
+            self.assertEqual(variant["join_finalize_build_ms"], 6)
+            self.assertEqual(variant["join_finalize_build_profile_count"], 3)
+            self.assertEqual(variant["prf_build_count"], 3)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "summary.md"
+            _write_benchmark_summary_markdown(path, experiment_root=Path(directory),
+                                              system_name="fixture", benchmark_summary=summary)
+            markdown = path.read_text()
+            self.assertIn("3 join queries; relative time uses 3 (excluded 0)", markdown)
+            self.assertIn("1 non-join queries excluded (scan_only.sql)", markdown)
+            self.assertIn("replacing zero counts with one before normalization", markdown)
+            self.assertIn("absolute totals retain the recorded zeros", markdown)
+            self.assertIn("6.00 ms (3/3)", markdown)
+
+    def test_summary_with_only_non_join_queries_has_no_relative_metrics(self):
+        rows = [MetricRow("fixture", "scan.sql", "sip", 10, None, 100)]
+        plans = [PlanMetricRow("fixture", "scan.sql", "sip", 100, 0, 0)]
+        summary = summarize_benchmark_metrics(rows, plans, (("fixture", "Fixture", None),))
+        benchmark = summary["benchmarks"][0]
+        self.assertEqual(benchmark["query_count"], 0)
+        self.assertIsNone(benchmark["variants"]["sip"]["relative_runtime_geomean"])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "summary.md"
+            _write_benchmark_summary_markdown(path, experiment_root=Path(directory),
+                                              system_name="fixture", benchmark_summary=summary)
+            self.assertIn("0 join queries", path.read_text())
+
     def test_latest_profile_is_selected_as_a_whole(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

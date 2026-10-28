@@ -1,0 +1,199 @@
+{
+  "experiment_name": "graviton-microbenchmarks",
+  "output_root": "/results",
+  "overwrite_output": false,
+  "workloads": [
+    {
+      "name": "join-pruning-workload",
+      "kind": "cross_product",
+      "params": {
+        "fixed": {
+          "fact_rows": 500000000,
+          "dimension_cardinality": 100000,
+          "key_domain_size": "dimension_cardinality",
+          "selectivity": 0.01,
+          "join_count": 1,
+          "build_key_multiplicity": 1,
+          "probe_layout": "uniform",
+          "row_group_size": 122880,
+          "dummy_string_cols": 2,
+          "dummy_string_len": 8,
+          "seed": 7
+        },
+        "sweep": {
+          "kind": "dimension_cardinality",
+          "values": [
+            100000,
+            100000000
+          ]
+        },
+        "query_types": [
+          {
+            "kind": "range",
+            "probe_layouts": [
+              "ordered",
+              "uniform"
+            ]
+          },
+          {
+            "kind": "shoulder",
+            "probe_layouts": [
+              "ordered",
+              "uniform"
+            ]
+          },
+          {
+            "kind": "seasonal",
+            "cluster_count": 10,
+            "probe_layouts": [
+              "ordered",
+              "uniform"
+            ]
+          },
+          {
+            "kind": "scattered",
+            "probe_layouts": [
+              "ordered",
+              "uniform"
+            ]
+          }
+        ]
+      },
+      "estimated_peak_gib": 260
+    }
+  ],
+  "systems": [
+    {
+      "name": "duckdb-paper",
+      "kind": "binary",
+      "variants": [
+        {
+          "label": "no prefilter",
+          "setup_sql": [
+            "SET enable_prefix_range_filter=false;",
+            "SET enable_join_min_max_filter_pushdown=false;",
+            "SET enable_join_bloom_filter_pushdown=false;",
+            "SET enable_perfect_hash_join_filter_pushdown=false;",
+            "SET dynamic_or_filter_threshold=0;",
+            "SET disabled_optimizers='compressed_materialization';"
+          ]
+        },
+        {
+          "label": "sip",
+          "setup_sql": [
+            "SET enable_prefix_range_filter=false;",
+            "SET enable_join_min_max_filter_pushdown=false;",
+            "SET enable_join_bloom_filter_pushdown=true;",
+            "SET enable_perfect_hash_join_filter_pushdown=false;",
+            "SET dynamic_or_filter_threshold=0;",
+            "SET disabled_optimizers='compressed_materialization';"
+          ]
+        },
+        {
+          "label": "sip + min/max",
+          "setup_sql": [
+            "SET enable_prefix_range_filter=false;",
+            "SET enable_join_min_max_filter_pushdown=true;",
+            "SET enable_join_bloom_filter_pushdown=true;",
+            "SET enable_perfect_hash_join_filter_pushdown=false;",
+            "SET dynamic_or_filter_threshold=0;",
+            "SET disabled_optimizers='compressed_materialization';"
+          ]
+        },
+        {
+          "label": "prf uncompressed",
+          "setup_sql": [
+            "SET enable_prefix_range_filter=true;",
+            "SET enable_prefix_range_filter_compression=false;",
+            "SET enable_join_min_max_filter_pushdown=true;",
+            "SET enable_join_bloom_filter_pushdown=true;",
+            "SET enable_perfect_hash_join_filter_pushdown=false;",
+            "SET dynamic_or_filter_threshold=0;",
+            "SET disabled_optimizers='compressed_materialization';"
+          ]
+        },
+        {
+          "label": "prf with fallback",
+          "setup_sql": [
+            "SET enable_prefix_range_filter=true;",
+            "SET enable_prefix_range_filter_compression=true;",
+            "SET enable_join_min_max_filter_pushdown=true;",
+            "SET enable_join_bloom_filter_pushdown=true;",
+            "SET enable_perfect_hash_join_filter_pushdown=false;",
+            "SET dynamic_or_filter_threshold=0;",
+            "SET disabled_optimizers='compressed_materialization';"
+          ]
+        }
+      ],
+      "binary_path": "/opt/prf/duckdb"
+    }
+  ],
+  "benchmark": {
+    "repetitions": 10,
+    "threads": 8,
+    "prepare_duckdb_binary": "duckdb",
+    "collect_profiles": true,
+    "memory_limit": "20GiB",
+    "max_temp_directory_size": "120GiB"
+  },
+  "jpb_microbenchmarks": {
+    "construction_seed": 42,
+    "system_name": "duckdb-paper",
+    "workload_name": "join-pruning-workload",
+    "repetitions": 5,
+    "warmups": 1,
+    "order_seed": 42,
+    "grafite_bpk": 12.0,
+    "diva_bpk": 16.0,
+    "max_fpr": 0.001,
+    "required_filters": [
+      "prf_uncompressed",
+      "prf",
+      "grafite",
+      "diva"
+    ]
+  },
+  "microbenchmarks": {
+    "construction_seed": 42,
+    "system_name": "duckdb-paper",
+    "domain_size": 100000000,
+    "total_keys": 1000000,
+    "min_clusters": 2,
+    "max_clusters": 524288,
+    "probe_count": 1000000,
+    "queries_per_cluster_count": 100000,
+    "repetitions": 5,
+    "seed": 42,
+    "grafite_bpk": 12.0,
+    "diva_bpk": 16.0,
+    "max_fpr": 0.001,
+    "required_filters": [
+      "bloom",
+      "grafite",
+      "prf_uncompressed",
+      "prf",
+      "diva"
+    ],
+    "aggregate": "median",
+    "range_query_kind": "empty"
+  },
+  "suite": {
+    "checkpoint_queries": true,
+    "checkpoint_microbenchmarks": true,
+    "container_memory": "28g",
+    "container_cpus": 8,
+    "timeout_seconds": 86400,
+    "prepare_timeout_seconds": 86400,
+    "disk_reserve_gib": 20,
+    "evict_datasets": true,
+    "paper_figures": true,
+    "validate_diva": true,
+    "required_workloads": [],
+    "required_figures": [
+      "filter_benchmark_overview",
+      "jpb_simulated_filtering"
+    ],
+    "microbenchmarks_only": true
+  },
+  "datasets": {}
+}

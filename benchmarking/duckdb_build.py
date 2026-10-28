@@ -250,10 +250,9 @@ def build_duckdb(
     extension_configs = [
         clone_dir / ".github" / "config" / "extensions" / "ducklake.cmake"
     ]
-    if "httpfs" in required_extensions:
-        extension_configs.append(
-            clone_dir / ".github" / "config" / "extensions" / "httpfs.cmake"
-        )
+    for name in ("httpfs", "aws", "json"):
+        if name in required_extensions:
+            extension_configs.append(clone_dir / ".github" / "config" / "extensions" / f"{name}.cmake")
     for extension_config in extension_configs:
         if not extension_config.exists():
             raise FileNotFoundError(f"extension config not found: {extension_config}")

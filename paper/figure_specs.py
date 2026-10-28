@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 VARIANT_ORDER = (
@@ -11,6 +11,18 @@ VARIANT_ORDER = (
     "prf with fallback",
     "rpt none",
     "rpt cascade",
+    "rpt prf",
+)
+
+COMPRESSED_VARIANT_ORDER = tuple(
+    label for label in VARIANT_ORDER if label != "prf uncompressed"
+)
+JOIN_PRUNING_VARIANT_ORDER = (
+    "no prefilter",
+    "sip",
+    "sip + min/max",
+    "rpt cascade",
+    "prf with fallback",
     "rpt prf",
 )
 
@@ -175,6 +187,11 @@ class FigureSpec:
     annotate_runtime_values: bool = False
     runtime_log_axis: bool = False
     rows_log_axis: bool = False
+    variant_order: tuple[str, ...] = VARIANT_ORDER
+    height_inches: float | None = None
+    rows_height_ratio: float | None = None
+    facet_dimensions: bool = False
+    legend_columns: int | None = None
 
 
 @dataclass(frozen=True)
@@ -204,16 +221,16 @@ PARAMETER_SWEEP_PANELS = (
         x_label="Rows per key",
         x_scale="log",
         log_base=2,
-        x_ticks=(1, 4, 16, 64, 128),
+        x_ticks=(1, 4, 16, 128),
     ),
     SweepPanelSpec(
         workload="jpb-sweep-selectivity",
         sweep_kind="selectivity",
         title="(c) Selectivity",
-        x_label="Dimension selectivity",
+        x_label="Selectivity",
         x_scale="log",
         log_base=10,
-        x_ticks=(0.0001, 0.001, 0.01, 0.1, 0.9),
+        x_ticks=(0.0001, 0.01, 0.9),
     ),
     SweepPanelSpec(
         workload="jpb-sweep-density",
@@ -222,7 +239,7 @@ PARAMETER_SWEEP_PANELS = (
         x_label="Key-domain size",
         x_scale="log",
         log_base=10,
-        x_ticks=(5_000_000, 30_000_000, 100_000_000, 1_000_000_000),
+        x_ticks=(5_000_000, 100_000_000, 1_000_000_000),
     ),
     SweepPanelSpec(
         workload="jpb-sweep-clusters",
@@ -231,7 +248,7 @@ PARAMETER_SWEEP_PANELS = (
         x_label="Clusters",
         x_scale="log",
         log_base=2,
-        x_ticks=(2, 16, 128, 1_024, 8_192, 65_536),
+        x_ticks=(2, 32, 1_024, 65_536),
     ),
     SweepPanelSpec(
         workload="jpb-sweep-row-groups",
@@ -257,6 +274,7 @@ JOIN_PRUNING_ORDERED = FigureSpec(
     probe_table="fact",
     runtime_log_axis=True,
     rows_log_axis=False,
+    variant_order=JOIN_PRUNING_VARIANT_ORDER,
 )
 
 INTRO_MOTIVATION = FigureSpec(
@@ -276,6 +294,9 @@ INTRO_MOTIVATION = FigureSpec(
     show_runtime_labels=True,
     runtime_log_axis=True,
     rows_log_axis=True,
+    variant_order=COMPRESSED_VARIANT_ORDER,
+    height_inches=2.6,
+    rows_height_ratio=0.55,
 )
 
 ROW_GROUP_RUNTIME_EXTERNAL = FigureSpec(
@@ -312,6 +333,7 @@ JOIN_PRUNING_UNIFORM = FigureSpec(
     probe_table="fact",
     runtime_log_axis=True,
     rows_log_axis=False,
+    variant_order=JOIN_PRUNING_VARIANT_ORDER,
 )
 
 JOIN_PRUNING_ORDERED_DUCKLAKE = FigureSpec(
@@ -422,6 +444,10 @@ STRING_JOIN = FigureSpec(
     annotate_runtime_values=True,
     runtime_log_axis=True,
     rows_log_axis=False,
+    variant_order=COMPRESSED_VARIANT_ORDER,
+    height_inches=3.5,
+    rows_height_ratio=0.55,
+    legend_columns=4,
 )
 
 END_TO_END_RUNTIME = FigureSpec(
@@ -452,3 +478,31 @@ FIGURES = (
     STRING_JOIN,
     END_TO_END_RUNTIME,
 )
+
+
+def figures_for_config(config) -> tuple[FigureSpec, ...]:
+    """Use the configured query catalog for generated JPB workloads."""
+    from benchmarking.workloads.cross_product import _resolve_sweep_cases, _case_query_types, _sweep_query_filename
+    workloads = {w.name: w for w in config.workloads}
+    result = []
+    for figure in FIGURES:
+        name = figure.workloads[0]
+        workload = workloads.get(name)
+        definition = getattr(workload, "experiment_definition", None)
+        if (len(figure.workloads) != 1 or not name.startswith('join-pruning-workload')
+                or definition is None or definition.sweep.kind != 'dimension_cardinality'):
+            result.append(figure)
+            continue
+        layout = 'uniform' if 'uniform' in figure.slug else 'ordered'
+        cases = _resolve_sweep_cases(definition, storage_kind=workload.storage_kind)
+        queries = tuple(_sweep_query_filename(case, query, layout) for case in cases
+                        for query in _case_query_types(definition, case) if layout in query.probe_layouts)
+        if not queries:
+            continue
+        changes = {"queries_by_workload": {name: queries},
+                   "facet_dimensions": workload.storage_kind == 'duckdb' and len(cases) > 2}
+        if workload.ducklake_data_source == 's3':
+            changes.update(metric='runtime_and_bytes_read', summary_key='ducklake_s3_bytes',
+                           variant_order=('no prefilter', 'sip', 'sip + min/max', 'prf with fallback'))
+        result.append(replace(figure, **changes))
+    return tuple(result)

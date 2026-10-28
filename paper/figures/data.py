@@ -26,6 +26,8 @@ class MetricRow:
     total_rows_scanned: int | None
     query_parameters: dict[str, object] | None = None
     filter_phases: JoinFilterMetrics = field(default_factory=JoinFilterMetrics)
+    fact_remote_bytes_read: float | None = None
+    remote_bytes_read: float | None = None
 
 
 @dataclass(frozen=True)
@@ -142,6 +144,9 @@ def load_metric_rows(experiment_root: Path, system_names: tuple[str, ...]) -> li
             if "query_parameters" in timing_columns
             else "NULL::VARCHAR AS query_parameters"
         )
+        remote_projection = ', '.join(
+            f"median({name}) AS {name}" if name in timing_columns else f"NULL::DOUBLE AS {name}"
+            for name in ('fact_remote_bytes_read', 'remote_bytes_read'))
         rows = con.execute(
             f"""
             WITH timing AS (
@@ -150,7 +155,7 @@ def load_metric_rows(experiment_root: Path, system_names: tuple[str, ...]) -> li
                     query_name,
                     variant_label,
                     median(elapsed_ns) / 1000000.0 AS median_ms,
-                    {query_parameters_projection}
+                    {query_parameters_projection}, {remote_projection}
                 FROM timing_runs
                 WHERE experiment_name = ?
                   AND system_name IN ({placeholders})
@@ -180,7 +185,7 @@ def load_metric_rows(experiment_root: Path, system_names: tuple[str, ...]) -> li
                 timing.query_parameters,
                 profiles.probe_rows_scanned,
                 profiles.total_rows_scanned,
-                profiles.profile_path
+                profiles.profile_path, timing.fact_remote_bytes_read, timing.remote_bytes_read
             FROM timing
             LEFT JOIN profiles
               ON profiles.workload_name = timing.workload_name
@@ -217,6 +222,8 @@ def load_metric_rows(experiment_root: Path, system_names: tuple[str, ...]) -> li
                 total_rows_scanned=row[6],
                 query_parameters=None if row[4] is None else json.loads(row[4]),
                 filter_phases=phases,
+                fact_remote_bytes_read=row[8],
+                remote_bytes_read=row[9],
             )
         )
     return result
@@ -618,6 +625,8 @@ def build_runtime_probe_table(
                 {
                     "variant_label": variant_label,
                     "median_ms": metric_row.median_ms,
+                    "fact_remote_bytes_read": metric_row.fact_remote_bytes_read,
+                    "remote_bytes_read": metric_row.remote_bytes_read,
                     **metric_row.filter_phases.to_dict(),
                     "logical_probe_rows": base_probe_rows,
                     "physical_rows_scanned": probe_rows_scanned,
@@ -649,6 +658,8 @@ def build_runtime_probe_table(
                 "workload_label": workload_label(workload_name),
                 "query_name": query_name,
                 "query_label": display_label(query_name),
+                "query_parameters": next((r.query_parameters for (q, _), r in metric_rows.items()
+                                           if q == query_name), None),
                 "series": series,
             }
         )
@@ -844,7 +855,8 @@ def summarize_benchmark_metrics(
             for metric in metric_values
         }
         relative_query_counts = {metric: 0 for metric in metric_values}
-        join_free_query_count = 0
+        join_free_query_names: list[str] = []
+        included_query_names: set[str] = set()
 
         for query_name in query_names:
             query_metrics = {
@@ -872,10 +884,21 @@ def summarize_benchmark_metrics(
                 query_has_join = query_has_join or plan_row.join_operator_count > 0
 
             if not query_has_join:
-                join_free_query_count += 1
+                join_free_query_names.append(query_name)
+                continue
+            # Use one query set for all variants, including a variant whose
+            # optimizer or runtime filters eliminate the join entirely.
+            included_query_names.add(query_name)
             for metric, values_by_variant in query_metrics.items():
                 for variant_label, value in values_by_variant.items():
                     metric_values[metric][variant_label].append(value)
+                if metric != "runtime_ms":
+                    # Keep zero-work queries in relative tuple metrics without
+                    # changing their contribution to the absolute totals.
+                    values_by_variant = {
+                        label: 1 if value == 0 else value
+                        for label, value in values_by_variant.items()
+                    }
                 values = list(values_by_variant.values())
                 if any(value <= 0 for value in values):
                     continue
@@ -889,7 +912,7 @@ def summarize_benchmark_metrics(
             phase_rows = [
                 row for row in rows
                 if row.workload_name == workload_name
-                and row.query_name in query_names
+                and row.query_name in included_query_names
                 and row.variant_label == variant_label
             ]
             phase_summary = {}
@@ -924,11 +947,12 @@ def summarize_benchmark_metrics(
             {
                 "workload_name": workload_name,
                 "benchmark_label": benchmark_label,
-                "query_count": len(query_names),
-                "join_free_query_count": join_free_query_count,
+                "query_count": len(included_query_names),
+                "join_free_query_count": len(join_free_query_names),
+                "join_free_query_names": join_free_query_names,
                 "relative_query_counts": relative_query_counts,
                 "relative_excluded_query_counts": {
-                    metric: len(query_names) - count
+                    metric: len(included_query_names) - count
                     for metric, count in relative_query_counts.items()
                 },
                 "variants": variants,

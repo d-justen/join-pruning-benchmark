@@ -50,7 +50,8 @@ def resolve_jpb_cases(config: ExperimentConfig) -> list[dict]:
                 if layout not in {"ordered", "uniform"}:
                     raise ValueError("unsupported JPB probe layout")
                 cases.append({"query": _sweep_query_filename(case, query, layout),
-                              "pattern": query.kind, "layout": layout,
+                              "pattern": (f"seasonal_{query.cluster_count}" if query.kind == "seasonal"
+                                          and query.cluster_count != 10 else query.kind), "layout": layout,
                               "dimension_cardinality": case.dimension_cardinality,
                               "probe_rows": case.fact_rows, "row_group_size": case.row_group_size,
                               "seed": case.seed, "build_keys": case.selected_distinct_keys,
@@ -63,10 +64,11 @@ def resolve_jpb_cases(config: ExperimentConfig) -> list[dict]:
 
 
 def resolve_binary(system) -> Path:
+    from benchmarking.benchmark_binary import select_benchmark_binary
     build_dir = system.build_dir or system.binary_path.parent
     for path in (build_dir / "tools/join_pruning_benchmark", build_dir / "join_pruning_benchmark"):
         if path.is_file() and os.access(path, os.X_OK):
-            return path.resolve()
+            return select_benchmark_binary(path)
     raise FileNotFoundError(f"missing join_pruning_benchmark in {build_dir}")
 
 
@@ -159,7 +161,8 @@ def load_jpb_manifest(root: Path, config: ExperimentConfig) -> dict:
     return manifest
 
 
-def run_jpb_microbenchmarks(config: ExperimentConfig, system, root: Path, *, reuse_completed: bool = False) -> Path:
+def run_jpb_microbenchmarks(config: ExperimentConfig, system, root: Path, *, reuse_completed: bool = False,
+                            checkpoint_cases: bool = False, checkpoint_callback=None) -> Path:
     spec = config.jpb_microbenchmarks
     cases = resolve_jpb_cases(config)
     directory = root / ARTIFACT_SUBDIR
@@ -171,8 +174,9 @@ def run_jpb_microbenchmarks(config: ExperimentConfig, system, root: Path, *, reu
                 "input_order": "build keys supplied sorted; probes ordered or synthetic uniform",
                 "outputs": {}}
     try:
+        from benchmarking.benchmark_binary import binary_backend
         binary = resolve_binary(system)
-        identity = {"path": str(binary), "sha256": sha256(binary)}
+        identity = {"path": str(binary), "sha256": sha256(binary), "diva_backend": binary_backend(binary)}
         manifest["binary"] = identity
         if reuse_completed and manifest_path.is_file():
             saved = json.loads(manifest_path.read_text())
@@ -196,7 +200,16 @@ def run_jpb_microbenchmarks(config: ExperimentConfig, system, root: Path, *, reu
             writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
             for i, case in enumerate(cases):
                 sql_path = inputs / f"{i}.sql"
-                sql_path.write_text(case["selected_sql"] + ";\n")
+                resource_policy = json.loads(os.environ.get("BENCH_PREPARATION_CONFIG", "{}"))
+                settings = []
+                # The simulation is deliberately single threaded. Its input SQL
+                # still obeys the suite's memory/spill budget; C++ vectors are
+                # bounded by the surrounding container's memory limit.
+                for setting in ("memory_limit", "temp_directory", "max_temp_directory_size"):
+                    if setting in resource_policy:
+                        value = str(resource_policy[setting]).replace("'", "''")
+                        settings.append(f"SET {setting}='{value}';")
+                sql_path.write_text("\n".join(settings + [case["selected_sql"] + ";"]) + "\n")
                 manifest["outputs"][f"input_{i}"] = {"path": str(sql_path.relative_to(directory)), "sha256": sha256(sql_path)}
                 writer.writerow([case[field] for field in ("query", "pattern", "layout", "dimension_cardinality",
                                  "probe_rows", "row_group_size", "seed", "build_keys")] + [f"inputs/{i}.sql"])
@@ -207,10 +220,23 @@ def run_jpb_microbenchmarks(config: ExperimentConfig, system, root: Path, *, reu
                      ("repetitions", "warmups", "order_seed", "construction_seed", "grafite_bpk", "diva_bpk", "max_fpr")]]
         manifest["command"] = command
         _write_manifest(manifest_path, manifest)
-        with (directory / "benchmark.log").open("w") as log:
-            log.write(json.dumps(command) + "\n")
-            log.flush()
-            subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True)
+        if checkpoint_cases:
+            from benchmarking.case_checkpoints import run_case, combine
+            chunks = []
+            for i, case in enumerate(cases):
+                chunk = directory / "checkpoints" / f"case-{i}.csv"
+                run_case([arg for arg in command if not arg.startswith("--output=")] + [f"--case-index={i}"],
+                         chunk, {"binary": identity, "config": manifest["config"], "cases": cases, "index": i},
+                         checkpoint_callback)
+                validate_results(chunk, spec, [case], names)
+                chunks.append(chunk)
+            combine(chunks, temporary)
+            manifest["checkpoint_protocol"] = "case-v1; original per-case filter order; fresh probes per process"
+        else:
+            with (directory / "benchmark.log").open("w") as log:
+                log.write(json.dumps(command) + "\n")
+                log.flush()
+                subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True)
         manifest["validation"] = validate_results(temporary, spec, cases, names)
         output = directory / "measurements.csv"
         temporary.replace(output)

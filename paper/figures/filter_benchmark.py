@@ -43,9 +43,9 @@ FILTER_LABELS = {
 
 FILTER_COLORS = {
     "bloom": "#2563eb",
-    "grafite": "#b91c1c",
+    "grafite": "#9ca3af",
     "diva": "#111827",
-    "prf_uncompressed": "#d97706",
+    "prf_uncompressed": "#06b6d4",
     "prf": "#0f766e",
 }
 
@@ -62,14 +62,15 @@ PAGE_SIZES = {
     "two-column": (7.0, 3.15),
 }
 
-FILTER_BENCHMARK_EXTRA_HEIGHT = 2.20
-FILTER_BENCHMARK_LABEL_FONT_SIZE = 7.5
+FILTER_BENCHMARK_EXTRA_HEIGHT = 1.15
 FILTER_BENCHMARK_TICK_FONT_SIZE = 6.5
+FILTER_BENCHMARK_LABEL_FONT_SIZE = FILTER_BENCHMARK_TICK_FONT_SIZE
 FILTER_BENCHMARK_LEGEND_FONT_SIZE = 6.5
 CACHE_REFERENCE_COLOR = "#6b7280"
 CACHE_REFERENCE_LABEL_FONT_SIZE = 6.3
+# Per-core cache capacities on the Graviton m9gd EC2 benchmark hosts.
 CACHE_REFERENCE_LINES = (
-    (49_152, "L1d · 48 KiB"),
+    (64 * 1_024, "L1d · 64 KiB"),
     (2 * 1_024 * 1_024, "L2 · 2 MiB"),
 )
 
@@ -103,30 +104,14 @@ def _display_label(filter_name: str) -> str:
     return FILTER_LABELS.get(filter_name, filter_name.replace("_", " "))
 
 
-def _row_major_legend_order(labels: list[str], ncol: int) -> list[str]:
-    if ncol <= 1 or len(labels) <= 1:
-        return labels
-    rows = (len(labels) + ncol - 1) // ncol
-    grid: list[list[str | None]] = []
-    index = 0
-    for _ in range(rows):
-        row: list[str | None] = []
-        for _ in range(ncol):
-            row.append(labels[index] if index < len(labels) else None)
-            index += 1
-        grid.append(row)
-
-    ordered: list[str] = []
-    for column in range(ncol):
-        for row in range(rows):
-            label = grid[row][column]
-            if label is not None:
-                ordered.append(label)
-    return ordered
-
-
 def _format_millions(value: float, _: object) -> str:
+    if value >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.3g}K"
     return f"{value / 1_000_000:.3g}"
+
+
+def _format_percent_tick(value: float, _: object) -> str:
+    return f"{value * 100:.1f}".removeprefix("0")
 
 
 def _format_percent(value: float) -> str:
@@ -346,10 +331,12 @@ def draw_filter_benchmark_plot(
 ) -> dict[str, object]:
     width, base_height = PAGE_SIZES["one-column"]
     panel_count = 5 if range_throughput_series is not None else 4
-    height = base_height + FILTER_BENCHMARK_EXTRA_HEIGHT + (1.05 if panel_count == 5 else 0)
+    height = base_height + FILTER_BENCHMARK_EXTRA_HEIGHT + (0.70 if panel_count == 5 else 0)
     fig, axes = plt.subplots(
         panel_count, 1, figsize=(width, height), sharex=True,
-        gridspec_kw={"hspace": 0.10}, constrained_layout=False,
+        # The summary-size panel needs room for six log ticks and cache labels.
+        gridspec_kw={"hspace": 0.14, "height_ratios": [1] * (panel_count - 3) + [1.25, 1, 1]},
+        constrained_layout=False,
     )
     throughput_ax = axes[0]
     size_ax, build_time_ax, false_positive_rate_ax = axes[-3:]
@@ -361,7 +348,7 @@ def draw_filter_benchmark_plot(
             points = range_throughput_series[name]
             range_ax.plot([point[0] for point in points], [point[1] for point in points],
                           color=FILTER_COLORS[name], linestyle=FILTER_LINESTYLES[name], linewidth=1.7)
-        range_ax.set_ylabel("Range throughput\n(M queries/s)", fontsize=FILTER_BENCHMARK_LABEL_FONT_SIZE)
+        range_ax.set_ylabel("Range probes\n(M/s)", fontsize=FILTER_BENCHMARK_LABEL_FONT_SIZE)
         range_ax.set_yscale("log")
         range_ax.yaxis.set_major_formatter(FuncFormatter(_format_millions))
         range_ax.yaxis.set_minor_formatter(NullFormatter())
@@ -427,7 +414,7 @@ def draw_filter_benchmark_plot(
         )
 
     throughput_ax.set_ylabel(
-        "Point throughput\n(M probes/s)",
+        "Point probes\n(M/s)",
         fontsize=FILTER_BENCHMARK_LABEL_FONT_SIZE,
     )
     throughput_ax.set_xscale("log")
@@ -474,7 +461,7 @@ def draw_filter_benchmark_plot(
     build_time_ax.set_ylim(build_time_ymin, build_time_ymax)
 
     false_positive_rate_ax.set_xlabel("Number of clusters", fontsize=FILTER_BENCHMARK_LABEL_FONT_SIZE)
-    false_positive_rate_ax.set_ylabel("False-positive\nrate", fontsize=FILTER_BENCHMARK_LABEL_FONT_SIZE)
+    false_positive_rate_ax.set_ylabel("False-positive\nrate (%)", fontsize=FILTER_BENCHMARK_LABEL_FONT_SIZE)
     false_positive_rate_ax.set_xscale("log", base=2)
     clusters = sorted({cluster for points in throughput_series.values() for cluster, _ in points})
     tick_step = max(1, math.ceil((len(clusters) - 1) / 4))
@@ -482,7 +469,7 @@ def draw_filter_benchmark_plot(
     false_positive_rate_ax.xaxis.set_major_locator(FixedLocator(ticks))
     false_positive_rate_ax.xaxis.set_major_formatter(FuncFormatter(_format_compact_bytes))
     false_positive_rate_ax.xaxis.set_minor_locator(NullLocator())
-    false_positive_rate_ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value * 100:.1f}%"))
+    false_positive_rate_ax.yaxis.set_major_formatter(FuncFormatter(_format_percent_tick))
     false_positive_rate_ax.set_ylim(0.0, false_positive_rate_ymax)
 
     for ax in axes:
@@ -494,28 +481,36 @@ def draw_filter_benchmark_plot(
         ax.spines["left"].set_color("#9ca3af")
         ax.spines["bottom"].set_color("#9ca3af")
 
-    legend_columns = 2
-    reordered_filters = _row_major_legend_order(plotted_filters, legend_columns)
-    handles, labels = throughput_ax.get_legend_handles_labels()
-    handle_by_label = {label: handle for handle, label in zip(handles, labels)}
-    reordered_labels = [_display_label(filter_name) for filter_name in reordered_filters]
-    reordered_handles = [handle_by_label[label] for label in reordered_labels]
-
-    fig.legend(
-        reordered_handles,
-        [label.replace("Prefix Range Filter (uncompressed)", "PRF (uncompressed)").replace(
-            "Grafite", "Grafite + exact EF" if grafite_exact_fallback else "Grafite") for label in reordered_labels],
-        loc="upper center",
-        bbox_to_anchor=(0.5, 0.98),
-        ncol=legend_columns,
-        frameon=False,
-        fontsize=FILTER_BENCHMARK_LEGEND_FONT_SIZE,
-        handlelength=2.0,
-        columnspacing=1.2,
-        alignment="left",
-    )
     fig.subplots_adjust(left=0.20, right=0.995, bottom=0.09, top=0.87)
     fig.align_ylabels(axes)
+    handles, _ = throughput_ax.get_legend_handles_labels()
+    handle_by_filter = dict(zip(plotted_filters, handles))
+    legend_rows = (("bloom", "grafite", "diva"), ("prf", "prf_uncompressed"))
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    gap = renderer.points_to_pixels(1.5) / throughput_ax.bbox.height
+    anchor_y = 1 + renderer.points_to_pixels(3) / throughput_ax.bbox.height
+    for row in reversed(legend_rows):
+        filters = [name for name in row if name in handle_by_filter]
+        if not filters:
+            continue
+        legend = fig.legend(
+            [handle_by_filter[name] for name in filters],
+            [_display_label(name).replace("Prefix Range Filter (uncompressed)", "PRF (uncompressed)")
+             for name in filters],
+            loc="lower center",
+            bbox_to_anchor=(0.5, anchor_y),
+            bbox_transform=throughput_ax.transAxes,
+            borderaxespad=0,
+            borderpad=0,
+            ncol=len(filters),
+            frameon=False,
+            fontsize=FILTER_BENCHMARK_LEGEND_FONT_SIZE,
+            # Show a full dash-dot cycle at the plotted line width.
+            handlelength=3.0,
+            columnspacing=1.2,
+        )
+        anchor_y += legend.get_window_extent(renderer).height / throughput_ax.bbox.height + gap
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, format="pdf", bbox_inches="tight", pad_inches=0.03)

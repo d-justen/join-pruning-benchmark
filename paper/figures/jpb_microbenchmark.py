@@ -23,6 +23,12 @@ from paper.figures.filter_benchmark import FILTER_COLORS
 FILTER_ORDER = ("grafite", "diva", "prf_uncompressed", "prf")
 FILTER_CODES = {"grafite": "G", "diva": "D", "prf_uncompressed": "U", "prf": "P"}
 PATTERNS = ("range", "shoulder", "seasonal", "scattered")
+
+
+def pattern_order(pattern: str) -> tuple[int, int]:
+    if pattern.startswith("seasonal_"):
+        return (2, int(pattern.split("_")[1]))
+    return (PATTERNS.index(pattern), 10 if pattern == "seasonal" else 0)
 PHASES = (("build", "Build", "#4c78a8"), ("range", "Range probes", "#e6a23c"),
           ("point", "Point probes", "#38978a"))
 CAPTION = ("Mean total simulated filtering time, including construction/finalization, row-group range probes, "
@@ -75,7 +81,7 @@ def aggregate_rows(rows: list[dict[str, str]]) -> list[dict]:
                 item[field] = ";".join(sorted({row[field] for row in samples}))
         series.append(item)
     return sorted(series, key=lambda row: (row["dimension_cardinality"], row["layout"],
-                                          PATTERNS.index(row["pattern"]), FILTER_ORDER.index(row["filter"])))
+                                          pattern_order(row["pattern"]), FILTER_ORDER.index(row["filter"])))
 
 
 def build_jpb_artifacts(csv_path: Path, output_dir: Path, figures_dir: Path,
@@ -100,10 +106,11 @@ def render_jpb_series(series: list[dict], output_dir: Path, figures_dir: Path,
     layouts = [layout for layout in ("ordered", "uniform") if any(row["layout"] == layout for row in series)]
     filters = [name for name in FILTER_ORDER if any(row["filter"] == name for row in series)]
     lookup = {(row["dimension_cardinality"], row["layout"], row["pattern"], row["filter"]): row for row in series}
-    height = 1.7 * len(layouts) + 0.65
+    height = 1.7 * len(layouts) + (1.0 if len(dimensions) == 1 else 0.65)
     fig, axes = plt.subplots(len(layouts), len(dimensions), squeeze=False, sharey=True,
-                             figsize=(max(3.8, 3.65 * len(dimensions)), height))
-    fig.subplots_adjust(left=0.095, right=0.99, top=1 - 0.5 / height, bottom=0.48 / height,
+                             figsize=(max(5.6, 3.65 * len(dimensions)), height))
+    fig.subplots_adjust(left=0.14 if len(dimensions) == 1 else 0.095,
+                        right=0.99, top=1 - 0.5 / height, bottom=0.48 / height,
                         hspace=0.62, wspace=0.13)
     low = min(row["total_ms"] for row in series) * 0.45 if y_scale == "log" else 0
     high = max(row["total_ms"] + row["total_stddev_ms"] for row in series) * (1.6 if y_scale == "log" else 1.1)
@@ -111,7 +118,9 @@ def render_jpb_series(series: list[dict], output_dir: Path, figures_dir: Path,
     for li, layout in enumerate(layouts):
         for di, dimension in enumerate(dimensions):
             ax = axes[li, di]
-            patterns = [pattern for pattern in PATTERNS if (dimension, layout, pattern, filters[0]) in lookup]
+            patterns = sorted({row["pattern"] for row in series
+                               if row["dimension_cardinality"] == dimension and row["layout"] == layout},
+                              key=pattern_order)
             for pi, pattern in enumerate(patterns):
                 for fi, name in enumerate(filters):
                     row = lookup[(dimension, layout, pattern, name)]
@@ -124,7 +133,7 @@ def render_jpb_series(series: list[dict], output_dir: Path, figures_dir: Path,
                         ax.errorbar(x, total, yerr=[[lower_error], [sd]], color="#202020", fmt="none",
                                     linewidth=0.6, capsize=1.5, zorder=4)
                     bar_count += 1
-            ax.set_xticks(range(len(patterns)), [p.capitalize() for p in patterns], fontsize=7)
+            ax.set_xticks(range(len(patterns)), [p.capitalize().replace("_", "\n") for p in patterns], fontsize=7)
             ax.tick_params(axis="x", length=0, pad=4)
             ax.tick_params(axis="y", labelsize=7)
             ax.set_yscale(y_scale)
@@ -138,7 +147,7 @@ def render_jpb_series(series: list[dict], output_dir: Path, figures_dir: Path,
             ax.set_title(f"{layout.capitalize()} probes · {dimension:,} dimension keys", fontsize=8, pad=7)
             if not patterns:
                 ax.text(0.5, 0.5, "No configured cases", transform=ax.transAxes, ha="center", fontsize=8)
-    fig.supylabel("Total simulated filtering time (ms)", fontsize=9, x=0.015)
+    fig.supylabel("Total simulated filtering time\n(ms)", fontsize=7, x=0.015)
     exact_fallback = any("exact_elias_fano" in row.get("adapter_representation", "") for row in series)
     labels = {"grafite": "Grafite (+ exact EF)" if exact_fallback else "Grafite", "diva": "Diva", "prf_uncompressed": "PRF uncompressed", "prf": "PRF compressed"}
     fig.legend(handles=[Patch(facecolor=FILTER_COLORS[name], label=labels[name]) for name in filters],

@@ -8,6 +8,8 @@ from pathlib import Path
 
 import duckdb
 
+from benchmarking.resources import connect
+
 from benchmarking.experiment_config import ExternalWorkloadConfig
 from benchmarking.manifests import (
     DUCKLAKE_HTTP_BASE_URL_PLACEHOLDER,
@@ -68,7 +70,7 @@ def _discover_default_source_db_path(external_dir: Path) -> Path | None:
 
 
 def list_base_tables(source_db_path: Path) -> list[str]:
-    con = duckdb.connect(str(source_db_path))
+    con = connect(str(source_db_path))
     try:
         return [
             row[0]
@@ -185,7 +187,7 @@ def initialize_external_db(
     if db_path.exists():
         db_path.unlink()
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    con = duckdb.connect(str(db_path))
+    con = connect(str(db_path))
     try:
         for sql_path in init_sql_paths:
             script = sql_path.read_text(encoding="utf-8")
@@ -234,13 +236,15 @@ def export_parquet_catalog(
     file_size_mb: int = DEFAULT_REMOTE_PARQUET_FILE_SIZE_MB,
     exclude_empty_files: bool = False,
     export_threads: int | None = None,
+    row_groups_per_file: int | None = None,
+    row_group_size: int = 122_880,
 ) -> Path:
     parquet_root = artifact_dir / root_dir_name
     if parquet_root.exists():
         shutil.rmtree(parquet_root)
     parquet_root.mkdir(parents=True, exist_ok=True)
 
-    con = duckdb.connect(str(source_db_path))
+    con = connect(str(source_db_path))
     try:
         if export_threads is not None:
             if export_threads <= 0:
@@ -263,13 +267,13 @@ def export_parquet_catalog(
         catalog: dict[str, list[str]] = {}
         for table_name in tables:
             table_dir = parquet_root / table_name
+            layout = (f"ROW_GROUP_SIZE {row_group_size}, ROW_GROUPS_PER_FILE {row_groups_per_file}"
+                      if row_groups_per_file is not None else f"FILE_SIZE_BYTES '{file_size_mb}MB'")
             con.execute(
                 f"""
                 COPY {_quote_identifier(table_name)}
                 TO ?
-                (FORMAT parquet, COMPRESSION {DEFAULT_REMOTE_PARQUET_COMPRESSION}, FILE_SIZE_BYTES '{
-                    file_size_mb
-                }MB')
+                (FORMAT parquet, COMPRESSION {DEFAULT_REMOTE_PARQUET_COMPRESSION}, {layout})
                 """,
                 [str(table_dir)],
             )
@@ -306,7 +310,7 @@ def export_parquet_catalog(
 
 
 def read_table_schemas(db_path: Path) -> dict[str, list[tuple[str, str]]]:
-    con = duckdb.connect(str(db_path), read_only=True)
+    con = connect(str(db_path), read_only=True)
     try:
         tables = [
             row[0]

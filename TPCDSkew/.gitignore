@@ -1,0 +1,22 @@
+# Vendor source, generator inputs, and upstream notices only.
+*
+!.gitignore
+!.dockerignore
+!CMakeLists.txt
+!Dockerfile
+!TPCDSkew/
+TPCDSkew/*
+!TPCDSkew/*.c
+!TPCDSkew/*.h
+!TPCDSkew/dists.dss
+!TPCDSkew/dss.ddl
+!TPCDSkew/dss.ri
+!TPCDSkew/makefile
+!TPCDSkew/makefile.suite
+!TPCDSkew/Readme
+!TPCDSkew/Readme1
+!TPCDSkew/README-SKEW.doc
+!TPCDSkew/History
+!TPCDSkew/Bugs
+!TPCDSkew/Porting.Notes
+!TPCDSkew/TPC END USER LICENSE AGREEMENT.docx

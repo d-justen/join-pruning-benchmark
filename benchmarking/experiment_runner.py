@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import shutil
+from contextlib import ExitStack
+from dataclasses import replace
 from pathlib import Path
 
 from benchmarking.artifact_layout import ExperimentPaths, prepare_experiment_root
@@ -16,6 +18,7 @@ from benchmarking.duckdb_runner import (
 )
 from benchmarking.experiment_config import ExperimentConfig
 from benchmarking.manifests import PreparedWorkload, load_manifest
+from benchmarking.s3_data import data_scope
 from benchmarking.microbenchmarks import run_microbenchmarks
 from benchmarking.jpb_microbenchmarks import run_jpb_microbenchmarks
 from benchmarking.workloads import (
@@ -156,6 +159,8 @@ def run_experiment_with_options(
             for workload in selected
         ):
             required_extensions.add("httpfs")
+        if any(getattr(workload, "ducklake_data_source", "local") == "s3" for workload in selected):
+            required_extensions.update(("httpfs", "aws", "json"))
         resolved_systems.append(
             resolve_system(
                 system_config,
@@ -178,7 +183,10 @@ def run_experiment_with_options(
         resume_preparation=resume_preparation,
     )
     remote_services = {}
+    staging = ExitStack()
     try:
+        workloads = [replace(workload, ducklake_s3_url=staging.enter_context(data_scope(workload, paths.root)))
+                     if workload.ducklake_data_source == "s3" else workload for workload in workloads]
         for workload in workloads:
             remote_services[workload.name] = start_remote_http_service(workload)
         for workload in workloads:
@@ -208,8 +216,11 @@ def run_experiment_with_options(
                     remote_services[workload.name],
                 )
     finally:
-        for remote_service in remote_services.values():
-            stop_remote_http_service(remote_service)
+        try:
+            for remote_service in remote_services.values():
+                stop_remote_http_service(remote_service)
+        finally:
+            staging.close()
     summary = summarize_results(paths.results_db, config.experiment_name)
     write_summary(paths.summary_json, summary)
     return paths

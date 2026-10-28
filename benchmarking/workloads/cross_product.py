@@ -6,6 +6,8 @@ from pathlib import Path
 
 import duckdb
 
+from benchmarking.resources import connect
+
 from benchmarking.experiment_config import (
     CrossProductExperimentDefinition,
     CrossProductQueryTypeConfig,
@@ -14,6 +16,7 @@ from benchmarking.experiment_config import (
 )
 from benchmarking.manifests import (
     DUCKLAKE_HTTP_BASE_URL_PLACEHOLDER,
+    DUCKLAKE_S3_BASE_URL_PLACEHOLDER,
     PreparedWorkload,
     utc_now_iso,
     write_manifest,
@@ -63,6 +66,14 @@ def build_dummy_column_expr(index: int, string_len: int, seed: int) -> str:
         f"substr(md5({sql_literal(salt)} || CAST(d_key AS VARCHAR) || "
         f"{sql_literal(f':seed:{seed}')}), 1, {string_len}) AS dummy_s{index}"
     )
+
+
+def fact_payload_expression(index: int, length: int, seed: int) -> str:
+    # Independent per row and column, including rows with the same foreign key.
+    # Base64 uses more of each character's entropy than a hexadecimal digest.
+    blocks = [f"to_base64(unhex(sha256('fact:{seed}:{index}:{block}:' || CAST(i AS VARCHAR))))"
+              for block in range((length + 42) // 43)]
+    return f"substr({' || '.join(blocks)}, 1, {length}) AS payload_s{index}"
 
 
 CROSS_PRODUCT_PARAMETER_DESCRIPTIONS = {
@@ -1051,7 +1062,17 @@ def _create_shared_sweep_fact_table(
                         raise ValueError(f"shared fact column {column_name} resolves to different expressions")
     select_list = ",\n            ".join(
         ["i AS fact_id"] + list(columns.values()) + ["i * 17 AS measure"]
+        + [fact_payload_expression(i, definition.fixed.fact_payload_len, definition.fixed.seed)
+           for i in range(1, definition.fixed.fact_payload_cols + 1)]
     )
+    if definition.fixed.fact_payload_cols:
+        # Bound each insertion; avoid materializing a 500M-row string projection.
+        con.execute("SET preserve_insertion_order=true")
+        con.execute(f"CREATE TABLE fact AS SELECT {select_list} FROM range(1, 1) t(i)")
+        for start in range(1, definition.fixed.fact_rows + 1, 983_040):
+            stop = min(start + 983_040, definition.fixed.fact_rows + 1)
+            con.execute(f"INSERT INTO fact SELECT {select_list} FROM range({start}, {stop}) t(i)")
+        return
     con.execute(
         f"""
         CREATE TABLE fact AS
@@ -1070,7 +1091,7 @@ def _create_row_group_fact_database(
     if db_path.exists():
         db_path.unlink()
     alias = f"fact_{case.case_id}"
-    coordinator = duckdb.connect()
+    coordinator = connect()
     try:
         seed_value = ((case.seed % 10_000_000) + 0.5) / 10_000_001
         coordinator.execute(f"SELECT setseed({seed_value})")
@@ -1260,7 +1281,7 @@ def _write_database(spec: CrossProductWorkloadConfig, db_path: Path, queries_dir
         db_path.unlink()
     db_path.parent.mkdir(parents=True, exist_ok=True)
     queries_dir.mkdir(parents=True, exist_ok=True)
-    con = duckdb.connect(str(db_path))
+    con = connect(str(db_path))
     try:
         seed_value = ((spec.seed % 10_000_000) + 0.5) / 10_000_001
         con.execute(f"SELECT setseed({seed_value})")
@@ -1367,6 +1388,10 @@ def _render_sweep_query(
         for join_index in range(1, case.join_count + 1)
         for column_index in range(1, definition.fixed.dummy_string_cols + 1)
     ]
+    if definition.fixed.projected_fact_payload_cols:
+        columns = ", ".join(f"f.payload_s{i}" for i in range(1, definition.fixed.projected_fact_payload_cols + 1))
+        payload_exprs += ["    COUNT(*) AS row_count",
+                          f"    SUM(hash({columns})::HUGEINT) AS payload_checksum"]
     select_clause = ",\n".join(payload_exprs) if payload_exprs else "    COUNT(*) AS row_count"
     joins: list[str] = []
     predicates: list[str] = []
@@ -1419,7 +1444,7 @@ def _write_sweep_workload(
                 connection_options[name] = value
         if preparation.temp_directory is not None:
             connection_options["temp_directory"] = str((artifact_dir / preparation.temp_directory).resolve())
-    con = duckdb.connect(str(db_path), config=connection_options)
+    con = connect(str(db_path), config=connection_options)
     dimensions: dict[str, list[dict]] = {}
     try:
         seed_value = ((definition.fixed.seed % 10_000_000) + 0.5) / 10_000_001
@@ -1506,6 +1531,9 @@ def _write_sweep_workload(
                 )
                 expected_selectivity = case.probe_selectivity ** case.join_count
                 query_catalog[filename] = {
+                    "fact_payload_cols": definition.fixed.fact_payload_cols,
+                    "fact_payload_len": definition.fixed.fact_payload_len,
+                    "projected_fact_payload_cols": definition.fixed.projected_fact_payload_cols,
                     "case_id": case.case_id,
                     "sweep_kind": case.sweep_kind,
                     "sweep_value": case.sweep_value,
@@ -1601,7 +1629,7 @@ def _write_sweep_workload(
 
 
 def _read_table_schemas(db_path: Path) -> dict[str, list[tuple[str, str]]]:
-    con = duckdb.connect(str(db_path), read_only=True)
+    con = connect(str(db_path), read_only=True)
     try:
         tables = [
             row[0]
@@ -1633,6 +1661,7 @@ def _write_ducklake_sql(
     table_schemas: dict[str, list[tuple[str, str]]],
     *,
     use_http_data: bool,
+    use_s3_data: bool = False,
 ) -> tuple[Path, Path, Path, Path, Path, str]:
     catalog_alias = "ducklake"
     metadata_path = (artifact_dir / "ducklake_metadata.duckdb").resolve()
@@ -1644,10 +1673,11 @@ def _write_ducklake_sql(
 
     catalog = json.loads(parquet_catalog_path.read_text(encoding="utf-8"))
     parquet_root = parquet_catalog_path.parent / "parquet"
+    catalog_data_path = DUCKLAKE_S3_BASE_URL_PLACEHOLDER + "/managed/" if use_s3_data else str(data_path)
     attach_sql = (
         f"ATTACH {sql_literal('ducklake:' + str(metadata_path))} "
         f"AS {quote_identifier(catalog_alias)} "
-        f"(DATA_PATH {sql_literal(str(data_path))}, DATA_INLINING_ROW_LIMIT 0);"
+        f"(DATA_PATH {sql_literal(catalog_data_path)}, DATA_INLINING_ROW_LIMIT 0, METADATA_CATALOG 'jpb_meta');"
     )
     bootstrap_statements = [
         "-- Generated by run_benchmarks.py",
@@ -1657,7 +1687,7 @@ def _write_ducklake_sql(
                 "SET enable_external_file_cache=false;",
                 "SET enable_http_metadata_cache=false;",
             ]
-            if use_http_data
+            if use_http_data or use_s3_data
             else []
         ),
         "LOAD ducklake;",
@@ -1671,7 +1701,7 @@ def _write_ducklake_sql(
                 "SET enable_external_file_cache=false;",
                 "SET enable_http_metadata_cache=false;",
             ]
-            if use_http_data
+            if use_http_data or use_s3_data
             else []
         ),
         "LOAD ducklake;",
@@ -1690,6 +1720,8 @@ def _write_ducklake_sql(
         )
         data_files = [
             (
+                f"{DUCKLAKE_S3_BASE_URL_PLACEHOLDER}/{relative_path}"
+                if use_s3_data else
                 f"{DUCKLAKE_HTTP_BASE_URL_PLACEHOLDER}/{relative_path}"
                 if use_http_data
                 else str((parquet_root / relative_path).resolve())
@@ -1763,7 +1795,16 @@ def prepare_cross_product_workload(
             catalog_filename="parquet_catalog.json",
             file_size_mb=spec.parquet_file_size_mb,
             exclude_empty_files=True,
+            export_threads=1 if spec.parquet_row_groups_per_file else None,
+            row_groups_per_file=spec.parquet_row_groups_per_file,
+            row_group_size=spec.parquet_row_group_size,
         )
+        if spec.ducklake_data_source == "s3" or spec.parquet_row_groups_per_file is not None:
+            from benchmarking.ducklake_validation import parquet_evidence
+            definition = spec.experiment_definition
+            ordered = definition is not None and all(
+                q.probe_layouts == ("ordered",) for q in definition.query_types)
+            parquet_evidence(parquet_catalog_path, ordered=ordered)
         (
             runtime_db_path,
             ducklake_bootstrap_sql_path,
@@ -1776,6 +1817,7 @@ def prepare_cross_product_workload(
             parquet_catalog_path,
             table_schemas,
             use_http_data=spec.ducklake_http_latency_ms is not None,
+            use_s3_data=spec.ducklake_data_source == "s3",
         )
         setup_sql_paths = (setup_sql_path,)
         staging_db_path = (artifact_dir / "benchmark.duckdb").resolve()
@@ -1788,6 +1830,9 @@ def prepare_cross_product_workload(
             "parquet_file_size_mb": spec.parquet_file_size_mb,
             "parquet_catalog_path": str(parquet_catalog_path),
             "http_latency_ms": spec.ducklake_http_latency_ms,
+            "data_source": spec.ducklake_data_source,
+            "parquet_row_group_size": spec.parquet_row_group_size,
+            "parquet_row_groups_per_file": spec.parquet_row_groups_per_file,
         }
         metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     elif spec.remote_http_parquet_latency_ms is not None:
@@ -1816,6 +1861,7 @@ def prepare_cross_product_workload(
         ducklake_data_path=ducklake_data_path,
         ducklake_catalog_alias=ducklake_catalog_alias,
         ducklake_http_latency_ms=spec.ducklake_http_latency_ms,
+        ducklake_data_source=spec.ducklake_data_source,
         definition_path=definition_path,
         cases_path=cases_path,
         query_catalog_path=query_catalog_path,

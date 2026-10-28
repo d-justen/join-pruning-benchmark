@@ -1,0 +1,159 @@
+diff --git a/src/include/http_state.hpp b/src/include/http_state.hpp
+--- a/src/include/http_state.hpp
++++ b/src/include/http_state.hpp
+@@ -68,8 +68,33 @@
+ 	shared_ptr<CachedFile> file;
+ };
+ 
++struct HTTPTransferStats {
++	idx_t bytes = 0;
++	idx_t requests = 0;
++};
++
+ class HTTPState : public ClientContextState {
+ public:
++	// Explicitly scoped counters survive QueryEnd so the following SQL statement can read them.
++	void ResetTransfers() {
++		lock_guard<mutex> guard(transfer_mutex);
++		transfers.clear();
++		track_transfers = true;
++	}
++	void RecordTransfer(const string &url, idx_t bytes, idx_t requests) {
++		if (!track_transfers) {
++			return;
++		}
++		lock_guard<mutex> guard(transfer_mutex);
++		// Never retain signed query parameters or credentials in result artifacts.
++		auto &entry = transfers[url.substr(0, url.find('?'))];
++		entry.bytes += bytes;
++		entry.requests += requests;
++	}
++	unordered_map<string, HTTPTransferStats> SnapshotTransfers() {
++		lock_guard<mutex> guard(transfer_mutex);
++		return transfers;
++	}
+ 	//! Reset all counters and cached files
+ 	void Reset();
+ 	//! Get cache entry, create if not exists
+@@ -98,6 +123,9 @@
+ 	void WriteProfilingInformation(std::ostream &ss) override;
+ 
+ private:
++	atomic<bool> track_transfers {false};
++	mutex transfer_mutex;
++	unordered_map<string, HTTPTransferStats> transfers;
+ 	//! Mutex to lock when getting the cached file(Parallel Only)
+ 	mutex cached_files_mutex;
+ 	//! In case of fully downloading the file, the cached files of this query
+diff --git a/src/httpfs_extension.cpp b/src/httpfs_extension.cpp
+--- a/src/httpfs_extension.cpp
++++ b/src/httpfs_extension.cpp
+@@ -1,6 +1,10 @@
+ #include "httpfs_extension.hpp"
+ 
+ #include "httpfs_client.hpp"
++#include "http_state.hpp"
++#include "duckdb/execution/expression_executor_state.hpp"
++#include "duckdb/function/table_function.hpp"
++#include "duckdb/function/scalar_function.hpp"
+ #include "create_secret_functions.hpp"
+ #include "duckdb.hpp"
+ #include "s3fs.hpp"
+@@ -17,7 +21,50 @@
+ 
+ namespace duckdb {
+ 
++
++static void ResetHTTPTransfers(DataChunk &input, ExpressionState &state, Vector &result) {
++	HTTPState::TryGetState(state.GetContext())->ResetTransfers();
++	result.Reference(Value::BOOLEAN(true), count_t(input.size()));
++}
++
++struct HTTPTransfersState : public GlobalTableFunctionState {
++	vector<pair<string, HTTPTransferStats>> entries;
++	idx_t offset = 0;
++};
++
++static unique_ptr<FunctionData> BindHTTPTransfers(ClientContext &, TableFunctionBindInput &,
++                                                 vector<LogicalType> &types, vector<string> &names) {
++	types = {LogicalType::VARCHAR, LogicalType::UBIGINT, LogicalType::UBIGINT};
++	names = {"url", "bytes_received", "get_requests"};
++	return nullptr;
++}
++
++static unique_ptr<GlobalTableFunctionState> InitHTTPTransfers(ClientContext &context, TableFunctionInitInput &) {
++	auto result = make_uniq<HTTPTransfersState>();
++	for (auto &entry : HTTPState::TryGetState(context)->SnapshotTransfers()) {
++		result->entries.emplace_back(entry.first, entry.second);
++	}
++	return std::move(result);
++}
++
++static void ScanHTTPTransfers(ClientContext &, TableFunctionInput &input, DataChunk &output) {
++	auto &state = input.global_state->Cast<HTTPTransfersState>();
++	idx_t count = 0;
++	while (state.offset < state.entries.size() && count < STANDARD_VECTOR_SIZE) {
++		auto &entry = state.entries[state.offset++];
++		output.data[0].Append(Value(entry.first));
++		output.data[1].Append(Value::UBIGINT(entry.second.bytes));
++		output.data[2].Append(Value::UBIGINT(entry.second.requests));
++		count++;
++	}
++	output.SetCardinality(count);
++}
++
+ static void LoadInternal(ExtensionLoader &loader) {
++	auto reset = ScalarFunction("httpfs_reset_transfer_stats", {}, LogicalType::BOOLEAN, ResetHTTPTransfers);
++	reset.SetStability(FunctionStability::VOLATILE);
++	loader.RegisterFunction(reset);
++	loader.RegisterFunction(TableFunction("httpfs_transfer_stats", {}, ScanHTTPTransfers, BindHTTPTransfers, InitHTTPTransfers));
+ 	auto &instance = loader.GetDatabaseInstance();
+ 	auto &fs = instance.GetFileSystem();
+ 
+diff --git a/src/httpfs_curl_client.cpp b/src/httpfs_curl_client.cpp
+--- a/src/httpfs_curl_client.cpp
++++ b/src/httpfs_curl_client.cpp
+@@ -222,6 +222,7 @@
+ 		ResetRequestInfo();
+ 		if (state) {
+ 			state->get_count++;
++			state->RecordTransfer(info.url, 0, 1);
+ 		}
+ 
+ 		auto curl_headers = TransformHeadersCurl(info.headers, info.params);
+@@ -258,6 +259,7 @@
+ 
+ 		if (state) {
+ 			state->total_bytes_received += bytes_received;
++			state->RecordTransfer(info.url, bytes_received, 0);
+ 		}
+ 
+ 		if (info.response_handler) {
+diff --git a/src/httpfs_httplib_client.cpp b/src/httpfs_httplib_client.cpp
+--- a/src/httpfs_httplib_client.cpp
++++ b/src/httpfs_httplib_client.cpp
+@@ -42,10 +42,15 @@
+ 	unique_ptr<HTTPResponse> Get(GetRequestInfo &info) override {
+ 		if (state) {
+ 			state->get_count++;
++			state->RecordTransfer(info.url, 0, 1);
+ 		}
+ 		auto headers = TransformHeaders(info.headers, info.params);
+ 		if (!info.response_handler && !info.content_handler) {
+-			return TransformResult(client->Get(info.path, headers));
++			auto response = client->Get(info.path, headers);
++			if (state && response) {
++				state->RecordTransfer(info.url, response->body.size(), 0);
++			}
++			return TransformResult(std::move(response));
+ 		} else {
+ 			return TransformResult(client->Get(
+ 			    info.path.c_str(), headers,
+@@ -56,6 +61,7 @@
+ 			    [&](const char *data, size_t data_length) {
+ 				    if (state) {
+ 					    state->total_bytes_received += data_length;
++					    state->RecordTransfer(info.url, data_length, 0);
+ 				    }
+ 				    return info.content_handler(const_data_ptr_cast(data), data_length);
+ 			    }));

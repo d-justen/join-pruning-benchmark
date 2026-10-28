@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""Host launcher; only Python's standard library and Docker are needed."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import tarfile
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+from benchmarking.suite_plan import load_plan
+
+ROOT = Path(__file__).resolve().parent
+SSB_COMMIT = "361661aebb4ab21fc6742805e42791a0012a13db"
+
+
+def call(args, **kwargs):
+    return subprocess.run(args, cwd=ROOT, check=True, **kwargs)
+
+
+def capture(args):
+    return call(args, text=True, capture_output=True).stdout.strip()
+
+
+def source_metadata(path: Path) -> dict:
+    names = subprocess.check_output(
+        ["git", "-C", str(path), "ls-files", "-z", "--cached", "--others", "--exclude-standard"]
+    ).decode().split("\0")
+    hashes = {}
+    for name in sorted(set(names)):
+        file = path / name
+        if file.is_file() and file.suffix in (".c", ".cpp", ".h", ".hpp", ".cmake", ".py", ".txt", ".dss", ".ddl"):
+            with file.open("rb") as stream:
+                hashes[name] = hashlib.file_digest(stream, "sha256").hexdigest()
+    return {"commit": subprocess.check_output(["git", "-C", str(path), "rev-parse", "HEAD"]).decode().strip(),
+            "dirty": bool(subprocess.check_output(["git", "-C", str(path), "status", "--porcelain", "--untracked-files=no"])),
+            "source_files_sha256": hashes}
+
+
+def build(args) -> None:
+    context = ROOT / "out/sources" / ("ssb-" + SSB_COMMIT)
+    context.mkdir(parents=True, exist_ok=True)
+    archive = context.parent / ("ssb-" + SSB_COMMIT + ".tar")
+    source = args.ssb_source
+    if source is None and (ROOT.parent / "ssb-dbgen/.git").exists():
+        source = ROOT.parent / "ssb-dbgen"
+    if source is not None:
+        # Archive exactly the pin, excluding build products and working-tree edits.
+        call(["git", "-C", str(source.resolve()), "archive", "--format=tar",
+              "--output", str(archive), SSB_COMMIT])
+        with tarfile.open(archive) as tar:
+            tar.extractall(context, filter="data")
+    else:
+        checkout = context.parent / "ssb-checkout"
+        if not (checkout / ".git").exists():
+            call(["git", "clone", "https://github.com/eyalroz/ssb-dbgen.git", str(checkout)])
+        call(["git", "-C", str(checkout), "archive", "--format=tar", "--output", str(archive), SSB_COMMIT])
+        with tarfile.open(archive) as tar:
+            tar.extractall(context, filter="data")
+    provenance = {"ssb_commit": SSB_COMMIT, "ssb_archive_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+                  "target": args.target, "platform": args.platform, "build_jobs": args.jobs,
+                  "built_at": datetime.now(timezone.utc).isoformat(),
+                  "duckdb": source_metadata(ROOT / "duckdb"),
+                  "rpt": source_metadata(ROOT / "dynamic-predicate-transfer"),
+                  "build_inputs_sha256": {
+                      str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
+                      for p in [ROOT / "requirements.txt", ROOT / ".dockerignore", ROOT / "docker/Dockerfile",
+                                ROOT / "docker/datasets.lock.json", ROOT / "TPCDSkew/CMakeLists.txt",
+                                *sorted((ROOT / "TPCDSkew/TPCDSkew").glob("*.c")),
+                                *sorted((ROOT / "TPCDSkew/TPCDSkew").glob("*.h")),
+                                ROOT / "TPCDSkew/TPCDSkew/dists.dss"]}}
+    (ROOT / "docker/provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
+    call(["docker", "buildx", "build", "--load", "--platform", args.platform,
+          "--target", args.target, "--build-arg", f"BUILD_JOBS={args.jobs}",
+          "--build-context", f"ssb={context}", "--file", "docker/Dockerfile", "--tag", args.image, "."])
+
+
+def local(args) -> None:
+    config = args.config.resolve()
+    raw = load_plan(config)
+    if "groups" in raw:
+        # Bind one resolved document; referenced files need not exist on EC2 or
+        # at the container's /input mount, and are frozen into resume metadata.
+        encoded = json.dumps(raw, indent=2, sort_keys=True)
+        config = ROOT / "out/launch-configs" / (hashlib.sha256(encoded.encode()).hexdigest() + ".json")
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(encoded + "\n")
+    run_id = args.run_id or (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6])
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", run_id):
+        raise ValueError("--run-id must be a safe directory name")
+    if args.resume and args.run_id is None:
+        raise ValueError("--resume requires --run-id")
+    results = args.results.resolve()
+    results.mkdir(parents=True, exist_ok=True)
+    if args.work:
+        work = args.work.resolve()
+        work.mkdir(parents=True, exist_ok=True)
+        cache_mount = f"type=bind,src={work},dst=/work"
+    else:
+        # Docker-managed Linux storage avoids macOS bind-mount overhead for data.
+        call(["docker", "volume", "create", args.volume], stdout=subprocess.DEVNULL)
+        cache_mount = f"type=volume,src={args.volume},dst=/work"
+    metadata = json.loads(capture(["docker", "image", "inspect", args.image]))[0]
+    image_identity = {"id": metadata["Id"], "repo_digests": metadata.get("RepoDigests", []),
+                      "architecture": metadata["Architecture"], "platform": metadata["Os"]}
+    command = ["docker", "run", "--rm", "--init", "--platform", args.platform,
+               "--env", f"BENCH_UID={os.getuid()}", "--env", f"BENCH_GID={os.getgid()}",
+               "--env", "BENCH_IMAGE_METADATA=" + json.dumps(image_identity),
+               "--env", "BENCH_DIVA_BACKEND=" + getattr(args, "diva_backend", "auto"),
+               "--cpus", str(raw["suite"]["container_cpus"]),
+               "--memory", raw["suite"]["container_memory"],
+               "--memory-swap", raw["suite"]["container_memory"],
+               "--mount", cache_mount,
+               "--mount", f"type=bind,src={results},dst=/results",
+               "--mount", f"type=bind,src={config},dst=/input/config.json,readonly",
+               args.image, args.stage, "--run", f"/results/{run_id}", "--cache", "/work"]
+    if args.stage not in ("analyze", "export"):
+        command += ["--config", "/input/config.json"]
+    if args.resume:
+        command.append("--resume")
+    if args.max_runtime_seconds is not None:
+        if args.max_runtime_seconds <= 0:
+            raise ValueError("--max-runtime-seconds must be positive")
+        position = command.index(args.image)
+        command[position:position] = ["--env", "BENCH_DEADLINE_EPOCH=" + str(time.time() + args.max_runtime_seconds)]
+    print(f"Run: {run_id}\nResults: {results / run_id}", flush=True)
+    completed = subprocess.run(command, cwd=ROOT)
+    raise SystemExit(completed.returncode)
+
+
+def split(args) -> None:
+    from benchmarking.suite_jobs import split_jobs
+    for path in split_jobs(args.config.resolve(), args.output.resolve()):
+        print(path)
+
+
+def combine(args) -> None:
+    from benchmarking.suite_jobs import combine_jobs, combine_dimension_cases
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", args.run_id):
+        raise ValueError("--run-id must be a safe directory name")
+    combine_fn = combine_dimension_cases if args.dimension_cases else combine_jobs
+    combine_fn(args.config.resolve(), args.runs, args.results.resolve() / args.run_id)
+    args.stage, args.resume, args.work, args.max_runtime_seconds = "analyze", False, None, None
+    args.volume = "join-pruning-data"
+    local(args)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    from benchmarking.cloud import add_parser
+    add_parser(commands)
+    image = commands.add_parser("build", help="compile the pinned Linux ARM64 image")
+    image.add_argument("--target", choices=("paper", "native", "extensions"), default="paper")
+    image.add_argument("--image", default="join-pruning-suite:local")
+    image.add_argument("--platform", default="linux/arm64")
+    image.add_argument("--jobs", type=int, default=2)
+    image.add_argument("--ssb-source", type=Path)
+    image.set_defaults(func=build)
+    split_parser = commands.add_parser("split", help="write one independent job per SQL workload")
+    split_parser.add_argument("--config", required=True, type=Path)
+    split_parser.add_argument("--output", required=True, type=Path)
+    split_parser.set_defaults(func=split)
+    combine_parser = commands.add_parser("combine", help="verify, combine and plot completed split jobs")
+    combine_parser.add_argument("--config", required=True, type=Path, help="original unsplit config")
+    combine_parser.add_argument("--dimension-cases", action="store_true",
+                                help="combine disjoint native dimension-cardinality partitions of one SQL workload")
+    combine_parser.add_argument("--runs", required=True, nargs="+", type=Path)
+    combine_parser.add_argument("--run-id", required=True)
+    combine_parser.add_argument("--results", type=Path, default=ROOT / "out/suite-results")
+    combine_parser.add_argument("--image", default="join-pruning-suite:local")
+    combine_parser.add_argument("--platform", default="linux/arm64")
+    combine_parser.set_defaults(func=combine)
+    run = commands.add_parser("local", help="run a stage locally, or on the target Linux host")
+    run.add_argument("stage", choices=("prepare", "run", "analyze", "export", "all"), default="all", nargs="?")
+    run.add_argument("--config", type=Path, default=ROOT / "configs/smoke-paper.json")
+    run.add_argument("--image", default="join-pruning-suite:local")
+    run.add_argument("--platform", default="linux/arm64")
+    run.add_argument("--results", type=Path, default=ROOT / "out/suite-results")
+    run.add_argument("--work", type=Path, help="bind-mount cache/spill, e.g. an EC2 NVMe mount")
+    run.add_argument("--volume", default="join-pruning-data")
+    run.add_argument("--run-id")
+    run.add_argument("--resume", action="store_true")
+    run.add_argument("--diva-backend", choices=("auto", "portable", "sve2"), default="auto",
+                     help="select a Diva backend before timing; SVE2 requires hardware support")
+    run.add_argument("--max-runtime-seconds", type=float, help="measurement deadline; finalization runs afterwards")
+    run.set_defaults(func=local)
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

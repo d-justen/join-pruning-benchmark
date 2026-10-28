@@ -8,6 +8,7 @@ import sys
 import tempfile
 from dataclasses import asdict
 from pathlib import Path
+from textwrap import fill
 
 MPLCONFIGDIR = Path(tempfile.gettempdir()) / "matplotlib-cache"
 MPLCONFIGDIR.mkdir(parents=True, exist_ok=True)
@@ -18,7 +19,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
-from matplotlib.ticker import FixedLocator, FuncFormatter, LogFormatterMathtext, MaxNLocator
+from matplotlib.ticker import FixedLocator, FuncFormatter, LogFormatterMathtext, LogLocator, MaxNLocator, NullFormatter
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -29,8 +30,10 @@ from benchmarking.microbenchmarks import ARTIFACT_SUBDIR, load_microbenchmark_ma
 from benchmarking.jpb_microbenchmarks import ARTIFACT_SUBDIR as JPB_ARTIFACT_SUBDIR, load_jpb_manifest
 from paper.figures.filter_benchmark import build_filter_benchmark_artifacts
 from paper.figures.jpb_microbenchmark import build_jpb_artifacts
+from paper.figures.ordered_panels import draw_ordered_panels, predicate_label
 from paper.figure_specs import (
     FIGURES,
+    figures_for_config,
     JPB_ALL_QUERIES,
     JPB_NATIVE_ALL_QUERIES,
     PARAMETER_SWEEP_PANELS,
@@ -67,8 +70,8 @@ PAGE_SIZES = {
 }
 
 TITLE_FONT_SIZE = 8.0
-LABEL_FONT_SIZE = 8.0
 TICK_FONT_SIZE = 7.0
+LABEL_FONT_SIZE = TICK_FONT_SIZE
 LEGEND_FONT_SIZE = 7.0
 ANNOTATION_FONT_SIZE = 6.5
 
@@ -93,7 +96,6 @@ PROBE_CARDINALITY_VARIANTS = (
 )
 PROBE_CARDINALITY_OUTLIER_THRESHOLD = 10.0
 PROBE_FILTERED_HATCH = "...."
-PROBE_SKIPPED_HATCH = "////"
 ROWS_SCANNED_HATCH = "////"
 FILTER_BUILD_HATCH = "\\\\\\\\"
 PRF_ANALYSIS_HATCH = "xxxx"
@@ -180,7 +182,9 @@ def _figure_is_available(figure, available_workloads: set[str]) -> bool:
 def _present_benchmark_groups(rows: list) -> tuple[tuple[str, str, tuple[str, ...] | None], ...]:
     available_workloads = _available_workload_names(rows)
     return tuple(
-        group for group in BENCHMARK_RUNTIME_BOXPLOT_GROUPS
+        (group[0], group[1], tuple(sorted({r.query_name for r in rows if r.workload_name == group[0]})))
+        if group[0].startswith('join-pruning-workload') else group
+        for group in BENCHMARK_RUNTIME_BOXPLOT_GROUPS
         if group[0] in available_workloads
     )
 
@@ -193,13 +197,16 @@ def _variant_panel_label(label: str) -> str:
     return VARIANT_PANEL_LABELS.get(label, _variant_display_label(label))
 
 
-def _present_entry_variants(entries: list[dict[str, object]]) -> tuple[str, ...]:
+def _present_entry_variants(
+    entries: list[dict[str, object]],
+    variant_order: tuple[str, ...] = VARIANT_ORDER,
+) -> tuple[str, ...]:
     present = {
         item["variant_label"]
         for entry in entries
         for item in entry["series"]
     }
-    return tuple(label for label in VARIANT_ORDER if label in present)
+    return tuple(label for label in variant_order if label in present)
 
 
 def _variant_bar_geometry(
@@ -402,6 +409,50 @@ def _artist_overlaps_axes(fig, artist, axes) -> bool:
     return any(artist_bbox.overlaps(ax.get_window_extent(renderer)) for ax in axes)
 
 
+def _layout_runtime_labels(fig, ax, labels: list, bar_width: float) -> dict[str, bool]:
+    """Fit runtime labels to their bar slots and reserve space above the bars."""
+    if not labels:
+        return {"runtime_label_overlap": False, "runtime_labels_outside_axes": False}
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    slot_width = abs(ax.transData.transform((bar_width, 1))[0] - ax.transData.transform((0, 1))[0])
+    if any(label.get_window_extent(renderer).width > slot_width * 0.9 for label in labels):
+        for label in labels:
+            label.set_rotation(90)
+        fig.canvas.draw()
+
+    # Work in axis-scale coordinates so the same padding works on log axes.
+    scale = ax.yaxis.get_transform()
+    lower, upper = scale.transform(ax.get_ylim())
+    axes_bbox = ax.get_window_extent(renderer)
+    padding = renderer.points_to_pixels(4)
+    for label in labels:
+        label_top = label.get_window_extent(renderer).y1
+        anchor_y = ax.transData.transform(label.xy)[1]
+        usable_height = 1 - (label_top - anchor_y + padding) / axes_bbox.height
+        value = scale.transform(label.xy[1])
+        upper = max(upper, lower + (value - lower) / max(usable_height, 0.1))
+    ax.set_ylim(top=float(scale.inverted().transform(upper)))
+    if ax.get_yscale() == "log":
+        ax.set_yticks(_log_ticks(*ax.get_ylim()))
+        _drop_seam_tick(ax)
+
+    fig.canvas.draw()
+    boxes = [label.get_window_extent(renderer) for label in labels]
+    return {
+        "runtime_label_overlap": any(
+            left.overlaps(right)
+            for index, left in enumerate(boxes)
+            for right in boxes[index + 1:]
+        ),
+        "runtime_labels_outside_axes": any(
+            box.x0 < axes_bbox.x0 or box.x1 > axes_bbox.x1
+            or box.y0 < axes_bbox.y0 or box.y1 > axes_bbox.y1
+            for box in boxes
+        ),
+    }
+
+
 def _draw_vertical_grouped_bars(
     output_path: Path,
     *,
@@ -518,12 +569,16 @@ def _draw_runtime_probe_bars(
     annotate_runtime_values: bool,
     runtime_log_axis: bool,
     rows_log_axis: bool,
-    split_scan_pruning: bool = False,
     show_filter_phases: bool = False,
+    variant_order: tuple[str, ...] = VARIANT_ORDER,
+    height_inches: float | None = None,
+    rows_height_ratio: float | None = None,
+    legend_columns: int | None = None,
 ) -> dict[str, bool]:
     width, height = PAGE_SIZES[width_key]
     text_scale = _capped_text_scale(width_key, placement_width_key)
     compressed_column_layout = placement_width_key == "one-column" and width_key != placement_width_key
+    annotated_column_layout = annotate_runtime_values and compressed_column_layout
     tick_font_size = _scaled_font_size(TICK_FONT_SIZE, text_scale)
     label_font_size = _scaled_font_size(LABEL_FONT_SIZE, text_scale)
     legend_font_size = _scaled_font_size(LEGEND_FONT_SIZE, text_scale)
@@ -534,6 +589,8 @@ def _draw_runtime_probe_bars(
         height += 1.25
     if has_bar_labels:
         height += 0.12
+    if height_inches is not None:
+        height = height_inches
     mirrored_log_layout = runtime_log_axis or rows_log_axis
     panel_hspace = 0.055 if compressed_column_layout else (0.035 if mirrored_log_layout else 0.0)
     fig, (runtime_ax, rows_ax) = plt.subplots(
@@ -542,7 +599,7 @@ def _draw_runtime_probe_bars(
         figsize=(width, height),
         sharex=True,
         gridspec_kw={
-            "height_ratios": [1.0, 1.15],
+            "height_ratios": [1.0, 1.15 if rows_height_ratio is None else rows_height_ratio],
             "hspace": panel_hspace,
         },
         constrained_layout=False,
@@ -553,21 +610,21 @@ def _draw_runtime_probe_bars(
 
     count = len(entries)
     x_positions = list(range(count))
-    present_variants = _present_entry_variants(entries)
+    present_variants = _present_entry_variants(entries, variant_order)
     bar_width, offsets = _variant_bar_geometry(0.18, len(present_variants))
     runtime_max = 0.0
     rows_max = 0
     positive_runtime_values: list[float] = []
     positive_row_values: list[float] = []
+    runtime_labels = []
 
     series_data: list[
-        tuple[str, list[float], list[int], list[int], list[int]]
+        tuple[str, list[float], list[int], list[int]]
     ] = []
     for variant_label in present_variants:
         runtime_values: list[float] = []
         probe_values: list[int] = []
         filtered_values: list[int] = []
-        skipped_values: list[int] = []
         for entry in entries:
             match = next(
                 (item for item in entry["series"] if item["variant_label"] == variant_label),
@@ -578,34 +635,23 @@ def _draw_runtime_probe_bars(
             filtered_rows = (
                 int(match["probe_rows_filtered_after_scan"]) if match else 0
             )
-            skipped_rows = (
-                int(match["probe_rows_skipped_at_scan"])
-                if match and split_scan_pruning
-                else 0
-            )
             runtime_values.append(runtime)
             probe_values.append(probe_rows)
             filtered_values.append(filtered_rows)
-            skipped_values.append(skipped_rows)
             runtime_max = max(runtime_max, runtime)
-            rows_max = max(rows_max, probe_rows + filtered_rows + skipped_rows)
+            rows_max = max(rows_max, probe_rows + filtered_rows)
             if runtime > 0:
                 positive_runtime_values.append(runtime)
             if probe_rows > 0:
                 positive_row_values.append(float(probe_rows))
             if probe_rows + filtered_rows > 0:
                 positive_row_values.append(float(probe_rows + filtered_rows))
-            if probe_rows + filtered_rows + skipped_rows > 0:
-                positive_row_values.append(
-                    float(probe_rows + filtered_rows + skipped_rows)
-                )
         series_data.append(
             (
                 variant_label,
                 runtime_values,
                 probe_values,
                 filtered_values,
-                skipped_values,
             )
         )
 
@@ -619,7 +665,6 @@ def _draw_runtime_probe_bars(
         runtime_values,
         probe_values,
         filtered_values,
-        skipped_values,
     ) in enumerate(series_data):
         positions = [x + offsets[series_index] for x in x_positions]
 
@@ -653,7 +698,7 @@ def _draw_runtime_probe_bars(
             for position, value, label_value in zip(positions, runtime_values, label_values):
                 if value <= 0:
                     continue
-                runtime_ax.annotate(
+                runtime_labels.append(runtime_ax.annotate(
                     f"{value:.0f}",
                     xy=(position, label_value),
                     xytext=(0, 2),
@@ -664,7 +709,7 @@ def _draw_runtime_probe_bars(
                     color="#111827",
                     clip_on=False,
                     zorder=5,
-                )
+                ))
 
         if rows_log_axis:
             rendered_probe_values = [
@@ -674,12 +719,6 @@ def _draw_runtime_probe_bars(
             rendered_scanned_values = [
                 _render_log_value(probe + filtered, row_floor)
                 for probe, filtered in zip(probe_values, filtered_values)
-            ]
-            rendered_total_values = [
-                _render_log_value(probe + filtered + skipped, row_floor)
-                for probe, filtered, skipped in zip(
-                    probe_values, filtered_values, skipped_values
-                )
             ]
             rows_ax.bar(
                 positions,
@@ -707,22 +746,6 @@ def _draw_runtime_probe_bars(
                 hatch=PROBE_FILTERED_HATCH,
                 zorder=3,
             )
-            rows_ax.bar(
-                positions,
-                [
-                    top - bottom
-                    for top, bottom in zip(
-                        rendered_total_values, rendered_scanned_values
-                    )
-                ],
-                width=bar_width,
-                bottom=rendered_scanned_values,
-                color="white",
-                edgecolor=COLORS[variant_label],
-                linewidth=0.7,
-                hatch=PROBE_SKIPPED_HATCH,
-                zorder=3,
-            )
         else:
             rows_ax.bar(
                 positions,
@@ -742,20 +765,6 @@ def _draw_runtime_probe_bars(
                 edgecolor=COLORS[variant_label],
                 linewidth=0.7,
                 hatch=PROBE_FILTERED_HATCH,
-                zorder=3,
-            )
-            rows_ax.bar(
-                positions,
-                skipped_values,
-                width=bar_width,
-                bottom=[
-                    probe + filtered
-                    for probe, filtered in zip(probe_values, filtered_values)
-                ],
-                color="white",
-                edgecolor=COLORS[variant_label],
-                linewidth=0.7,
-                hatch=PROBE_SKIPPED_HATCH,
                 zorder=3,
             )
 
@@ -790,7 +799,7 @@ def _draw_runtime_probe_bars(
         runtime_ax.yaxis.set_major_formatter(_format_axis_value("runtime_ms"))
         runtime_ax.set_ylim(0, runtime_max * 1.15 if runtime_max > 0 else 1.0)
     rows_ax.set_ylabel(
-        "Fact tuples",
+        "Tuples" if annotated_column_layout else "Fact tuples",
         fontsize=label_font_size,
         labelpad=10,
     )
@@ -807,7 +816,7 @@ def _draw_runtime_probe_bars(
             rows_ax.set_ylim(1.0, 10.0)
     else:
         rows_ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: _format_large_number(value)))
-        rows_ax.yaxis.set_major_locator(MaxNLocator(nbins=4, prune="both"))
+        rows_ax.yaxis.set_major_locator(MaxNLocator(nbins=3 if annotated_column_layout else 4, prune="both"))
         rows_ax.set_ylim(0, rows_max * 1.03 if rows_max > 0 else 1.0)
     rows_ax.invert_yaxis()
 
@@ -854,29 +863,17 @@ def _draw_runtime_probe_bars(
             facecolor="white",
             edgecolor="#4b5563",
             hatch=PROBE_FILTERED_HATCH,
-            label=(
-                "Tuple-filtered after scan"
-                if split_scan_pruning
-                else "Pre-filtered tuples"
-            ),
+            label="Tuple-filtered tuples",
         ),
     ]
-    if split_scan_pruning:
-        semantic_handles.append(
-            Patch(
-                facecolor="white",
-                edgecolor="#4b5563",
-                hatch=PROBE_SKIPPED_HATCH,
-                label="Skipped at scan",
-            )
-        )
     if show_filter_phases and phase_verification["filter_phase_bars"]:
         semantic_handles.extend(_filter_phase_legend_handles())
     variant_legend = fig.legend(
         handles=variant_handles,
         loc="upper center",
         bbox_to_anchor=(0.5, 0.99),
-        ncol=2 if width_key == "one-column" else 4,
+        ncol=legend_columns if legend_columns is not None else (
+            2 if width_key == "one-column" or annotated_column_layout else 4),
         frameon=False,
         fontsize=legend_font_size,
         handlelength=1.5,
@@ -885,7 +882,7 @@ def _draw_runtime_probe_bars(
     semantic_legend = fig.legend(
         handles=semantic_handles,
         loc="upper center",
-        bbox_to_anchor=(0.5, 0.78 if width_key == "one-column" else 0.87),
+        bbox_to_anchor=(0.5, 0.78 if width_key == "one-column" else (0.80 if annotated_column_layout else 0.87)),
         ncol=1 if width_key == "one-column" else 3,
         frameon=False,
         fontsize=legend_font_size,
@@ -893,6 +890,8 @@ def _draw_runtime_probe_bars(
         columnspacing=1.0,
     )
     plot_top = 0.50 if width_key == "one-column" else (0.72 if show_filter_phases else 0.75)
+    if annotated_column_layout:
+        plot_top = 0.65
     if show_filter_phases and phase_verification["filter_phase_bars"]:
         plot_top = min(plot_top, _annotate_filter_phases(fig, semantic_legend, annotation_font_size))
 
@@ -902,8 +901,20 @@ def _draw_runtime_probe_bars(
         bottom=0.08 if not show_query_labels else (0.18 if has_wrapped_xticklabels else (0.12 if compressed_column_layout else 0.11)),
         top=plot_top,
     )
-    runtime_ax.yaxis.set_label_coords(-0.11, 0.5)
-    rows_ax.yaxis.set_label_coords(-0.11, 0.5)
+    runtime_ax.yaxis.set_label_coords(-0.11, 0.6 if annotated_column_layout else 0.5)
+    rows_ax.yaxis.set_label_coords(-0.11, 0.4 if annotated_column_layout else 0.5)
+    if legend_columns is not None:
+        # Center both legend rows over the plot with the same gap as the byte figure.
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        gap = renderer.points_to_pixels(4) / runtime_ax.bbox.height
+        anchor_y = 1 + gap
+        for legend in (semantic_legend, variant_legend):
+            legend.borderaxespad = 0
+            legend.set_loc("lower center")
+            legend.set_bbox_to_anchor((0.5, anchor_y), transform=runtime_ax.transAxes)
+            anchor_y += legend.get_window_extent(renderer).height / runtime_ax.bbox.height + gap
+    label_verification = _layout_runtime_labels(fig, runtime_ax, runtime_labels, bar_width)
     runtime_verification = _verify_layout(fig, runtime_ax)
     rows_verification = _verify_layout(fig, rows_ax)
     verification = {
@@ -926,6 +937,7 @@ def _draw_runtime_probe_bars(
             )
         ),
         **phase_verification,
+        **label_verification,
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(
@@ -953,8 +965,13 @@ def _draw_runtime_total_rows_bars(
     rows_y_label: str = "Rows scanned",
     rows_percent: bool = False,
     show_filter_phases: bool = False,
+    variant_order: tuple[str, ...] = VARIANT_ORDER,
+    height_inches: float | None = None,
+    rows_height_ratio: float | None = None,
+    legend_columns: int | None = None,
 ) -> dict[str, bool]:
     width, height = PAGE_SIZES[width_key]
+    bytes_read = rows_metric_key == "fact_remote_gib"
     text_scale = _capped_text_scale(width_key, placement_width_key)
     compressed_column_layout = placement_width_key == "one-column" and width_key != placement_width_key
     tick_font_size = _scaled_font_size(TICK_FONT_SIZE, text_scale)
@@ -964,6 +981,8 @@ def _draw_runtime_total_rows_bars(
     height += 1.0 if compressed_column_layout else 0.85
     if show_runtime_labels:
         height += 0.10
+    if height_inches is not None:
+        height = height_inches
     mirrored_log_layout = runtime_log_axis or rows_log_axis
     fig, (runtime_ax, rows_ax) = plt.subplots(
         2,
@@ -971,7 +990,7 @@ def _draw_runtime_total_rows_bars(
         figsize=(width, height),
         sharex=True,
         gridspec_kw={
-            "height_ratios": [1.0, 1.05],
+            "height_ratios": [1.0, 1.05 if rows_height_ratio is None else rows_height_ratio],
             "hspace": 0.035 if mirrored_log_layout else 0.0,
         },
         constrained_layout=False,
@@ -982,15 +1001,13 @@ def _draw_runtime_total_rows_bars(
 
     count = len(entries)
     x_positions = list(range(count))
-    present_variants = _present_entry_variants(entries)
-    bar_width, offsets = _variant_bar_geometry(
-        0.15 if show_runtime_labels else 0.18,
-        len(present_variants),
-    )
+    present_variants = _present_entry_variants(entries, variant_order)
+    bar_width, offsets = _variant_bar_geometry(0.18, len(present_variants))
     runtime_max = 0.0
     rows_max = 0.0
     positive_runtime_values: list[float] = []
     positive_row_values: list[float] = []
+    runtime_labels = []
 
     series_data: list[tuple[str, list[float], list[float]]] = []
     for variant_label in present_variants:
@@ -1054,7 +1071,7 @@ def _draw_runtime_total_rows_bars(
             for position, value, label_value in zip(positions, runtime_values, label_values):
                 if value <= 0:
                     continue
-                runtime_ax.annotate(
+                runtime_labels.append(runtime_ax.annotate(
                     f"{value:.0f}",
                     xy=(position, label_value),
                     xytext=(0, 2),
@@ -1065,7 +1082,7 @@ def _draw_runtime_total_rows_bars(
                     color="#111827",
                     clip_on=False,
                     zorder=5,
-                )
+                ))
         if rows_log_axis:
             rendered_row_values = [
                 _render_log_value(value, row_floor)
@@ -1088,7 +1105,7 @@ def _draw_runtime_total_rows_bars(
                 width=bar_width,
                 color=COLORS[variant_label],
                 edgecolor="white",
-                linewidth=0.5,
+                linewidth=0 if bytes_read else 0.5,
                 zorder=3,
             )
 
@@ -1135,12 +1152,14 @@ def _draw_runtime_total_rows_bars(
             FuncFormatter(
                 (lambda value, _: f"{value * 100:.0f}%")
                 if rows_percent
+                else (lambda value, _: f"{value:g}") if bytes_read
                 else (lambda value, _: _format_large_number(value))
             )
         )
         rows_ax.yaxis.set_major_locator(MaxNLocator(nbins=4, prune="both"))
         rows_ax.set_ylim(
-            0,
+            # Keep short byte bars clear of the divider; every bar still starts at zero.
+            -rows_max * 0.025 if bytes_read else 0,
             1.03 if rows_percent else (rows_max * 1.03 if rows_max > 0 else 1.0),
         )
     rows_ax.invert_yaxis()
@@ -1186,6 +1205,7 @@ def _draw_runtime_total_rows_bars(
     if show_filter_phases and phase_verification["filter_phase_bars"]:
         total_rows_legend_handles.extend(_filter_phase_legend_handles())
     plot_top = 0.74 if show_runtime_labels else (0.70 if compressed_column_layout else (0.74 if width_key == "one-column" else 0.83))
+    runtime_legend = None
     if show_filter_phases and phase_verification["filter_phase_bars"]:
         phase_legend = fig.legend(
             handles=total_rows_legend_handles, loc="upper center", bbox_to_anchor=(0.5, 0.99),
@@ -1205,11 +1225,13 @@ def _draw_runtime_total_rows_bars(
             columnspacing=1.0,
         )
     else:
-        runtime_ax.legend(
+        legend_anchor_y = 1.36 if compressed_column_layout else (1.40 if width_key == "one-column" else 1.30)
+        runtime_legend = runtime_ax.legend(
             handles=total_rows_legend_handles,
             loc="upper center",
-            bbox_to_anchor=(0.5, 1.36 if compressed_column_layout else (1.40 if width_key == "one-column" else 1.30)),
-            ncol=2 if width_key == "one-column" else (2 if compressed_column_layout else 4),
+            bbox_to_anchor=(0.5, legend_anchor_y),
+            ncol=legend_columns if legend_columns is not None else (
+                2 if width_key == "one-column" else (2 if compressed_column_layout else 4)),
             frameon=False,
             fontsize=legend_font_size,
             handlelength=1.5,
@@ -1223,6 +1245,15 @@ def _draw_runtime_total_rows_bars(
     )
     runtime_ax.yaxis.set_label_coords(-0.14 if show_runtime_labels else -0.11, 0.5)
     rows_ax.yaxis.set_label_coords(-0.14 if show_runtime_labels else -0.11, 0.5)
+    if runtime_legend is not None:
+        # Short figures still need room for every legend row above the bars.
+        fig.canvas.draw()
+        legend_bbox = runtime_legend.get_window_extent(fig.canvas.get_renderer())
+        gap = 4 * fig.dpi / 72
+        adjustment = runtime_ax.bbox.y1 + gap - legend_bbox.y0
+        if adjustment > 0 or legend_columns is not None:
+            runtime_legend.set_bbox_to_anchor((0.5, legend_anchor_y + adjustment / runtime_ax.bbox.height))
+    label_verification = _layout_runtime_labels(fig, runtime_ax, runtime_labels, bar_width)
     runtime_verification = _verify_layout(fig, runtime_ax)
     rows_verification = _verify_layout(fig, rows_ax)
     verification = {
@@ -1235,6 +1266,9 @@ def _draw_runtime_total_rows_bars(
             or rows_verification["text_outside_figure"]
         ),
         **phase_verification,
+        **label_verification,
+        "legend_overlaps_axes": runtime_legend is not None and _artist_overlaps_axes(
+            fig, runtime_legend, (runtime_ax, rows_ax)),
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(
@@ -1338,10 +1372,10 @@ def _draw_runtime_plan_work_bars(
             zorder=3,
         )
 
-    runtime_ax.set_ylabel("Execution time (ms)", fontsize=8)
+    runtime_ax.set_ylabel("Execution time (ms)", fontsize=LABEL_FONT_SIZE)
     runtime_ax.yaxis.set_major_formatter(_format_axis_value("runtime_ms"))
     runtime_ax.set_ylim(0, runtime_max * 1.15 if runtime_max > 0 else 1.0)
-    work_ax.set_ylabel("Tuples (log)", fontsize=8 if log_lower_axis else 8)
+    work_ax.set_ylabel("Tuples (log)" if log_lower_axis else "Tuples", fontsize=LABEL_FONT_SIZE)
     work_ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: _format_large_number(value)))
     if log_lower_axis and positive_work_values:
         lower_power = math.floor(math.log10(min(positive_work_values)))
@@ -1390,7 +1424,7 @@ def _draw_runtime_plan_work_bars(
         Patch(facecolor="white", edgecolor="#4b5563", label="Join-probed tuples"),
         Patch(facecolor="white", edgecolor="#4b5563", hatch=ROWS_SCANNED_HATCH, label="Rows scanned"),
     ]
-    runtime_ax.legend(
+    runtime_legend = runtime_ax.legend(
         handles=variant_handles + semantic_handles,
         loc="upper center",
         bbox_to_anchor=(0.5, 1.30),
@@ -1427,6 +1461,12 @@ def _draw_runtime_plan_work_bars(
             "tick_label_overlap": runtime_verification["tick_label_overlap"] or work_verification["tick_label_overlap"],
             "text_outside_figure": runtime_verification["text_outside_figure"] or work_verification["text_outside_figure"],
         }
+    fig.canvas.draw()
+    legend_bbox = runtime_legend.get_window_extent(fig.canvas.get_renderer())
+    adjustment = runtime_ax.bbox.y1 + 4 * fig.dpi / 72 - legend_bbox.y0
+    if adjustment > 0:
+        runtime_legend.set_bbox_to_anchor((0.5, 1.30 + adjustment / runtime_ax.bbox.height))
+    verification['legend_overlaps_axes'] = _artist_overlaps_axes(fig, runtime_legend, (runtime_ax, work_ax))
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(
         output_path,
@@ -1488,8 +1528,9 @@ def _draw_relative_probe_cardinality_boxplot(
         patch.set_alpha(0.9)
 
     ax.set_xticks(positions)
-    ax.set_xticklabels([_variant_display_label(label) for label in present_variants], fontsize=7)
-    ax.set_ylabel("Relative scan cardinality (log)", fontsize=8)
+    ax.set_xticklabels([fill(_variant_display_label(label), width=14, break_long_words=False)
+                       for label in present_variants], fontsize=7)
+    ax.set_ylabel("Relative scan cardinality (log)", fontsize=LABEL_FONT_SIZE)
     ax.tick_params(axis="y", labelsize=7)
     ax.grid(axis="y", color="#e5e7eb", linewidth=0.8, zorder=0)
     ax.spines["top"].set_visible(False)
@@ -1702,14 +1743,14 @@ def _benchmark_summaries(rows: list) -> dict[str, object]:
         summaries["join_pruning_benchmark"] = summarize_benchmark_runtime(
             rows,
             workload_name="join-pruning-workload",
-            query_names=JPB_NATIVE_ALL_QUERIES,
+            query_names=tuple(sorted({r.query_name for r in rows if r.workload_name == 'join-pruning-workload'})),
             benchmark_label=WORKLOAD_LABELS["join-pruning-workload"],
         )
     if "join-pruning-workload-ducklake" in available_workloads:
         summaries["join_pruning_benchmark_ducklake"] = summarize_benchmark_runtime(
             rows,
             workload_name="join-pruning-workload-ducklake",
-            query_names=JPB_ALL_QUERIES,
+            query_names=tuple(sorted({r.query_name for r in rows if r.workload_name == 'join-pruning-workload-ducklake'})),
             benchmark_label=WORKLOAD_LABELS["join-pruning-workload-ducklake"],
         )
     if "join-pruning-workload-ducklake-http-10ms" in available_workloads:
@@ -1805,9 +1846,9 @@ def _write_benchmark_summary_markdown(
         )
         best_values = {
             key: min(
-                value
-                for variant in variants.values()
-                if (value := variant[key]) is not None
+                (value for variant in variants.values()
+                 if (value := variant[key]) is not None),
+                default=None,
             )
             for key in metric_keys
         }
@@ -1869,6 +1910,7 @@ def _write_benchmark_summary_markdown(
             "",
             "## Metric Definitions",
             "",
+            "- **Queries:** only queries with a join operator in at least one selected variant's profile are included. The same query set is used for every variant and all table metrics, including phase totals. Queries with zero join-probe tuples remain included.",
             "- **Total time:** sum of per-query median execution times.",
             "- **Join/filter build:** elapsed hash-join finalization, including hash-table work and PRF/Bloom construction, excluding the separately measured PRF postprocessing. This is not an isolated filter-build cost.",
             "- **PRF analysis / compression:** separate elapsed phases. Uncompressed PRF can require analysis to choose a fallback; its compression time is zero. Compression includes its own bitmap analysis. Bloom-only builds record zero for both PRF phases.",
@@ -1877,9 +1919,9 @@ def _write_benchmark_summary_markdown(
             "- Profile phases come from a separate execution from the timed median. Multi-join phase spans can overlap, so their sums are not an additive decomposition of query latency. External joins report initial finalization only, excluding later source-side rounds. Worker times are not used.",
             "- **Relative time:** geometric mean of each query runtime divided by the best variant runtime for that query.",
             "- **Rows scanned:** sum of profile-level `cumulative_rows_scanned` across all queries.",
-            "- **Relative rows:** geometric mean of each query's cumulative rows scanned divided by the best variant for that query.",
-            "- **Join-probe tuples:** sum of the output cardinality of distinct `TABLE_SCAN` operators that appear anywhere in the left subtree of at least one `*_JOIN` operator in a query plan. Each qualifying scan is counted once per query.",
-            "- **Relative probes:** geometric mean of each query's join-probe tuples divided by the best variant for that query.",
+            "- **Relative rows:** geometric mean of each query's cumulative rows scanned divided by the best variant for that query, replacing zero counts with one before normalization.",
+            "- **Join-probe tuples:** sum of the immediate left child's output cardinality for every `*_JOIN` operator in a query plan, including delimiter joins. This excludes runtime-filter construction and application work.",
+            "- **Relative probes:** geometric mean of each query's join-probe tuples divided by the best variant for that query, replacing zero counts with one before normalization.",
             "- Lower relative values are better; `1.00x` is best.",
             "",
             "## Coverage",
@@ -1889,20 +1931,22 @@ def _write_benchmark_summary_markdown(
     for benchmark in benchmark_summary["benchmarks"]:
         relative_counts = benchmark["relative_query_counts"]
         excluded_counts = benchmark["relative_excluded_query_counts"]
+        excluded_queries = ", ".join(benchmark["join_free_query_names"])
+        excluded_detail = f" ({excluded_queries})" if excluded_queries else ""
         lines.append(
-            f"- **{benchmark['benchmark_label']}:** {benchmark['query_count']} queries; "
+            f"- **{benchmark['benchmark_label']}:** {benchmark['query_count']} join queries; "
             f"relative time uses {relative_counts['runtime_ms']} "
             f"(excluded {excluded_counts['runtime_ms']}); "
             f"relative rows use {relative_counts['rows_scanned']} "
             f"(excluded {excluded_counts['rows_scanned']}); "
             f"relative probes use {relative_counts['join_probe_tuples']} "
             f"(excluded {excluded_counts['join_probe_tuples']}). "
-            f"{benchmark['join_free_query_count']} queries contain no join operator."
+            f"{benchmark['join_free_query_count']} non-join queries excluded{excluded_detail}."
         )
     lines.extend(
         [
             "",
-            "Relative geometric means exclude a query when any variant reports a non-positive value for that metric, because normalization against zero is undefined. Absolute totals still include those values.",
+            "Zero tuple counts are treated as one only for the relative rows/probes geometric means; absolute totals retain the recorded zeros. A query with zero work in every variant contributes a relative ratio of 1. Runtime values are not floored to one.",
         ]
     )
     lines.append("")
@@ -2012,17 +2056,20 @@ def _draw_parameter_sweep_overview(
     rows: list,
 ) -> tuple[dict[str, bool], dict[str, object]]:
     panel_series, summary = _parameter_sweep_series(rows)
-    fig, axes = plt.subplots(2, 3, figsize=(7.0, 5.4), constrained_layout=False)
+    fig, axes = plt.subplots(
+        3, 2, figsize=(PAGE_SIZES["one-column"][0], 3.5),
+        constrained_layout=False,
+    )
     fig.patch.set_facecolor("white")
     present_variants = tuple(
         variant
         for variant in VARIANT_ORDER
-        if any(
+        if variant != "rpt none" and any(
             any(key[0] == variant for key in grouped)
             for grouped in panel_series.values()
         )
     )
-    for ax, panel in zip(axes.flat, PARAMETER_SWEEP_PANELS):
+    for index, (ax, panel) in enumerate(zip(axes.flat, PARAMETER_SWEEP_PANELS)):
         ax.set_facecolor("white")
         grouped = panel_series[panel.workload]
         for variant in present_variants:
@@ -2039,29 +2086,36 @@ def _draw_parameter_sweep_overview(
                     [point[1] for point in points],
                     color=COLORS[variant],
                     marker=SWEEP_MARKERS[variant],
-                    markersize=3.0,
+                    markersize=2.5,
                     markeredgewidth=0.4,
-                    linewidth=1.15,
+                    linewidth=0.9,
                     linestyle=SWEEP_LINE_STYLES[query_type],
                     zorder=3,
                 )
         if panel.x_scale == "log":
             ax.set_xscale("log", base=panel.log_base)
         ax.set_yscale("log")
+        ax.margins(y=0.08)
+        ax.yaxis.set_major_locator(LogLocator(base=10, subs=(1.0,)))
+        ax.yaxis.set_major_formatter(LogFormatterMathtext(base=10, labelOnlyBase=True))
+        ax.yaxis.set_minor_locator(LogLocator(base=10, subs=range(2, 10)))
+        ax.yaxis.set_minor_formatter(NullFormatter())
         if panel.x_ticks:
             ax.xaxis.set_major_locator(FixedLocator(panel.x_ticks))
         ax.xaxis.set_major_formatter(_sweep_tick_formatter(panel.sweep_kind))
-        ax.set_title(panel.title, fontsize=TITLE_FONT_SIZE, pad=4)
-        ax.set_xlabel(panel.x_label, fontsize=LABEL_FONT_SIZE, labelpad=2)
+        ax.set_xlabel(
+            f"{chr(ord('a') + index)}) {panel.x_label}",
+            fontsize=LABEL_FONT_SIZE, labelpad=2,
+        )
         ax.tick_params(axis="both", labelsize=TICK_FONT_SIZE, pad=1.5)
         ax.grid(axis="both", color="#e5e7eb", linewidth=0.7, zorder=0)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
         ax.spines["left"].set_color("#9ca3af")
         ax.spines["bottom"].set_color("#9ca3af")
-    fig.supylabel("Median execution time (ms)", fontsize=LABEL_FONT_SIZE, x=0.016)
-    method_handles = [
-        Line2D(
+    fig.supylabel("Median execution time (ms)", fontsize=LABEL_FONT_SIZE, x=0.01, y=0.6125)
+    method_handles = {
+        variant: Line2D(
             [],
             [],
             color=COLORS[variant],
@@ -2071,31 +2125,50 @@ def _draw_parameter_sweep_overview(
             label=_variant_display_label(variant),
         )
         for variant in present_variants
-    ]
+    }
     query_handles = [
-        Line2D([], [], color="#111827", linestyle="-", linewidth=1.2, label="Shoulder"),
-        Line2D([], [], color="#111827", linestyle=":", linewidth=1.2, label="Scattered"),
+        Line2D([], [], color="#111827", linestyle="-", linewidth=1.2, label="shoulder"),
+        Line2D([], [], color="#111827", linestyle=":", linewidth=1.2, label="scattered"),
     ]
-    legend = fig.legend(
-        handles=method_handles + query_handles,
-        loc="lower center",
-        bbox_to_anchor=(0.5, 0.012),
-        ncol=5,
-        frameon=False,
-        fontsize=LEGEND_FONT_SIZE,
-        handlelength=1.7,
-        columnspacing=1.1,
-    )
+    legend_rows = [
+        [method_handles[variant] for variant in row if variant in method_handles]
+        for row in (
+            ("no prefilter", "sip", "sip + min/max"),
+            ("rpt cascade", "rpt prf"),
+            ("prf with fallback", "prf uncompressed"),
+        )
+    ] + [query_handles]
     fig.subplots_adjust(
-        left=0.115,
-        right=0.975,
-        top=0.955,
-        bottom=0.205,
-        wspace=0.34,
-        hspace=0.42,
+        left=0.16,
+        right=0.95,
+        top=0.985,
+        bottom=0.24,
+        wspace=0.32,
+        hspace=0.51,
     )
     fig.canvas.draw()
     renderer = fig.canvas.get_renderer()
+    legends = []
+    anchor_y = 0.01
+    gap = renderer.points_to_pixels(1.5) / fig.bbox.height
+    for handles in reversed(legend_rows):
+        if not handles:
+            continue
+        legend = fig.legend(
+            handles=handles,
+            loc="lower center",
+            bbox_to_anchor=(0.5, anchor_y),
+            borderaxespad=0,
+            borderpad=0,
+            ncol=len(handles),
+            frameon=False,
+            fontsize=LEGEND_FONT_SIZE,
+            handlelength=1.5,
+            columnspacing=0.9,
+        )
+        legends.append(legend)
+        anchor_y += legend.get_window_extent(renderer).height / fig.bbox.height + gap
+    fig.canvas.draw()
     figure_bbox = fig.get_window_extent(renderer)
     verifications = []
     for ax in axes.flat:
@@ -2141,10 +2214,11 @@ def _draw_parameter_sweep_overview(
         "text_outside_figure": any(
             item["text_outside_figure"] for item in verifications
         )
-        or _artist_overlaps_axes(fig, legend, axes.flat),
+        or any(_artist_overlaps_axes(fig, legend, axes.flat) for legend in legends),
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, format="pdf", bbox_inches="tight", pad_inches=0.01)
+    # Preserve the one-column width instead of resizing the PDF to its text bounds.
+    fig.savefig(output_path, format="pdf")
     plt.close(fig)
     return verification, summary
 
@@ -2203,11 +2277,11 @@ def build_figures(experiment_root: Path, system_name: str | None, *, jpb_y_scale
         summary["figures"]["jpb_simulated_filtering"] = artifacts["figure_path"]
         summary["verification"]["jpb_simulated_filtering"] = artifacts["verification"]
         summary["sections"]["jpb_microbenchmarks"] = {**artifacts, "manifest_path": str(jpb_dir / "manifest.json")}
-    for figure in FIGURES:
+    for figure in figures_for_config(experiment_config):
         if not _figure_is_available(figure, available_workloads):
             summary["skipped_figures"].append(figure.slug)
             continue
-        if figure.metric in {"runtime_and_probe_rows", "runtime_and_files_read"}:
+        if figure.metric in {"runtime_and_probe_rows", "runtime_and_files_read", "runtime_and_bytes_read"}:
             workload_name = figure.workloads[0]
             query_names = figure.queries_by_workload[workload_name]
             if figure.probe_table is None:
@@ -2249,6 +2323,7 @@ def build_figures(experiment_root: Path, system_name: str | None, *, jpb_y_scale
                 "runtime_ms",
             )
             detail_metric_key = (
+                "fact_remote_bytes_read" if figure.metric == "runtime_and_bytes_read" else
                 "files_read_fraction"
                 if figure.metric == "runtime_and_files_read"
                 else "physical_rows_scanned"
@@ -2269,12 +2344,13 @@ def build_figures(experiment_root: Path, system_name: str | None, *, jpb_y_scale
             section_summary = {
                 "runtime": runtime_summary,
                 (
+                    "fact_bytes_read" if figure.metric == "runtime_and_bytes_read" else
                     "fact_files_opened_fraction"
-                    if figure.metric == "runtime_and_files_read"
+                    if figure.metric in {"runtime_and_files_read", "runtime_and_bytes_read"}
                     else "probe_rows"
                 ): (
                     rows_summary
-                    if figure.metric == "runtime_and_files_read"
+                    if figure.metric in {"runtime_and_files_read", "runtime_and_bytes_read"}
                     else {
                         metric_key: summarize_section(
                             [
@@ -2355,7 +2431,29 @@ def build_figures(experiment_root: Path, system_name: str | None, *, jpb_y_scale
                 entries.extend(build_absolute_table(rows, workload_name, query_names, figure.metric))
             section_summary = summarize_section(entries, figure.metric)
         figure_path = figures_dir / f"{figure.slug}.pdf"
-        if figure.metric == "runtime_and_probe_rows":
+        if figure.facet_dimensions:
+            verification = draw_ordered_panels(figure_path, entries, figure.variant_order, COLORS, _variant_display_label)
+        elif figure.metric == "runtime_and_bytes_read":
+            for entry in entries:
+                if entry.get('query_parameters'):
+                    entry['query_label'] = predicate_label(entry['query_parameters'], compact=False)
+                for item in entry['series']:
+                    if item['fact_remote_bytes_read'] is None:
+                        raise ValueError(f"missing S3 byte measurement: {entry['query_name']}/{item['variant_label']}")
+                    item['fact_remote_gib'] = item['fact_remote_bytes_read'] / (1024 ** 3)
+            verification = _draw_runtime_total_rows_bars(
+                figure_path, entries=entries, width_key=figure.width, placement_width_key=figure.placement_width,
+                show_query_labels=True, show_runtime_labels=False, workload_labels=False,
+                runtime_log_axis=True, rows_log_axis=False, rows_metric_key='fact_remote_gib',
+                rows_y_label='Fact bytes read\n(GiB)', variant_order=figure.variant_order,
+                height_inches=3.4, rows_height_ratio=0.55, legend_columns=4)
+        elif figure.metric == "runtime_and_probe_rows":
+            # A single generated dimension has no need for filename-sized labels.
+            parameters = [entry.get('query_parameters') for entry in entries]
+            if parameters and all(p and 'dimension_cardinality' in p for p in parameters):
+                if len({p['dimension_cardinality'] for p in parameters}) == 1:
+                    for entry in entries:
+                        entry['query_label'] = predicate_label(entry['query_parameters'])
             verification = _draw_runtime_probe_bars(
                 figure_path,
                 entries=entries,
@@ -2365,10 +2463,10 @@ def build_figures(experiment_root: Path, system_name: str | None, *, jpb_y_scale
                 annotate_runtime_values=figure.annotate_runtime_values,
                 runtime_log_axis=figure.runtime_log_axis,
                 rows_log_axis=figure.rows_log_axis,
-                split_scan_pruning=(
-                    figure.workloads == ("join-pruning-workload",)
-                ),
-                show_filter_phases=figure.workloads[0].startswith("join-pruning-workload"),
+                variant_order=figure.variant_order,
+                height_inches=figure.height_inches,
+                rows_height_ratio=figure.rows_height_ratio,
+                legend_columns=figure.legend_columns,
             )
         elif figure.metric == "runtime_and_files_read":
             verification = _draw_runtime_total_rows_bars(
@@ -2385,6 +2483,7 @@ def build_figures(experiment_root: Path, system_name: str | None, *, jpb_y_scale
                 rows_y_label="Fact files opened",
                 rows_percent=True,
                 show_filter_phases=figure.workloads[0].startswith("join-pruning-workload"),
+                variant_order=figure.variant_order,
             )
         elif figure.metric == "runtime_and_total_rows":
             verification = _draw_runtime_total_rows_bars(
@@ -2397,6 +2496,9 @@ def build_figures(experiment_root: Path, system_name: str | None, *, jpb_y_scale
                 workload_labels=figure.query_workload_labels,
                 runtime_log_axis=figure.runtime_log_axis,
                 rows_log_axis=figure.rows_log_axis,
+                variant_order=figure.variant_order,
+                height_inches=figure.height_inches,
+                rows_height_ratio=figure.rows_height_ratio,
             )
         else:
             verification = _draw_vertical_grouped_bars(
@@ -2409,6 +2511,7 @@ def build_figures(experiment_root: Path, system_name: str | None, *, jpb_y_scale
                 workload_labels=figure.query_workload_labels,
             )
         summary["figures"][figure.slug] = str(figure_path)
+        (output_dir / f"{figure.slug}_series.json").write_text(json.dumps(entries, indent=2) + '\n')
         summary["verification"][figure.slug] = verification
         summary["sections"].setdefault(figure.summary_key, {}).update({figure.slug: section_summary})
 
@@ -2422,7 +2525,7 @@ def build_figures(experiment_root: Path, system_name: str | None, *, jpb_y_scale
         summary["figures"]["parameter_sweep_overview"] = str(sweep_path)
         summary["verification"]["parameter_sweep_overview"] = sweep_verification
         summary["sections"]["parameter_sweeps"] = sweep_summary
-    elif sweep_workloads.intersection(available_workloads):
+    else:
         summary["skipped_figures"].append("parameter_sweep_overview")
 
     def summarize_plan_work_entries(entries: list[dict[str, object]]) -> dict[str, object]:

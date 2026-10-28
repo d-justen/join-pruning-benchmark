@@ -1,0 +1,98 @@
+{
+  "experiment_name": "smoke-spill",
+  "output_root": "/results",
+  "overwrite_output": false,
+  "workloads": [
+    {
+      "name": "ssb-ordered",
+      "kind": "external",
+      "source_dir": "external_benchmarks/ssb-ordered",
+      "dataset": "ssb-ordered",
+      "estimated_peak_gib": 8,
+      "query_names": [
+        "q01.sql"
+      ]
+    }
+  ],
+  "systems": [
+    {
+      "name": "duckdb-paper",
+      "kind": "binary",
+      "variants": [
+        {
+          "label": "no prefilter",
+          "setup_sql": [
+            "SET enable_prefix_range_filter=false;",
+            "SET enable_join_min_max_filter_pushdown=false;",
+            "SET enable_join_bloom_filter_pushdown=false;",
+            "SET enable_perfect_hash_join_filter_pushdown=false;",
+            "SET dynamic_or_filter_threshold=0;",
+            "SET disabled_optimizers='compressed_materialization';"
+          ]
+        },
+        {
+          "label": "prf with fallback",
+          "setup_sql": [
+            "SET enable_prefix_range_filter=true;",
+            "SET enable_prefix_range_filter_compression=true;",
+            "SET enable_join_min_max_filter_pushdown=true;",
+            "SET enable_join_bloom_filter_pushdown=true;",
+            "SET enable_perfect_hash_join_filter_pushdown=false;",
+            "SET dynamic_or_filter_threshold=0;",
+            "SET disabled_optimizers='compressed_materialization';"
+          ]
+        }
+      ],
+      "binary_path": "/opt/prf/duckdb"
+    },
+    {
+      "name": "rpt-plus",
+      "kind": "binary",
+      "workload_names": [
+        "ssb-ordered"
+      ],
+      "variants": [
+        {
+          "label": "rpt none",
+          "setup_sql": [
+            "SET rpt_filter = 'none';"
+          ]
+        },
+        {
+          "label": "rpt prf",
+          "setup_sql": [
+            "SET rpt_filter = 'prf';",
+            "SET rpt_prf_scan_pushdown = true;"
+          ]
+        }
+      ],
+      "binary_path": "/opt/rpt/duckdb"
+    }
+  ],
+  "benchmark": {
+    "repetitions": 1,
+    "threads": 2,
+    "prepare_duckdb_binary": "duckdb",
+    "collect_profiles": true,
+    "memory_limit": "128MiB",
+    "max_temp_directory_size": "8GiB"
+  },
+  "suite": {
+    "checkpoint_queries": true,
+    "checkpoint_microbenchmarks": true,
+    "container_memory": "6g",
+    "container_cpus": 2,
+    "timeout_seconds": 600,
+    "prepare_timeout_seconds": 1200,
+    "disk_reserve_gib": 2,
+    "evict_datasets": true,
+    "paper_figures": false
+  },
+  "datasets": {
+    "ssb-ordered": {
+      "kind": "ssb",
+      "scale_factor": 1,
+      "order": "ordered"
+    }
+  }
+}

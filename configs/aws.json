@@ -1,0 +1,16 @@
+{
+  "profile": "join-pruning",
+  "region": "eu-central-1",
+  "stack": "join-pruning",
+  "instance_type": "m9gd.2xlarge",
+  "smoke_instance_type": "m9gd.xlarge",
+  "max_runtime_seconds": 86400,
+  "finalization_seconds": 900,
+  "root_volume_gib": 40,
+  "results_volume_gib": 40,
+  "aws_cli": {
+    "version": "2.38.3",
+    "sha256": "30452d9d2e47979ddca5dd9d0fc13c3b42ad6185b44916e54e3f5ef31fe70ee9"
+  },
+  "ami_parameter": "/aws/service/canonical/ubuntu/server/24.04/stable/current/arm64/hvm/ebs-gp3/ami-id"
+}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import socket
 import subprocess
@@ -10,16 +11,18 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.request import urlopen
+from urllib.parse import urlsplit
 
 import duckdb
 
 from benchmarking.duckdb_build import ResolvedSystem
-from benchmarking.experiment_config import BenchmarkOptions, VariantConfig
+from benchmarking.experiment_config import BenchmarkOptions, VariantConfig, applies_to_workload
 from benchmarking.filter_profiles import (
     ensure_filter_profile_columns, extract_join_filter_metrics, store_join_filter_metrics,
 )
 from benchmarking.manifests import (
     DUCKLAKE_HTTP_BASE_URL_PLACEHOLDER,
+    DUCKLAKE_S3_BASE_URL_PLACEHOLDER,
     PreparedWorkload,
 )
 from benchmarking.query_inventory import QuerySpec, load_queries
@@ -121,6 +124,9 @@ def ensure_results_schema(results_db: Path) -> None:
         con.execute("ALTER TABLE profile_runs ADD COLUMN IF NOT EXISTS total_bytes_read BIGINT;")
         con.execute("ALTER TABLE profile_runs ADD COLUMN IF NOT EXISTS total_bytes_written BIGINT;")
         con.execute("ALTER TABLE profile_runs ADD COLUMN IF NOT EXISTS table_scan_file_count BIGINT;")
+        for name in ("remote_bytes_read", "fact_remote_bytes_read", "remote_get_requests"):
+            con.execute(f"ALTER TABLE timing_runs ADD COLUMN IF NOT EXISTS {name} BIGINT;")
+        con.execute("ALTER TABLE timing_runs ADD COLUMN IF NOT EXISTS remote_read_details VARCHAR;")
         con.execute("ALTER TABLE timing_runs ADD COLUMN IF NOT EXISTS query_parameters VARCHAR;")
         con.execute("ALTER TABLE profile_runs ADD COLUMN IF NOT EXISTS query_parameters VARCHAR;")
         ensure_filter_profile_columns(con)
@@ -197,16 +203,24 @@ def render_query_execution_block(
     query_parameters_sql = sql_literal(json.dumps(query.parameters, sort_keys=True))
     variant_setup_sql = sql_literal("\n".join(variant.setup_sql))
     statements: list[str] = [query_sql + ";"]
+    measure_bytes = workload.ducklake_data_source == "s3"
+    if measure_bytes and not workload.ducklake_s3_url:
+        raise ValueError("S3 workload has not been uploaded")
     for repetition in range(1, repetition_count + 1):
+        if measure_bytes:
+            statements.append("SELECT httpfs_reset_transfer_stats();")
         statements.extend(
             [
                 "SET VARIABLE benchmark_t0_ns = epoch_ns(current_timestamp);",
                 query_sql + ";",
+                *(["SET VARIABLE benchmark_elapsed_ns = epoch_ns(current_timestamp) - getvariable('benchmark_t0_ns');",
+                   remote_bytes_snapshot_sql(workload)] if measure_bytes else []),
                 "INSERT INTO benchmark_results.timing_runs (",
                 "    run_id, experiment_name, workload_name, workload_kind,",
                 "    system_name, system_kind, system_version, system_git_commit, system_repo, system_ref,",
                 "    variant_label, variant_setup_sql, query_name, query_path, join_variant, cluster_count,",
-                "    query_parameters, repetition, elapsed_ns, measured_at",
+                "    query_parameters, repetition, elapsed_ns, measured_at,",
+                "    remote_bytes_read, fact_remote_bytes_read, remote_get_requests, remote_read_details",
                 ") VALUES (",
                 f"    {sql_literal(run_id)},",
                 f"    {sql_literal(experiment_name)},",
@@ -226,12 +240,29 @@ def render_query_execution_block(
                 f"    {cluster_count_sql},",
                 f"    {query_parameters_sql},",
                 f"    {repetition},",
-                "    epoch_ns(current_timestamp) - getvariable('benchmark_t0_ns'),",
-                "    CAST(current_timestamp AS TIMESTAMP)",
+                ("    getvariable('benchmark_elapsed_ns')," if measure_bytes else
+                 "    epoch_ns(current_timestamp) - getvariable('benchmark_t0_ns'),"),
+                "    CAST(current_timestamp AS TIMESTAMP),",
+                ("    getvariable('benchmark_io').total_bytes, getvariable('benchmark_io').fact_bytes, "
+                 "getvariable('benchmark_io').requests, getvariable('benchmark_io').details"
+                 if measure_bytes else "    NULL, NULL, NULL, NULL"),
                 ");",
             ]
         )
     return "\n".join(statements)
+
+
+def remote_bytes_snapshot_sql(workload: PreparedWorkload) -> str:
+    prefix = urlsplit(workload.ducklake_s3_url).path.rstrip('/') + '/'
+    return f"""SET VARIABLE benchmark_io = (
+        SELECT struct_pack(
+            total_bytes := coalesce(sum(bytes_received), 0)::BIGINT,
+            fact_bytes := coalesce(sum(bytes_received) FILTER (WHERE contains(url, {sql_literal(prefix + 'fact/')})), 0)::BIGINT,
+            requests := coalesce(sum(get_requests), 0)::BIGINT,
+            details := coalesce(to_json(list(struct_pack(url := url, bytes_received := bytes_received,
+                                                        get_requests := get_requests) ORDER BY url)), '[]'))
+        FROM httpfs_transfer_stats() WHERE contains(url, {sql_literal(prefix)})
+    );"""
 
 
 def render_profile_execution_block(
@@ -310,11 +341,17 @@ def render_workload_sql(
         f"ATTACH {sql_literal(str(results_db))} AS benchmark_results;",
         "SET enable_progress_bar=false;",
     ]
-    if benchmark.threads is not None:
-        statements.append(f"SET threads = {benchmark.threads};")
     statements.extend(workload_setup_sql)
     statements.extend(variant.setup_sql)
     statements.extend(workload.post_variant_setup_sql)
+    # Apply the experiment policy after variant setup so all variants have the
+    # same resource budget, including workloads that spill beyond RAM.
+    if benchmark.threads is not None:
+        statements.append(f"SET threads = {benchmark.threads};")
+    for setting in ("memory_limit", "temp_directory", "max_temp_directory_size"):
+        value = getattr(benchmark, setting)
+        if value is not None:
+            statements.append(f"SET {setting} = {sql_literal(value)};")
     for query in queries:
         statements.append(
             render_query_execution_block(
@@ -401,6 +438,7 @@ def bootstrap_ducklake_workload(
     binary: Path,
     workload: PreparedWorkload,
     remote_service: RemoteHttpService | None = None,
+    benchmark: BenchmarkOptions | None = None,
 ) -> None:
     if workload.storage_mode != "ducklake":
         return
@@ -408,6 +446,15 @@ def bootstrap_ducklake_workload(
     if bootstrap_sql_path is None:
         raise ValueError(f"DuckLake workload has no bootstrap SQL: {workload.name}")
     bootstrap_sql = bootstrap_sql_path.read_text(encoding="utf-8")
+    if benchmark is not None:
+        settings = []
+        if benchmark.threads is not None:
+            settings.append(f"SET threads={benchmark.threads};")
+        for name in ("memory_limit", "temp_directory", "max_temp_directory_size"):
+            value = getattr(benchmark, name)
+            if value is not None:
+                settings.append(f"SET {name}={sql_literal(value)};")
+        bootstrap_sql = "\n".join(settings) + "\n" + bootstrap_sql
     if workload.ducklake_http_latency_ms is not None:
         if remote_service is None:
             raise ValueError(
@@ -421,11 +468,32 @@ def bootstrap_ducklake_workload(
         raise ValueError(
             f"DuckLake bootstrap SQL still contains an HTTP URL placeholder: {workload.name}"
         )
+    if workload.ducklake_data_source == "s3":
+        bootstrap_sql = remote_s3_setup(workload) + "\n" + bootstrap_sql.replace(
+            DUCKLAKE_S3_BASE_URL_PLACEHOLDER, workload.ducklake_s3_url)
     run_command([str(binary), str(workload.db_path), "-c", bootstrap_sql])
+    if workload.ducklake_data_source == "s3":
+        from benchmarking.ducklake_validation import validate_catalog
+        validate_catalog(binary, workload, load_workload_setup_sql(workload))
 
 
 def load_workload_setup_sql(workload: PreparedWorkload) -> tuple[str, ...]:
-    return tuple(path.read_text(encoding="utf-8").strip() for path in workload.setup_sql_paths)
+    statements = tuple(path.read_text(encoding="utf-8").strip() for path in workload.setup_sql_paths)
+    if workload.ducklake_data_source == "s3":
+        return (remote_s3_setup(workload),) + tuple(
+            sql.replace(DUCKLAKE_S3_BASE_URL_PLACEHOLDER, workload.ducklake_s3_url) for sql in statements)
+    return statements
+
+
+def remote_s3_setup(workload: PreparedWorkload) -> str:
+    if not workload.ducklake_s3_url or not workload.ducklake_s3_url.startswith("s3://"):
+        raise ValueError("S3 workload requires a staged s3:// URL")
+    region = os.environ.get("AWS_REGION")
+    if not region:
+        raise ValueError("S3 workload requires AWS_REGION from the EC2 host")
+    return ("LOAD httpfs; LOAD aws; LOAD json;\nCREATE OR REPLACE SECRET jpb_s3 "
+            f"(TYPE s3, PROVIDER credential_chain, CHAIN 'instance', REFRESH 'auto', REGION {sql_literal(region)}, "
+            f"SCOPE {sql_literal(workload.ducklake_s3_url + '/')});")
 
 
 def start_remote_http_service(
@@ -602,6 +670,8 @@ def benchmark_workload(
         workload_setup_sql += active_remote_service.setup_sql
     try:
         for variant in variants:
+            if not applies_to_workload(variant, workload.name):
+                continue
             variant_dir = sql_dir / workload.name / system.name
             variant_dir.mkdir(parents=True, exist_ok=True)
             sql_path = variant_dir / f"{label_to_path_component(variant.label)}.sql"

@@ -7,6 +7,7 @@ from pathlib import Path
 
 
 DUCKLAKE_HTTP_BASE_URL_PLACEHOLDER = "__DUCKLAKE_HTTP_BASE_URL__"
+DUCKLAKE_S3_BASE_URL_PLACEHOLDER = "__DUCKLAKE_S3_BASE_URL__"
 
 
 def utc_now_iso() -> str:
@@ -40,6 +41,8 @@ class PreparedWorkload:
     definition_path: Path | None = None
     cases_path: Path | None = None
     query_catalog_path: Path | None = None
+    ducklake_data_source: str = "local"
+    ducklake_s3_url: str | None = None
 
 
 def manifest_to_dict(manifest: PreparedWorkload) -> dict:
@@ -95,6 +98,14 @@ def _resolve_optional_path(raw: str | None) -> Path | None:
 def load_manifest(path: Path) -> PreparedWorkload:
     manifest_path = path.resolve()
     raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    # Suite exports use paths relative to this manifest; historical absolute
+    # manifests remain supported.
+    for key, value in raw.items():
+        if key.endswith("_path") or key.endswith("_dir") or key in ("source_root",):
+            if value is not None and not Path(value).is_absolute():
+                raw[key] = str(manifest_path.parent / value)
+        elif key.endswith("_paths"):
+            raw[key] = [str(manifest_path.parent / p) if not Path(p).is_absolute() else p for p in value]
     return PreparedWorkload(
         name=raw["name"],
         kind=raw["kind"],
@@ -119,6 +130,8 @@ def load_manifest(path: Path) -> PreparedWorkload:
         ducklake_data_path=_resolve_optional_path(raw.get("ducklake_data_path")),
         ducklake_catalog_alias=raw.get("ducklake_catalog_alias"),
         ducklake_http_latency_ms=raw.get("ducklake_http_latency_ms"),
+        ducklake_data_source=raw.get("ducklake_data_source", "local"),
+        ducklake_s3_url=raw.get("ducklake_s3_url"),
         definition_path=_resolve_optional_path(raw.get("definition_path")),
         cases_path=_resolve_optional_path(raw.get("cases_path")),
         query_catalog_path=_resolve_optional_path(raw.get("query_catalog_path")),

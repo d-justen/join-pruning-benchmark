@@ -176,6 +176,7 @@ def validate_results(directory: Path, config: MicrobenchmarkConfig,
 
 
 def resolve_microbenchmark_binaries(system: ResolvedSystem) -> dict[str, Path]:
+    from benchmarking.benchmark_binary import select_benchmark_binary
     # Binary systems must provide the tools beside the CLI or in its tools/ directory.
     build_dir = system.build_dir or system.binary_path.parent
     binaries = {}
@@ -184,7 +185,7 @@ def resolve_microbenchmark_binaries(system: ResolvedSystem) -> dict[str, Path]:
         binary = next((p for p in candidates if p.is_file() and os.access(p, os.X_OK)), None)
         if binary is None:
             raise FileNotFoundError(f"missing {target} in the selected DuckDB build: {build_dir}")
-        binaries[kind] = binary.resolve()
+        binaries[kind] = select_benchmark_binary(binary)
     return binaries
 
 
@@ -256,14 +257,17 @@ def load_microbenchmark_manifest(experiment_root: Path) -> dict:
 
 
 def run_microbenchmarks(config: MicrobenchmarkConfig, system: ResolvedSystem,
-                       experiment_root: Path, *, reuse_completed: bool = False) -> Path:
+                       experiment_root: Path, *, reuse_completed: bool = False,
+                       checkpoint_cases: bool = False, checkpoint_callback=None) -> Path:
     directory = experiment_root / ARTIFACT_SUBDIR
     directory.mkdir(parents=True, exist_ok=True)
     manifest_path = directory / "manifest.json"
     config_dict = json.loads(json.dumps(asdict(config)))
     try:
+        from benchmarking.benchmark_binary import binary_backend
         binaries = resolve_microbenchmark_binaries(system)
-        identities = {kind: {"path": str(path), "sha256": sha256(path)} for kind, path in binaries.items()}
+        identities = {kind: {"path": str(path), "sha256": sha256(path), "diva_backend": binary_backend(path)}
+                      for kind, path in binaries.items()}
     except Exception as exc:
         _write_manifest(manifest_path, {"schema_version": 2, "build_contract": BUILD_CONTRACT, "status": "failed", "config": config_dict,
                                         "finished_at": utc_now_iso(), "error": str(exc)})
@@ -307,10 +311,25 @@ def run_microbenchmarks(config: MicrobenchmarkConfig, system: ResolvedSystem,
             command = [str(binary), *common, count_arg, f"--output={temporary.resolve()}"]
             manifest["commands"][kind] = command
             _write_manifest(manifest_path, manifest)
-            with (directory / f"{kind}.log").open("w", encoding="utf-8") as log:
-                log.write(json.dumps(command) + "\n")
-                log.flush()
-                subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True)
+            if checkpoint_cases:
+                from benchmarking.case_checkpoints import run_case, combine
+                chunks = []
+                cluster = config.min_clusters
+                while cluster <= config.max_clusters:
+                    chunk = directory / "checkpoints" / f"{kind}-{cluster}.csv"
+                    options = [arg for arg in common if not arg.startswith(("--min-clusters=", "--max-clusters="))]
+                    run_case([str(binary), *options, count_arg, f"--min-clusters={cluster}", f"--max-clusters={cluster}"],
+                             chunk, {"binary": identities[kind], "config": config_dict, "kind": kind, "cluster": cluster},
+                             checkpoint_callback)
+                    chunks.append(chunk)
+                    cluster *= 2
+                combine(chunks, temporary)
+                manifest["checkpoint_protocol"] = "cluster-v1; original seeds/repetitions; ascending case processes"
+            else:
+                with (directory / f"{kind}.log").open("w", encoding="utf-8") as log:
+                    log.write(json.dumps(command) + "\n")
+                    log.flush()
+                    subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True)
             temporary.replace(output)
             manifest["outputs"][kind] = {"path": output.name, "sha256": sha256(output)}
         manifest["validation"] = validate_results(directory, config, available)

@@ -1,0 +1,116 @@
+{
+  "version": 1,
+  "airports_commit": "b529623d2a0b09a9be78d37fc7a7a5e1e16e3451",
+  "files": {
+    "job_aka_name.parquet": {
+      "url": "https://github.com/duckdb/duckdb-data/releases/download/v1.0/job_aka_name.parquet",
+      "sha256": "13c4e99c09f725f5b6c5d68caba093a3f3df7456084cfb4fdc88ed2db4791e8f",
+      "bytes": 51628048
+    },
+    "job_aka_title.parquet": {
+      "url": "https://github.com/duckdb/duckdb-data/releases/download/v1.0/job_aka_title.parquet",
+      "sha256": "7576ca0f5d0438e2d3eedcf152f05f1280419bab222cacdf03283054d1c093ac",
+      "bytes": 24405144
+    },
+    "job_cast_info.parquet": {
+      "url": "https://github.com/duckdb/duckdb-data/releases/download/v1.0/job_cast_info.parquet",
+      "sha256": "0f1f03df4bbae922dfa7a9cd1515e420ba1af1c39b3c8f69d307045ce151f741",
+      "bytes": 422985311
+    },
+    "job_char_name.parquet": {
+      "url": "https://github.com/duckdb/duckdb-data/releases/download/v1.0/job_char_name.parquet",
+      "sha256": "8d99df0e254a609bff6bf656e8d64133cb330b2d138efe9e5cf397aaa429a42c",
+      "bytes": 173945898
+    },
+    "job_company_name.parquet": {
+      "url": "https://github.com/duckdb/duckdb-data/releases/download/v1.0/job_company_name.parquet",
+      "sha256": "a19428b68794f56ba2b56b85006802c5b6aa97aa67265a2921484e0ad2594c7f",
+      "bytes": 13916490
+    },
+    "job_company_type.parquet": {
+      "url": "https://github.com/duckdb/duckdb-data/releases/download/v1.0/job_company_type.parquet",
+      "sha256": "1e6e6c2ac5e4fec8c1365d481aad62bba46e2f037bee9e6a8826cfd623d4e8ea",
+      "bytes": 2311
+    },
+    "job_complete_cast.parquet": {
+      "url": "https://github.com/duckdb/duckdb-data/releases/download/v1.0/job_complete_cast.parquet",
+      "sha256": "5e1f6a0caa31f9e8b7f2010a93b7df0440f29fd4c6728ad8eb0a97d971bca0a0",
+      "bytes": 1525528
+    },
+    "job_comp_cast_type.parquet": {
+      "url": "https://github.com/duckdb/duckdb-data/releases/download/v1.0/job_comp_cast_type.parquet",
+      "sha256": "5b4b986e03e5b107a47d1e719a0bd8fbb7530cdf2223b142743993cb9cbff619",
+      "bytes": 2171
+    },
+    "job_info_type.parquet": {
+      "url": "https://github.com/duckdb/duckdb-data/releases/download/v1.0/job_info_type.parquet",
+      "sha256": "6c9bbafd4d93986393c1dc79124d35a35d4eb8ed3e82bd7420963df0db6381ba",
+      "bytes": 4297
+    },
+    "job_keyword.parquet": {
+      "url": "https://github.com/duckdb/duckdb-data/releases/download/v1.0/job_keyword.parquet",
+      "sha256": "1da4ea5d9afbf595988f3a50c98c1037d55920863599c46653e9db08c174f7f8",
+      "bytes": 3092993
+    },
+    "job_kind_type.parquet": {
+      "url": "https://github.com/duckdb/duckdb-data/releases/download/v1.0/job_kind_type.parquet",
+      "sha256": "d27c302c44b456974c05db79c2dd2f43efcdeac3742ffd2158e633ed9c7c26e6",
+      "bytes": 2248
+    },
+    "job_link_type.parquet": {
+      "url": "https://github.com/duckdb/duckdb-data/releases/download/v1.0/job_link_type.parquet",
+      "sha256": "2cb2aad5b765ef8a680ea9e4a5868bb89622f39963f2650ef5b446208cdb3da6",
+      "bytes": 2521
+    },
+    "job_movie_companies.parquet": {
+      "url": "https://github.com/duckdb/duckdb-data/releases/download/v1.0/job_movie_companies.parquet",
+      "sha256": "20e762d8a9aca841816c2aba081ff15cd895a95e89785323952ad9800b819e92",
+      "bytes": 33752547
+    },
+    "job_movie_info.parquet": {
+      "url": "https://github.com/duckdb/duckdb-data/releases/download/v1.0/job_movie_info.parquet",
+      "sha256": "b62d0b53af3d81075c673dd0a81bd2cd5a75f14b6caa81bbc33e1c626de2366b",
+      "bytes": 461425014
+    },
+    "job_movie_info_idx.parquet": {
+      "url": "https://github.com/duckdb/duckdb-data/releases/download/v1.0/job_movie_info_idx.parquet",
+      "sha256": "5aa34827e6139f73d3cacde4333571d0d41a7183949f8ff385022da9bd6dd729",
+      "bytes": 14914871
+    },
+    "job_movie_keyword.parquet": {
+      "url": "https://github.com/duckdb/duckdb-data/releases/download/v1.0/job_movie_keyword.parquet",
+      "sha256": "f47acd59c6847eb3adf3b7acd199a8bbdc0cb966853a45e3d8126bd302e0b291",
+      "bytes": 33112818
+    },
+    "job_movie_link.parquet": {
+      "url": "https://github.com/duckdb/duckdb-data/releases/download/v1.0/job_movie_link.parquet",
+      "sha256": "2c0e0979e249c66662bdefaf5e328b7f35f2394530406577a9ff4daefea296af",
+      "bytes": 356443
+    },
+    "job_name.parquet": {
+      "url": "https://github.com/duckdb/duckdb-data/releases/download/v1.0/job_name.parquet",
+      "sha256": "2c909f3c89259247bbe1b05c51ff46f9e3ea491489dd8da0d1c625314732d577",
+      "bytes": 218580214
+    },
+    "job_person_info.parquet": {
+      "url": "https://github.com/duckdb/duckdb-data/releases/download/v1.0/job_person_info.parquet",
+      "sha256": "4864b369d1b0f89933ae324abf5bc3be8bcc2a6c462b64fce5f3e4adae3ba5b2",
+      "bytes": 235261014
+    },
+    "job_role_type.parquet": {
+      "url": "https://github.com/duckdb/duckdb-data/releases/download/v1.0/job_role_type.parquet",
+      "sha256": "e9038cb4b9da0d7d49a910c8db42125daaedcea02c573a9a9b79d4f548349885",
+      "bytes": 2347
+    },
+    "job_title.parquet": {
+      "url": "https://github.com/duckdb/duckdb-data/releases/download/v1.0/job_title.parquet",
+      "sha256": "037b82f254723aa285668b18c87387ec59d34ae1cd25731c6fdb51280a0dbbcf",
+      "bytes": 144897832
+    },
+    "airports.csv": {
+      "url": "https://raw.githubusercontent.com/davidmegginson/ourairports-data/b529623d2a0b09a9be78d37fc7a7a5e1e16e3451/airports.csv",
+      "sha256": "0499dbd88de2fc735ac5c09f59796ccc3af544e17ffda807f793c0c6fe6c3d75",
+      "bytes": 12748669
+    }
+  }
+}

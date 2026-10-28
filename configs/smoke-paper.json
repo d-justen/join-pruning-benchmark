@@ -1,0 +1,23 @@
+{
+  "suite": {
+    "container_memory": "6g",
+    "container_cpus": 2
+  },
+  "groups": [
+    {
+      "name": "native",
+      "config": "smoke.json"
+    },
+    {
+      "name": "sweeps",
+      "config": "smoke-sweeps.json"
+    },
+    {
+      "name": "ducklake-http",
+      "config": "smoke-extensions.json",
+      "binary_paths": {
+        "duckdb-paper": "/opt/prf/duckdb-extensions"
+      }
+    }
+  ]
+}

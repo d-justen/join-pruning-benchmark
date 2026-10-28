@@ -1,0 +1,7 @@
+**
+!Dockerfile
+!CMakeLists.txt
+!TPCDSkew/
+!TPCDSkew/*.c
+!TPCDSkew/*.h
+!TPCDSkew/dists.dss

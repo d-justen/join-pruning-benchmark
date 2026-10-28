@@ -1,0 +1,19 @@
+{
+  "suite": {
+    "container_memory": "28g",
+    "container_cpus": 8
+  },
+  "groups": [
+    {
+      "name": "native",
+      "config": "graviton-full.json"
+    },
+    {
+      "name": "ordered-ducklake",
+      "config": "graviton-ordered-ducklake.json",
+      "binary_paths": {
+        "duckdb-paper": "/opt/prf/duckdb-extensions"
+      }
+    }
+  ]
+}

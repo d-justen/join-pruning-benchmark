@@ -6,6 +6,8 @@ from pathlib import Path
 
 import duckdb
 
+from benchmarking.resources import connect
+
 from benchmarking.experiment_config import SingleJoinClustersWorkloadConfig
 from benchmarking.manifests import PreparedWorkload, utc_now_iso, write_manifest
 from benchmarking.workloads.external import export_remote_parquet_catalog
@@ -181,7 +183,7 @@ def _write_database(
         db_path.unlink()
     db_path.parent.mkdir(parents=True, exist_ok=True)
     queries_dir.mkdir(parents=True, exist_ok=True)
-    con = duckdb.connect(str(db_path))
+    con = connect(str(db_path))
     try:
         seed_value = ((spec.seed % 10_000_000) + 0.5) / 10_000_001
         con.execute(f"SELECT setseed({seed_value})")

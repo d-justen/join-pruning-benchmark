@@ -46,6 +46,13 @@ def _as_float(raw: object, label: str) -> float:
 class VariantConfig:
     label: str
     setup_sql: tuple[str, ...]
+    workload_names: tuple[str, ...] | None = None
+
+
+def applies_to_workload(selection, workload_name: str) -> bool:
+    """Shared selection rule for parsed configurations and suite JSON."""
+    names = selection.get("workload_names") if isinstance(selection, dict) else selection.workload_names
+    return names is None or workload_name in names
 
 
 @dataclass(frozen=True)
@@ -112,6 +119,9 @@ class CrossProductFixedParameters:
     dummy_string_cols: int
     dummy_string_len: int
     seed: int
+    fact_payload_cols: int = 0
+    fact_payload_len: int = 32
+    projected_fact_payload_cols: int = 0
 
 
 @dataclass(frozen=True)
@@ -150,6 +160,9 @@ class CrossProductWorkloadConfig:
     experiment_definition: CrossProductExperimentDefinition | None = None
     post_variant_setup_sql: tuple[str, ...] = ()
     preparation: DensityPreparationOptions = DensityPreparationOptions()
+    ducklake_data_source: str = "local"
+    parquet_row_groups_per_file: int | None = None
+    parquet_row_group_size: int = 122_880
 
 
 @dataclass(frozen=True)
@@ -194,6 +207,9 @@ class BenchmarkOptions:
     threads: int | None
     prepare_duckdb_binary: str
     collect_profiles: bool
+    memory_limit: str | None = None
+    temp_directory: str | None = None
+    max_temp_directory_size: str | None = None
 
 
 @dataclass(frozen=True)
@@ -352,7 +368,13 @@ def _parse_variants(raw: object, label: str) -> tuple[VariantConfig, ...]:
             _normalize_sql_statement(_require_string(statement, "setup_sql entry"))
             for statement in setup_sql_list
         )
-        variants.append(VariantConfig(label=variant_label, setup_sql=setup_sql))
+        names_raw = variant_obj.get("workload_names")
+        names = None if names_raw is None else tuple(
+            _require_string(n, "variant.workload_names entry")
+            for n in _require_list(names_raw, "variant.workload_names"))
+        if names is not None and (not names or len(set(names)) != len(names)):
+            raise ValueError("variant.workload_names must be nonempty and distinct")
+        variants.append(VariantConfig(label=variant_label, setup_sql=setup_sql, workload_names=names))
     return tuple(variants)
 
 
@@ -539,7 +561,17 @@ def _parse_cross_product_definition(params: dict) -> CrossProductExperimentDefin
             "fixed.dummy_string_len",
         ),
         seed=_require_int(fixed_raw.get("seed", 0), "fixed.seed"),
+        fact_payload_cols=_require_int(fixed_raw.get("fact_payload_cols", 0), "fixed.fact_payload_cols"),
+        fact_payload_len=_require_int(fixed_raw.get("fact_payload_len", 32), "fixed.fact_payload_len"),
+        projected_fact_payload_cols=_require_int(
+            fixed_raw.get("projected_fact_payload_cols", 0), "fixed.projected_fact_payload_cols"),
     )
+    if not 0 <= fixed.projected_fact_payload_cols <= fixed.fact_payload_cols:
+        raise ValueError("projected_fact_payload_cols must be between zero and fact_payload_cols")
+    if not 1 <= fixed.fact_payload_len <= 1024:
+        raise ValueError("fact_payload_len must be between 1 and 1024")
+    if fixed.fact_payload_cols and (sweep_kind != "dimension_cardinality" or fixed.row_group_size != 122_880):
+        raise ValueError("fact payload requires a dimension_cardinality sweep with default native row groups")
     query_types = _parse_cross_product_query_types(
         params.get("query_types"),
         default_probe_layout=fixed.probe_layout,
@@ -569,12 +601,26 @@ def _parse_cross_product(raw: dict, name: str) -> CrossProductWorkloadConfig:
     )
     if parquet_file_size_mb <= 0:
         raise ValueError("storage.parquet_file_size_mb must be positive")
+    data_source = _require_string(storage.get("data_source", "local"), "storage.data_source")
+    if data_source not in {"local", "s3"}:
+        raise ValueError("storage.data_source must be local or s3")
+    groups_raw = storage.get("parquet_row_groups_per_file")
+    groups = None if groups_raw is None else _require_int(groups_raw, "storage.parquet_row_groups_per_file")
+    row_group_size = _require_int(storage.get("parquet_row_group_size", 122_880), "storage.parquet_row_group_size")
+    if groups is not None and groups <= 0:
+        raise ValueError("parquet_row_groups_per_file must be positive")
+    if row_group_size <= 0 or row_group_size % 2048:
+        raise ValueError("parquet_row_group_size must be a positive multiple of 2048")
+    if (data_source != "local" or groups is not None) and storage_kind != "ducklake":
+        raise ValueError("remote storage and Parquet layout options require DuckLake")
     ducklake_http_latency_ms = (
         None
         if storage.get("http_latency_ms") is None
         else _require_int(storage.get("http_latency_ms"), "storage.http_latency_ms")
     )
     if ducklake_http_latency_ms is not None:
+        if data_source == "s3":
+            raise ValueError("S3 storage cannot use simulated HTTP latency")
         if storage_kind != "ducklake":
             raise ValueError("storage.http_latency_ms requires storage.kind='ducklake'")
         if ducklake_http_latency_ms < 0:
@@ -652,6 +698,9 @@ def _parse_cross_product(raw: dict, name: str) -> CrossProductWorkloadConfig:
         ducklake_http_latency_ms=ducklake_http_latency_ms,
         experiment_definition=experiment_definition,
         preparation=preparation,
+        ducklake_data_source=data_source,
+        parquet_row_groups_per_file=groups,
+        parquet_row_group_size=row_group_size,
         post_variant_setup_sql=tuple(
             _normalize_sql_statement(_require_string(statement, "post_variant_setup_sql entry"))
             for statement in _require_list(
@@ -870,6 +919,9 @@ def _parse_benchmark(raw: object) -> BenchmarkOptions:
             benchmark_obj.get("collect_profiles", True),
             "collect_profiles",
         ),
+        memory_limit=benchmark_obj.get("memory_limit"),
+        temp_directory=benchmark_obj.get("temp_directory"),
+        max_temp_directory_size=benchmark_obj.get("max_temp_directory_size"),
     )
 
 
@@ -911,6 +963,11 @@ def load_experiment_config(path: Path) -> ExperimentConfig:
         raise ValueError("threads must be positive when set")
     known_workloads = {workload.name for workload in config.workloads}
     for system in config.systems:
+        for variant in system.variants:
+            if variant.workload_names is not None:
+                unknown = set(variant.workload_names) - known_workloads
+                if unknown:
+                    raise ValueError(f"variant {variant.label!r} references unknown workloads: {sorted(unknown)}")
         if system.workload_names is None:
             continue
         unknown = set(system.workload_names) - known_workloads
